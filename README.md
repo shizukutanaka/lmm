@@ -45,6 +45,7 @@ lmm status          -> live status + GPU memory
 lmm models          -> local models installed (Ollama)
 lmm cost [--days N] -> measured spend: Anthropic logs + lmm's own hub telemetry
 lmm route "task"    -> recommend local vs remote (--explain for the score)
+lmm fit [model]     -> does it fit in your GPU, and at what context length?
 lmm ask "prompt"    -> ask any backend: cached, routed, optionally cascaded
 lmm serve <model>   -> pull + expose a local model endpoint (Ollama)
 lmm serve --hub     -> OpenAI-compatible proxy over every configured provider
@@ -108,6 +109,45 @@ you did not specify.
 Privacy outranks price everywhere: a prompt matching your `route.private`
 keywords is pinned to local providers, and a cascade on such a prompt will not
 escalate off the machine no matter how badly the local model scores.
+
+### Will it even run? `lmm fit`
+
+Routing to a local model is only free if the model actually loads. `lmm fit`
+answers that with arithmetic instead of trial and error:
+
+```
+weights  = params × bits_per_weight / 8
+KV cache = 2 × layers × kv_heads × head_dim × context × bytes_per_element
+total    = weights + KV cache + ~0.5 GiB (context, activations, scratch)
+```
+
+```bash
+$ lmm fit llama3.1:8b --vram 8 --ctx 32768
+VRAM budget: 8.0 GiB  [--vram]
+KV cache dtype: f16  (2.0 bytes/element)
+------------------------------------------------------------------------
+  [OVER] llama3.1:8b                    9.02 GiB @ 32,768 ctx
+         weights 4.52 + kv 4.00 + overhead 0.50   (8.0B params, 4.85 bpw, 32L, 8 kv-heads x 128)
+         fits up to 24,437 tokens of context
+         -> fits at 7.02 GiB with --kv q8_0 (llama.cpp --cache-type-k/v q8_0)
+```
+
+Two details the naive version of this gets wrong:
+
+- **`kv_heads` is the GQA count, not the query-head count.** Llama 3.1 8B has
+  32 query heads but only 8 KV heads — using the query count overstates the KV
+  cache by 4×. Architecture metadata comes from Ollama's `/api/show`, so these
+  are the model's real numbers, not a guess from its name.
+- **bits-per-weight is above the nominal bit count.** k-quants store scale
+  factors and keep sensitive tensors wider, so Q4_K_M is ~4.85 bpw, not 4.0.
+
+`--kv q8_0` / `--kv q4_0` model llama.cpp's `--cache-type-k`/`--cache-type-v`,
+which halve and quarter the KV cache respectively. `lmm route` now uses these
+numbers too: instead of "GPU is under 80% used", it reports which installed
+model actually fits in the free VRAM.
+
+GPU detection covers NVIDIA (`nvidia-smi`), AMD (`rocm-smi`) and Apple Silicon
+(unified memory, reported at a conservative 75% usable share).
 
 ### The taskbar problem, solved
 

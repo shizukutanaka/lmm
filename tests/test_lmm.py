@@ -481,6 +481,101 @@ class TestConfigMerging(unittest.TestCase):
         json.loads(buf.getvalue())
 
 
+class TestVramFit(unittest.TestCase):
+    """The KV-cache formula, checked against published figures.
+
+    kv = 2 * layers * kv_heads * head_dim * ctx * bytes_per_element
+    """
+
+    LLAMA3_8B = {"params": 8.03e9, "layers": 32, "kv_heads": 8, "head_dim": 128,
+                 "ctx_max": 131072, "quant": "q4_k_m"}
+    # Llama-2 7B predates GQA: 32 query heads AND 32 KV heads.
+    LLAMA2_7B = {"params": 6.74e9, "layers": 32, "kv_heads": 32, "head_dim": 128,
+                 "ctx_max": 4096, "quant": "f16"}
+
+    def test_llama3_8b_kv_at_32k_matches_published_4gib(self):
+        est = lmm.estimate_vram(self.LLAMA3_8B, 32768, kv_type="f16")
+        self.assertAlmostEqual(est["kv_gib"], 4.0, places=3)
+
+    def test_llama2_7b_kv_at_4k_matches_published_2gib(self):
+        est = lmm.estimate_vram(self.LLAMA2_7B, 4096, kv_type="f16")
+        self.assertAlmostEqual(est["kv_gib"], 2.0, places=3)
+
+    def test_gqa_head_count_matters_fourfold(self):
+        # Llama 3.1 8B has 32 query heads but 8 KV heads; using the query count
+        # would overstate the KV cache by 4x. This is the easiest thing to get
+        # wrong in the formula, so it is pinned.
+        mha = dict(self.LLAMA3_8B, kv_heads=32)
+        a = lmm.estimate_vram(self.LLAMA3_8B, 8192)["kv_gib"]
+        b = lmm.estimate_vram(mha, 8192)["kv_gib"]
+        self.assertAlmostEqual(b / a, 4.0, places=6)
+
+    def test_kv_quantization_halves_and_quarters(self):
+        f16 = lmm.estimate_vram(self.LLAMA3_8B, 32768, kv_type="f16")["kv_gib"]
+        q8 = lmm.estimate_vram(self.LLAMA3_8B, 32768, kv_type="q8_0")["kv_gib"]
+        q4 = lmm.estimate_vram(self.LLAMA3_8B, 32768, kv_type="q4_0")["kv_gib"]
+        self.assertAlmostEqual(q8, f16 / 2, places=6)
+        self.assertAlmostEqual(q4, f16 / 4, places=6)
+
+    def test_kv_scales_linearly_with_context(self):
+        a = lmm.estimate_vram(self.LLAMA3_8B, 4096)["kv_gib"]
+        b = lmm.estimate_vram(self.LLAMA3_8B, 8192)["kv_gib"]
+        self.assertAlmostEqual(b, a * 2, places=6)
+
+    def test_weights_track_bits_per_weight(self):
+        q4 = lmm.estimate_vram(self.LLAMA3_8B, 0, quant="q4_k_m")["weights_gib"]
+        q8 = lmm.estimate_vram(self.LLAMA3_8B, 0, quant="q8_0")["weights_gib"]
+        f16 = lmm.estimate_vram(self.LLAMA3_8B, 0, quant="f16")["weights_gib"]
+        self.assertLess(q4, q8)
+        self.assertLess(q8, f16)
+        # 8B at q4_k_m lands near the ~4.6 GiB real GGUF file size
+        self.assertGreater(q4, 4.0)
+        self.assertLess(q4, 5.2)
+
+    def test_total_is_weights_plus_kv_plus_overhead(self):
+        est = lmm.estimate_vram(self.LLAMA3_8B, 8192)
+        self.assertAlmostEqual(
+            est["total_gib"],
+            est["weights_gib"] + est["kv_gib"] + est["overhead_gib"], places=9)
+
+    def test_max_context_round_trips(self):
+        budget = 24.0
+        ctx = lmm.max_context_for(self.LLAMA3_8B, budget)
+        self.assertGreater(ctx, 0)
+        self.assertLessEqual(lmm.estimate_vram(self.LLAMA3_8B, ctx)["total_gib"],
+                             budget + 1e-6)
+        # one token past the limit must not fit
+        self.assertGreater(
+            lmm.estimate_vram(self.LLAMA3_8B, ctx + 2)["total_gib"], budget)
+
+    def test_max_context_is_zero_when_weights_alone_overflow(self):
+        self.assertEqual(lmm.max_context_for(self.LLAMA3_8B, 1.0), 0)
+
+    def test_kv_quantization_buys_context(self):
+        f16 = lmm.max_context_for(self.LLAMA3_8B, 8.0, kv_type="f16")
+        q4 = lmm.max_context_for(self.LLAMA3_8B, 8.0, kv_type="q4_0")
+        self.assertAlmostEqual(q4 / f16, 4.0, delta=0.01)
+
+    def test_quant_bpw_lookup(self):
+        self.assertEqual(lmm.quant_bpw("Q4_K_M"), lmm.QUANT_BPW["q4_k_m"])
+        self.assertEqual(lmm.quant_bpw("F16"), 16.0)
+        # unknown quant falls back to Ollama's default pull, not a crash
+        self.assertEqual(lmm.quant_bpw("wat"), lmm.QUANT_BPW["q4_k_m"])
+        self.assertEqual(lmm.quant_bpw(None), lmm.QUANT_BPW["q4_k_m"])
+
+    def test_parse_params(self):
+        self.assertAlmostEqual(lmm.parse_params("8.0B"), 8.0e9)
+        self.assertAlmostEqual(lmm.parse_params("134.52M"), 134.52e6)
+        self.assertAlmostEqual(lmm.parse_params("7b"), 7.0e9)
+        self.assertEqual(lmm.parse_params("garbage"), 0.0)
+        self.assertEqual(lmm.parse_params(None), 0.0)
+
+    def test_params_from_name_ignores_version_numbers(self):
+        self.assertAlmostEqual(lmm.params_from_name("qwen2.5-coder:7b"), 7.0e9)
+        self.assertAlmostEqual(lmm.params_from_name("llama3.1:70b"), 70.0e9)
+        self.assertEqual(lmm.params_from_name("mistral"), 0.0)
+
+
 class temp_state(object):
     """Point lmm's usage log and cache at a throwaway directory."""
 

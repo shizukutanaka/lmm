@@ -21,6 +21,7 @@
 #   models              local models installed
 #   cost [--days N]     measured spend: Anthropic session logs + lmm's own hub
 #   route "task ..."    recommend local vs remote for a task (--explain)
+#   fit [model]         does it fit in your GPU, and at what context length?
 #   ask "prompt"        one question, routed across every backend (--cascade)
 #   serve <model>       pull + expose a local model endpoint (Ollama)
 #   serve --hub         OpenAI-compatible proxy over all configured providers
@@ -326,17 +327,195 @@ def app_data():
 
 
 def gpu_info():
+    """Detected accelerator memory in MiB: {name, used, total, pct, kind}.
+
+    NVIDIA, AMD and Apple Silicon are all asked in turn — "is there GPU
+    headroom" is the question behind every local-vs-cloud decision, and
+    answering it only for CUDA users made that decision wrong everywhere else.
+    """
     r = run("nvidia-smi --query-gpu=name,memory.used,memory.total --format=csv,noheader")
     if r and r.stdout.strip():
         parts = [p.strip() for p in r.stdout.strip().split(",")]
         if len(parts) >= 3:
             try:
-                u = int(parts[1].replace("MiB", ""))
-                t = int(parts[2].replace("MiB", ""))
-                return {"name": parts[0], "used": u, "total": t, "pct": round(100 * u / t)}
+                u = int(parts[1].replace("MiB", "").strip())
+                t = int(parts[2].replace("MiB", "").strip())
+                return {"name": parts[0], "used": u, "total": t,
+                        "pct": round(100 * u / t) if t else 0, "kind": "nvidia"}
             except ValueError:
                 pass
+    # AMD ROCm. --showmeminfo prints "Total Memory (B): N" / "Total Used ...".
+    r = run("rocm-smi --showmeminfo vram --csv")
+    if r and r.stdout.strip():
+        try:
+            total = used = 0
+            for ln in r.stdout.splitlines():
+                low = ln.lower()
+                nums = [int(x) for x in ln.replace(",", " ").split() if x.isdigit()]
+                if not nums:
+                    continue
+                if "total" in low and "used" not in low:
+                    total = max(total, max(nums))
+                elif "used" in low:
+                    used = max(used, max(nums))
+            if total > 0:
+                t, u = total // (1024 ** 2), used // (1024 ** 2)
+                return {"name": "AMD GPU (ROCm)", "used": u, "total": t,
+                        "pct": round(100 * u / t) if t else 0, "kind": "amd"}
+        except (ValueError, ZeroDivisionError):
+            pass
+    # Apple Silicon: no discrete VRAM — the GPU shares system RAM. Metal caps a
+    # process well below installed RAM, so report the usable share, not all of
+    # it. (~75% is the conservative default for machines up to 36GB.)
+    if sys.platform == "darwin":
+        r = run("sysctl -n hw.memsize")
+        if r and r.stdout.strip().isdigit():
+            total_mib = int(r.stdout.strip()) // (1024 ** 2)
+            usable = int(total_mib * 0.75)
+            return {"name": "Apple Silicon (unified memory)", "used": 0,
+                    "total": usable, "pct": 0, "kind": "apple"}
     return None
+
+
+# ------------------- VRAM fit: will this model actually run? ----------------
+# The local half of every local-vs-cloud decision. Two published numbers do the
+# work:
+#
+#   weights  = params * bits_per_weight / 8
+#   kv cache = 2 * n_layers * n_kv_heads * head_dim * ctx * bytes_per_element
+#
+# The 2 is K and V. n_kv_heads must be the GQA count, not the query-head count
+# — Llama 3.1 8B has 32 query heads but 8 KV heads, so assuming the former
+# overstates the KV cache by 4x. Verified against the published figure for
+# Llama-3-8B at 32K context in fp16: 2*32*8*128*32768*2 = 4.0 GiB.
+#
+# bits-per-weight is above the nominal bit count because k-quants store scales
+# and keep sensitive tensors wider. Values are the llama.cpp measurements on
+# LLaMA-family models and are approximate for other architectures.
+QUANT_BPW = {
+    "f32": 32.0, "f16": 16.0, "bf16": 16.0,
+    "q8_0": 8.50, "q6_k": 6.59,
+    "q5_k_m": 5.69, "q5_k_s": 5.52, "q5_0": 5.54, "q5_1": 6.00,
+    "q4_k_m": 4.85, "q4_k_s": 4.58, "q4_0": 4.55, "q4_1": 5.00,
+    "q3_k_l": 4.27, "q3_k_m": 3.89, "q3_k_s": 3.50,
+    "q2_k": 3.35,
+    "iq4_xs": 4.25, "iq3_xs": 3.30, "iq2_xs": 2.40,
+}
+
+# KV cache element size. llama.cpp exposes these as --cache-type-k/--cache-type-v;
+# q8_0 halves the cache for very little quality loss, q4_0 quarters it.
+KV_BYTES = {"f16": 2.0, "q8_0": 1.0, "q8": 1.0, "q4_0": 0.5, "q4": 0.5}
+
+# CUDA/Metal context, activations and scratch buffers. Real usage runs roughly
+# 200-800MB depending on batch size and backend; 0.5GiB is a middle estimate.
+VRAM_OVERHEAD_GIB = 0.5
+
+GIB = 1024 ** 3
+
+
+def parse_params(s):
+    """'8.0B' / '134.52M' / '7b' -> parameter count as a float."""
+    s = (s or "").strip().lower().replace(",", "")
+    mult = 1.0
+    if s.endswith("b"):
+        mult, s = 1e9, s[:-1]
+    elif s.endswith("m"):
+        mult, s = 1e6, s[:-1]
+    try:
+        return float(s) * mult
+    except ValueError:
+        return 0.0
+
+
+def params_from_name(name):
+    """Last-resort parameter count from a tag like 'qwen2.5-coder:7b'."""
+    token = ""
+    for ch in (name or "").lower():
+        if ch.isdigit() or ch == ".":
+            token += ch
+        elif ch in ("b", "m") and token:
+            n = parse_params(token + ch)
+            if 1e8 <= n <= 2e12:          # ignore version numbers like "2.5"
+                return n
+            token = ""
+        else:
+            token = ""
+    return 0.0
+
+
+def ollama_model_info(model):
+    """Real architecture metadata from a running Ollama (`POST /api/show`).
+
+    Returns {params, layers, kv_heads, head_dim, ctx_max, quant, source} or
+    None. Without this the KV cache cannot be computed honestly, because
+    layer/head counts are not derivable from a parameter count.
+    """
+    body = http_post_json("http://localhost:11434/api/show",
+                          {"model": model}, "", timeout=20)
+    if not isinstance(body, dict) or body.get("error") or "model_info" not in body:
+        return None
+    mi = body.get("model_info") or {}
+    det = body.get("details") or {}
+    arch = mi.get("general.architecture") or det.get("family") or ""
+
+    def g(*suffixes):
+        for suf in suffixes:
+            for key in (f"{arch}.{suf}", suf):
+                if isinstance(mi.get(key), (int, float)):
+                    return mi[key]
+        return None
+
+    layers = g("block_count")
+    heads = g("attention.head_count")
+    kv_heads = g("attention.head_count_kv") or heads
+    embed = g("embedding_length")
+    head_dim = g("attention.key_length")
+    if not head_dim and embed and heads:
+        head_dim = embed / heads
+    params = parse_params(det.get("parameter_size", "")) or params_from_name(model)
+    if not (layers and kv_heads and head_dim):
+        return None
+    return {"params": params, "layers": int(layers), "kv_heads": int(kv_heads),
+            "head_dim": int(head_dim), "ctx_max": int(g("context_length") or 0),
+            "quant": (det.get("quantization_level") or "").lower(),
+            "arch": arch, "source": "ollama"}
+
+
+def quant_bpw(quant):
+    q = (quant or "").strip().lower()
+    if q in QUANT_BPW:
+        return QUANT_BPW[q]
+    for k in sorted(QUANT_BPW, key=len, reverse=True):
+        if k in q:
+            return QUANT_BPW[k]
+    return QUANT_BPW["q4_k_m"]          # Ollama's default pull
+
+
+def kv_bytes_per_token(spec, kv_type="f16"):
+    """2 (K and V) * layers * kv_heads * head_dim * bytes — per token."""
+    return (2 * spec["layers"] * spec["kv_heads"] * spec["head_dim"]
+            * KV_BYTES.get((kv_type or "f16").lower(), 2.0))
+
+
+def estimate_vram(spec, ctx, quant=None, kv_type="f16"):
+    """Total GiB to run `spec` at `ctx` tokens: weights + KV cache + overhead."""
+    bpw = quant_bpw(quant or spec.get("quant"))
+    weights = spec.get("params", 0.0) * bpw / 8.0 / GIB
+    kv = kv_bytes_per_token(spec, kv_type) * max(ctx, 0) / GIB
+    return {"weights_gib": weights, "kv_gib": kv,
+            "overhead_gib": VRAM_OVERHEAD_GIB,
+            "total_gib": weights + kv + VRAM_OVERHEAD_GIB, "bpw": bpw}
+
+
+def max_context_for(spec, budget_gib, quant=None, kv_type="f16"):
+    """Largest context that still fits in `budget_gib`. 0 means the weights
+    alone do not fit."""
+    est = estimate_vram(spec, 0, quant, kv_type)
+    room = budget_gib - est["weights_gib"] - VRAM_OVERHEAD_GIB
+    if room <= 0:
+        return 0
+    per_tok = kv_bytes_per_token(spec, kv_type) / GIB
+    return int(room / per_tok) if per_tok > 0 else 0
 
 
 # ------------------------------- config ------------------------------------
@@ -1021,6 +1200,32 @@ def cmd_route(cfg, task, explain=False):
         print("=> no providers configured; add 'providers' or start Ollama")
 
 
+def best_local_fit(ctx=4096, limit=6):
+    """Largest installed local model that actually fits in free VRAM at `ctx`.
+
+    "Is there GPU headroom" used to be answered with a percentage, which says
+    nothing about whether the model you have can load. This checks the real
+    number: weights + KV cache + overhead against free memory.
+    """
+    gpu = gpu_info()
+    if not gpu:
+        return None
+    budget = (gpu["total"] - gpu["used"]) / 1024.0
+    best = None
+    for name in (detect_ollama().get("models") or [])[:limit]:
+        spec = ollama_model_info(name)
+        if not spec:
+            continue
+        est = estimate_vram(spec, ctx)
+        if est["total_gib"] <= budget and (best is None or
+                                           spec["params"] > best[1]["params"]):
+            best = (name, spec, est)
+    if not best:
+        return None
+    return {"model": best[0], "gib": best[2]["total_gib"], "budget_gib": budget,
+            "params": best[1]["params"], "ctx": ctx}
+
+
 def route_task(cfg, task):
     t = (task or "").lower()
     rt = merged_route(cfg)
@@ -1034,8 +1239,15 @@ def route_task(cfg, task):
     elif any(k in t for k in rt["heavy"]):
         rec = "Claude Code (remote, paid) — best for coding/design"
     else:
-        if gpu and gpu["pct"] < 80 and local_ok:
-            rec = "Ollama (local, free) — GPU headroom available"
+        fit = best_local_fit() if local_ok else None
+        if fit:
+            rec = (f"Ollama {fit['model']} (local, free) — fits in "
+                   f"{fit['gib']:.1f} of {fit['budget_gib']:.1f} GiB free "
+                   f"at {fit['ctx']:,} ctx")
+        elif gpu and local_ok:
+            rec = ("Claude Code (remote, paid) — no installed local model fits "
+                   f"in {(gpu['total'] - gpu['used']) / 1024.0:.1f} GiB free "
+                   "(see `lmm fit`)")
         else:
             rec = "Claude Code (remote, paid)"
     return rec
@@ -1121,6 +1333,82 @@ def cmd_models():
             print("  -", m)
     else:
         print("no ollama models (or ollama not running)")
+
+
+def cmd_fit(model=None, ctx=None, vram=None, kv="f16", as_json=False):
+    """Answer the question every local-LLM user actually has: does this model
+    run on this machine, and at what context length?"""
+    gpu = gpu_info()
+    if vram:
+        budget, src = float(vram), "--vram"
+    elif gpu:
+        budget = (gpu["total"] - gpu["used"]) / 1024.0
+        src = f"{gpu['name']} ({gpu['total'] - gpu['used']} of {gpu['total']} MiB free)"
+    else:
+        print("[fit] no GPU detected and no --vram given. "
+              "Pass --vram <GiB> to size a machine you do not have in front of you.")
+        return
+
+    models = [model] if model else (detect_ollama().get("models") or [])
+    if not models:
+        print("[fit] no model given and no Ollama models installed. "
+              "Try: lmm fit llama3.1:8b --vram 24")
+        return
+
+    rows = []
+    for name in models:
+        spec = ollama_model_info(name)
+        if not spec:
+            params = params_from_name(name)
+            rows.append({"model": name, "error": (
+                "no metadata (start Ollama so `lmm fit` can read the real layer "
+                "and KV-head counts)"),
+                "weights_only_gib": (params * quant_bpw(None) / 8.0 / GIB
+                                     if params else None)})
+            continue
+        want = ctx or spec["ctx_max"] or 4096
+        est = estimate_vram(spec, want, None, kv)
+        rows.append({"model": name, "ctx": want, "kv_type": kv, "spec": spec,
+                     "est": est, "fits": est["total_gib"] <= budget,
+                     "max_ctx": max_context_for(spec, budget, None, kv)})
+
+    if as_json:
+        print(json.dumps({"budget_gib": round(budget, 2), "source": src,
+                          "rows": rows}, indent=2, default=str))
+        return
+
+    print(f"VRAM budget: {budget:.1f} GiB  [{src}]")
+    print(f"KV cache dtype: {kv}  "
+          f"({KV_BYTES.get(kv.lower(), 2.0)} bytes/element)")
+    print("-" * 72)
+    for r in rows:
+        if r.get("error"):
+            print(f"  {r['model']:<32} ? {r['error']}")
+            if r.get("weights_only_gib"):
+                print(f"  {'':<32}   weights alone ~{r['weights_only_gib']:.1f} GiB "
+                      f"(assuming q4_k_m)")
+            continue
+        e, s = r["est"], r["spec"]
+        mark = "OK  " if r["fits"] else "OVER"
+        print(f"  [{mark}] {r['model']:<28} {e['total_gib']:6.2f} GiB "
+              f"@ {r['ctx']:,} ctx")
+        print(f"         weights {e['weights_gib']:.2f} + kv {e['kv_gib']:.2f} "
+              f"+ overhead {e['overhead_gib']:.2f}   "
+              f"({s['params']/1e9:.1f}B params, {e['bpw']:.2f} bpw, "
+              f"{s['layers']}L, {s['kv_heads']} kv-heads x {s['head_dim']})")
+        if r["max_ctx"]:
+            print(f"         fits up to {r['max_ctx']:,} tokens of context")
+        else:
+            print("         weights alone do not fit — use a smaller quant or model")
+        if not r["fits"] and kv == "f16":
+            alt = estimate_vram(s, r["ctx"], None, "q8_0")
+            if alt["total_gib"] <= budget:
+                print(f"         -> fits at {alt['total_gib']:.2f} GiB with "
+                      f"--kv q8_0 (llama.cpp --cache-type-k/v q8_0)")
+    print("-" * 72)
+    print("Estimates. bits-per-weight are llama.cpp measurements on LLaMA-family "
+          "models;\noverhead is a 0.5 GiB middle estimate for context and scratch "
+          "buffers.")
 
 
 def cmd_serve(model):
@@ -2144,6 +2432,13 @@ def main():
     p.add_argument("--no-cache", action="store_true", help="bypass the prompt cache")
     p.add_argument("--explain", action="store_true",
                    help="show routing score, rung scores and per-call cost")
+    p = sub.add_parser("fit", help="will this model fit in your GPU, and at what context?")
+    p.add_argument("model", nargs="?", help="model tag; omit to check every installed one")
+    p.add_argument("--ctx", type=int, default=None, help="context length in tokens")
+    p.add_argument("--vram", type=float, default=None, help="override detected free VRAM (GiB)")
+    p.add_argument("--kv", default="f16", choices=sorted(set(KV_BYTES)),
+                   help="KV cache dtype (llama.cpp --cache-type-k/v)")
+    p.add_argument("--json", action="store_true")
     p = sub.add_parser("cache")
     p.add_argument("--clear", action="store_true", help="delete all cached answers")
     p.add_argument("--stats", action="store_true", help="show cache stats (default)")
@@ -2192,6 +2487,8 @@ def main():
                 cascade=getattr(args, "cascade", False),
                 no_cache=getattr(args, "no_cache", False),
                 explain=getattr(args, "explain", False))
+    elif cmd == "fit":
+        cmd_fit(args.model, args.ctx, args.vram, args.kv, getattr(args, "json", False))
     elif cmd == "cache":
         cmd_cache(getattr(args, "clear", False))
     elif cmd == "examples":
