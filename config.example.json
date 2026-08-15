@@ -1,0 +1,28 @@
+{
+  "pricing": {
+    "my-model": { "in": 1.0, "out": 2.0, "cw": 1.0, "cr": 0.1 }
+  },
+  "route": {
+    "private": ["secret", "社内", "private", "local", "offline"],
+    "heavy":   ["code", "設計", "refactor", "debug", "architecture"]
+  },
+  "extra_runtimes": [
+    {
+      "name": "vLLM",
+      "type": "local",
+      "paid": false,
+      "procs": ["vllm", "vllm.entrypoints"],
+      "installed_paths": ["~/.vllm"],
+      "endpoint": "http://localhost:8000/v1",
+      "models_cmd": "curl -s http://localhost:8000/v1/models"
+    },
+    {
+      "name": "My Remote Agent",
+      "type": "remote",
+      "paid": true,
+      "procs": ["myagent"],
+      "installed_paths": ["~/myagent"],
+      "endpoint": "https://api.myagent.example"
+    }
+  ]
+}
