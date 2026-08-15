@@ -1152,35 +1152,79 @@ def cmd_examples():
     }, indent=2, ensure_ascii=False))
 
 
-def cmd_ask(prompt, provider, cfg):
-    """Unified inference: route to a cloud provider (OpenAI-compatible) or the
-    local Ollama API. One command, any backend — the hub entry point."""
+def local_ollama_provider():
+    """Synthesize an implicit local provider from a running Ollama, so `lmm ask`
+    works even with no config (zero-config hub). Returns dict or None."""
+    d = detect_ollama()
+    if not d.get("running"):
+        return None
+    models = d.get("models") or []
+    model = models[0] if models else "qwen2.5-coder:3b"
+    return {"api_key": "ollama", "base_url": "http://localhost:11434/v1",
+            "model": model, "kind": "local", "_implicit": True}
+
+
+def resolve_ask_targets(cfg, prompt, explicit):
+    """Ordered providers to try. Priority is USER-CONTROLLED via cfg['ask_order']
+    (a list of provider names). Falls back to implicit running Ollama.
+
+    Order:  explicit  >  cfg['ask_order']  >  (keyword-matched)  >  implicit
+    running Ollama as final safety net. With no ask_order set, the old default
+    (keyword match, then all configured, then implicit Ollama) applies.
+    """
     provs = merged_providers(cfg)
-    if provider:
-        if provider not in provs:
-            print(f"[ask] unknown provider '{provider}'. Configured: "
-                  f"{', '.join(provs) or '(none - add to config providers)'}")
-            return
-        chosen = provider
-    else:
-        chosen = pick_provider_for_task(cfg, prompt, provs)
-        if not chosen:
-            print("[ask] no provider configured. Add 'providers' to your lmm "
-                  "config (see `lmm examples`). Local Ollama is used only when "
-                  "a 'local' provider entry points at :11434.")
-            return
-    prov = provs[chosen]
-    print(f"[ask] -> {chosen} ({prov['model'] or 'no model set'})")
-    res = call_provider(prov, prompt)
-    if isinstance(res, dict) and res.get("error"):
-        print(f"[ask] error: {res['error']}")
+    if explicit:
+        if explicit in provs:
+            return [(explicit, provs[explicit])]
+        lo = local_ollama_provider()
+        if explicit in ("local", "ollama", "local-ollama") and lo:
+            return [("local-ollama(implicit)", lo)]
+        return []
+    order = list(cfg.get("ask_order") or [])
+    out, seen = [], set()
+    for n in order:                      # user-defined priority, in full
+        if n in provs and n not in seen:
+            out.append((n, provs[n])); seen.add(n)
+    if not order:                       # no ask_order: sensible default
+        pk = pick_provider_for_task(cfg, prompt, provs)
+        if pk and pk not in seen:
+            out.append((pk, provs[pk])); seen.add(pk)
+        for n, p in provs.items():
+            if n not in seen:
+                out.append((n, p)); seen.add(n)
+    lo = local_ollama_provider()        # always-on zero-config safety net
+    if lo and "local-ollama(implicit)" not in seen:
+        out.append(("local-ollama(implicit)", lo))
+    return out
+
+
+
+def cmd_ask(prompt, provider, cfg):
+    """Unified inference with auto-routing + fallback: tries providers in order
+    (explicit > private/local > configured > implicit running Ollama) and
+    falls through to the next on error. This is the hub's intelligence. Priority is set by cfg['ask_order']."""
+    targets = resolve_ask_targets(cfg, prompt, provider)
+    if not targets:
+        print("[ask] no provider available. Start Ollama (`lmm serve <model>`) "
+              "or add 'providers' to lmm config (see `lmm examples`).")
         return
-    try:
-        msg = res["choices"][0]["message"]["content"]
-        print(msg)
-    except (KeyError, IndexError, TypeError):
-        print("[ask] unexpected response:")
-        print(json.dumps(res, indent=2, ensure_ascii=False)[:2000])
+    last_err = None
+    for name, prov in targets:
+        print(f"[ask] -> trying {name} ({prov['model'] or 'no model set'})")
+        res = call_provider(prov, prompt)
+        if isinstance(res, dict) and res.get("error"):
+            last_err = res["error"]
+            print(f"[ask]    {name} failed: {last_err} -- fallback")
+            continue
+        try:
+            msg = res["choices"][0]["message"]["content"]
+            print(msg)
+            return
+        except (KeyError, IndexError, TypeError):
+            last_err = "unexpected response"
+            print(f"[ask]    {name} returned unexpected shape -- fallback")
+            continue
+    print(f"[ask] all providers failed. last error: {last_err}")
 
 
 
