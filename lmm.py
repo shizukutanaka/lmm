@@ -655,6 +655,31 @@ def cost_report(cfg, days=30):
     out.append("")
     out.append("Tip: set real cloud usage in lmm config 'usage' to replace "
                "this estimate with measured cost.")
+    # ---- measured cloud usage (user-provided, replaces estimate) ----
+    # cfg['usage'] accepts either a USD amount per provider:
+    #   "usage": {"openai": 12.50, "gemini": 3.20}
+    # or token counts priced via the rate table:
+    #   "usage": {"openai": {"in": 1000000, "out": 2000000}}
+    usage = cfg.get("usage") or {}
+    if usage:
+        out.append("")
+        out.append("=" * 64)
+        out.append("MEASURED CLOUD USAGE (from lmm config 'usage')")
+        out.append("-" * 64)
+        measured = 0.0
+        for name, val in sorted(usage.items()):
+            if isinstance(val, dict):
+                p = pricing.get(name, pricing["default"])
+                c = (val.get("in", 0) / 1e6 * p["in"]
+                     + val.get("out", 0) / 1e6 * p["out"])
+                out.append(f"  {name:22} {val}  = ${c:,.2f}")
+            else:
+                c = float(val)
+                out.append(f"  {name:22} ${c:,.2f}")
+            measured += c
+        out.append("-" * 64)
+        out.append(f"MEASURED CLOUD TOTAL  ${measured:,.2f}")
+        out.append(f"ALL-IN TOTAL (Claude + cloud)  ${grand + measured:,.2f}")
     return "\n".join(out)
 
 
@@ -1132,6 +1157,10 @@ def cmd_examples():
                        "model": "gemini-1.5-pro", "kind": "remote"},
             "my-local": {"api_key": "ollama", "base_url": "http://localhost:11434/v1",
                          "model": "qwen2.5-coder:7b", "kind": "local"}
+        },
+        "usage": {
+            "openai": 12.50,
+            "gemini": {"in": 1000000, "out": 2000000}
         },
         "extra_runtimes": [
             {
