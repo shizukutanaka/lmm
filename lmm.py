@@ -297,6 +297,69 @@ def merged_route(cfg):
     return r
 
 
+def merged_providers(cfg):
+    """Return the cloud/remote provider registry from config.
+
+    Each provider entry: {api_key, base_url, model, kind}. Used by `lmm ask`
+    and `lmm serve --hub` so a single `lmm` command can target any backend
+    through one OpenAI-compatible interface.
+    """
+    provs = {}
+    for name, v in (cfg.get("providers") or {}).items():
+        if not isinstance(v, dict):
+            continue
+        provs[name] = {
+            "api_key": v.get("api_key", ""),
+            "base_url": v.get("base_url", "https://api.openai.com/v1"),
+            "model": v.get("model", ""),
+            "kind": v.get("kind", "remote"),
+        }
+    return provs
+
+
+def http_post_json(url, payload, api_key, timeout=60):
+    """Minimal OpenAI-compatible chat completion call (zero-dep, stdlib only)."""
+    import urllib.request
+    data = json.dumps(payload).encode("utf-8")
+    req = urllib.request.Request(
+        url, data=data,
+        headers={"Content-Type": "application/json",
+                 "Authorization": f"Bearer {api_key}"})
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return json.loads(resp.read().decode("utf-8", "ignore"))
+    except Exception as e:  # network / auth errors must surface, not silently pass
+        return {"error": str(e)}
+
+
+def call_provider(prov, prompt, temperature=0.7):
+    """Send `prompt` to one provider (OpenAI-compatible /chat/completions)."""
+    if not prov.get("model"):
+        return {"error": "provider has no model set"}
+    url = prov["base_url"].rstrip("/") + "/chat/completions"
+    payload = {
+        "model": prov["model"],
+        "messages": [{"role": "user", "content": prompt}],
+        "temperature": temperature,
+    }
+    return http_post_json(url, payload, prov.get("api_key", ""))
+
+
+def pick_provider_for_task(cfg, task, provs):
+    """Choose a provider via the same keyword logic as route_task, but over
+    the configured cloud providers. Falls back to the first provider."""
+    rt = merged_route(cfg)
+    t = (task or "").lower()
+    if any(k in t for k in rt.get("private", [])):
+        for name, p in provs.items():
+            if p.get("kind") == "local":
+                return name
+    for name in provs:
+        if name.lower() in t:
+            return name
+    return next(iter(provs), None)
+
+
 # ----------------------------- detectors -----------------------------------
 def detect_ollama():
     r = run("ollama list")
@@ -708,6 +771,80 @@ def cmd_serve(model):
     print("endpoint ready: http://localhost:11434  (OpenAI-compatible)")
 
 
+def cmd_serve_hub(cfg, host, port):
+    """Start an OpenAI-compatible proxy that fans out to every configured
+    provider (cloud + local). Apps point at this one endpoint; `lmm` routes
+    each request. This is the hub: one endpoint, many backends."""
+    import http.server, socketserver, threading
+    provs = merged_providers(cfg)
+    if not provs:
+        print("[hub] no providers configured. Add 'providers' to lmm config "
+              "(see `lmm examples`). Nothing to proxy.")
+        return
+
+    class Handler(http.server.BaseHTTPRequestHandler):
+        def _send(self, code, obj):
+            body = json.dumps(obj, ensure_ascii=False).encode("utf-8")
+            self.send_response(code)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def do_GET(self):
+            if self.path.rstrip("/").endswith("/v1/models"):
+                self._send(200, {"object": "list", "data": [
+                    {"id": n, "object": "model", "owned_by": p["kind"]}
+                    for n, p in provs.items()]})
+            else:
+                self._send(404, {"error": "not found"})
+
+        def do_POST(self):
+            if not self.path.rstrip("/").endswith("/v1/chat/completions"):
+                self._send(404, {"error": "only /v1/chat/completions supported"})
+                return
+            length = int(self.headers.get("Content-Length", 0))
+            try:
+                req = json.loads(self.rfile.read(length).decode("utf-8", "ignore"))
+            except Exception as e:
+                self._send(400, {"error": f"bad json: {e}"})
+                return
+            # provider selection: body["model"] may be a configured provider name
+            name = req.get("model", "")
+            prov = provs.get(name)
+            if not prov:
+                prov = provs.get(pick_provider_for_task(cfg, req.get("messages", [{}])[0].get("content", "") if req.get("messages") else "", provs))
+            if not prov:
+                self._send(400, {"error": "no provider for model '%s'" % name})
+                return
+            # rewrite body model to the provider's actual model
+            fwd = dict(req)
+            fwd["model"] = prov["model"]
+            res = call_provider(prov, fwd.get("messages", [{}])[0].get("content", ""),
+                                temperature=fwd.get("temperature", 0.7))
+            if isinstance(res, dict) and res.get("error"):
+                self._send(502, {"error": res["error"]})
+                return
+            self._send(200, res)
+
+        def log_message(self, *a):
+            pass
+
+    class S(socketserver.ThreadingMixIn, http.server.HTTPServer):
+        daemon_threads = True
+
+    httpd = S((host, port), Handler)
+    print(f"[hub] OpenAI-compatible endpoint: http://{host}:{port}/v1")
+    print(f"[hub] backends: {', '.join(provs)}")
+    print("[hub] Ctrl+C to stop.")
+    try:
+        httpd.serve_forever()
+    except KeyboardInterrupt:
+        print("")
+        print("[hub] stopped.")
+
+
+
 def cmd_stop(runtime, cfg):
     table = dict(STOP_TABLE)
     for e in cfg.get("extra_runtimes", []):
@@ -985,6 +1122,14 @@ def cmd_examples():
     print(json.dumps({
         "pricing": {"my-model": {"in": 1.0, "out": 2.0, "cw": 1.0, "cr": 0.1}},
         "route": {"private": ["secret", "社内"], "heavy": ["code", "設計"]},
+        "providers": {
+            "openai": {"api_key": "sk-...", "base_url": "https://api.openai.com/v1",
+                       "model": "gpt-4o", "kind": "remote"},
+            "gemini": {"api_key": "AIza...", "base_url": "https://generativelanguage.googleapis.com/v1beta/openai/",
+                       "model": "gemini-1.5-pro", "kind": "remote"},
+            "my-local": {"api_key": "ollama", "base_url": "http://localhost:11434/v1",
+                         "model": "qwen2.5-coder:7b", "kind": "local"}
+        },
         "extra_runtimes": [
             {
                 "name": "vLLM",
@@ -1007,6 +1152,38 @@ def cmd_examples():
     }, indent=2, ensure_ascii=False))
 
 
+def cmd_ask(prompt, provider, cfg):
+    """Unified inference: route to a cloud provider (OpenAI-compatible) or the
+    local Ollama API. One command, any backend — the hub entry point."""
+    provs = merged_providers(cfg)
+    if provider:
+        if provider not in provs:
+            print(f"[ask] unknown provider '{provider}'. Configured: "
+                  f"{', '.join(provs) or '(none - add to config providers)'}")
+            return
+        chosen = provider
+    else:
+        chosen = pick_provider_for_task(cfg, prompt, provs)
+        if not chosen:
+            print("[ask] no provider configured. Add 'providers' to your lmm "
+                  "config (see `lmm examples`). Local Ollama is used only when "
+                  "a 'local' provider entry points at :11434.")
+            return
+    prov = provs[chosen]
+    print(f"[ask] -> {chosen} ({prov['model'] or 'no model set'})")
+    res = call_provider(prov, prompt)
+    if isinstance(res, dict) and res.get("error"):
+        print(f"[ask] error: {res['error']}")
+        return
+    try:
+        msg = res["choices"][0]["message"]["content"]
+        print(msg)
+    except (KeyError, IndexError, TypeError):
+        print("[ask] unexpected response:")
+        print(json.dumps(res, indent=2, ensure_ascii=False)[:2000])
+
+
+
 def main():
     ap = argparse.ArgumentParser(
         description="LMM - Local/remote Model Manager (cross-platform, zero-dep)")
@@ -1021,6 +1198,10 @@ def main():
     p.add_argument("task", nargs="?")
     p = sub.add_parser("serve")
     p.add_argument("model", nargs="?")
+    p.add_argument("--hub", action="store_true",
+                   help="start OpenAI-compatible proxy over all configured providers")
+    p.add_argument("--host", default="127.0.0.1")
+    p.add_argument("--port", type=int, default=8080)
     p = sub.add_parser("stop")
     p.add_argument("runtime", nargs="?")
     sub.add_parser("dash")
@@ -1029,6 +1210,9 @@ def main():
     p.add_argument("--interval", type=float, default=3.0)
     sub.add_parser("autostart")
     sub.add_parser("hide").add_argument("runtime", nargs="?")
+    p = sub.add_parser("ask")
+    p.add_argument("prompt", nargs="*")
+    p.add_argument("--provider", default=None, help="provider name from config")
     sub.add_parser("examples")
     args = ap.parse_args()
     if args.version:
@@ -1052,7 +1236,10 @@ def main():
     elif cmd == "route":
         print(f"task: {args.task}\n=> recommend: {route_task(cfg, args.task)}")
     elif cmd == "serve":
-        cmd_serve(args.model)
+        if getattr(args, "hub", False):
+            cmd_serve_hub(cfg, args.host, args.port)
+        else:
+            cmd_serve(args.model)
     elif cmd == "stop":
         cmd_stop(args.runtime, cfg)
     elif cmd == "dash":
@@ -1063,6 +1250,8 @@ def main():
         cmd_watch(cfg, args.interval)
     elif cmd == "autostart":
         cmd_autostart()
+    elif cmd == "ask":
+        cmd_ask(" ".join(getattr(args, "prompt", [])), getattr(args, "provider", None), cfg)
     elif cmd == "examples":
         cmd_examples()
 
