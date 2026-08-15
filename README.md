@@ -43,9 +43,12 @@ lmm discover        -> list every detected runtime (CLI)
 lmm cli             -> same as discover (explicit CLI mode)
 lmm status          -> live status + GPU memory
 lmm models          -> local models installed (Ollama)
-lmm cost [--days N] -> measured Anthropic token cost from your session logs
-lmm route "task"    -> recommend local vs remote for a task
+lmm cost [--days N] -> measured spend: Anthropic logs + lmm's own hub telemetry
+lmm route "task"    -> recommend local vs remote (--explain for the score)
+lmm ask "prompt"    -> ask any backend: cached, routed, optionally cascaded
 lmm serve <model>   -> pull + expose a local model endpoint (Ollama)
+lmm serve --hub     -> OpenAI-compatible proxy over every configured provider
+lmm cache           -> prompt-cache stats (--clear to drop it)
 lmm stop <runtime>  -> stop a running runtime
 lmm hide <runtime>  -> strip a runtime's taskbar button (Claude/ChatGPT/...)
 lmm watch           -> background daemon: auto-hide new LLM windows
@@ -54,6 +57,57 @@ lmm dash            -> generate + open a self-contained HTML dashboard
 lmm gui             -> open the live GUI dashboard explicitly
 lmm examples        -> print a sample config file
 ```
+
+### The hub: one endpoint, and a cheaper bill
+
+Point your apps at `lmm serve --hub` and every request goes through one path —
+cache, routing, cascade, metering — across all your local and cloud backends.
+Three published techniques do the cost work, implemented with the standard
+library alone:
+
+| Layer | Paper | What it does here |
+|-------|-------|-------------------|
+| Cache | [GPT Semantic Cache](https://arxiv.org/abs/2411.05276) (68.8% fewer API calls) | Exact-hash tier is on by default; an optional semantic tier uses **local** Ollama embeddings, never a paid one |
+| Routing | [RouteLLM](https://arxiv.org/abs/2406.18665), ICLR 2025 (40% fewer strong-model calls, <5% quality loss) | Scores the prompt and compares it to a cost threshold `α`; easy prompts try cheap providers first |
+| Cascade | [FrugalGPT](https://arxiv.org/abs/2305.05176) (up to 98% cost reduction) | `--cascade` runs cheap models first and escalates only when the answer scores badly |
+
+[vCache](https://arxiv.org/abs/2502.03771) shows a single static similarity
+threshold cannot bound false cache hits, so the semantic tier is **opt-in**, its
+default threshold is a strict `0.95`, and every near miss is logged so you can
+tune it from evidence (`lmm cache`).
+
+RouteLLM and FrugalGPT both learn their scorers from training data. lmm has
+neither the data nor the dependencies for that, so it approximates them with
+lexical features and a heuristic answer verifier. The thresholds — the part you
+actually tune — work exactly as published.
+
+```bash
+$ lmm ask --cascade --explain "what is 2+2"
+[route] strength=0.03 threshold=0.5 -> local-ollama, deepseek, openai
+[cascade] rung0 local-ollama score=0.85 $0.0000 -> accept
+[cascade] total $0.0000 over 1 rung(s)
+4
+
+$ lmm ask --cascade --explain "what is 2+2"      # asked again
+[cache] exact hit (sim=1.000) — $0.0000, saved ~$0.0012
+4
+
+$ lmm route --explain "refactor this async scheduler and explain why it deadlocks"
+  heavy keyword (refactor)               +0.30
+  code marker (async)                    +0.25
+  reasoning marker (explain why)         +0.20
+  strength s = 0.94  >=  threshold 0.50
+=> strong-first: openai, deepseek, local-ollama
+```
+
+Nothing here is on by default except the exact-match cache. With no config at
+all, `lmm ask` behaves as it always did — it just now records what each call
+cost. **Your own `ask_order` always wins**: auto-routing only decides the order
+you did not specify.
+
+Privacy outranks price everywhere: a prompt matching your `route.private`
+keywords is pinned to local providers, and a cascade on such a prompt will not
+escalate off the machine no matter how badly the local model scores.
 
 ### The taskbar problem, solved
 
@@ -97,8 +151,41 @@ Devin/Cua. Add your own in `~/.lmm/config.json` (see `lmm examples`).
 ## Configuration
 
 Works with zero config. `~/.lmm/config.json` (or `~/.config/lmm/config.json`,
-or `./lmm.config.json`) can add runtimes, override pricing, or change routing
-keywords. See `lmm examples` for the shape.
+or `./lmm.config.json`) can add runtimes, override pricing, change routing
+keywords, or configure the hub. See `lmm examples` for the full shape —
+`config.example.json` is generated from it, so the two never drift.
+
+| Key | Purpose |
+|-----|---------|
+| `providers` | Your backends. Optional `price` (a rate-table key or `{in,out}`) makes the cost numbers exact |
+| `ask_order` | Provider priority. Set it and lmm follows it exactly |
+| `route_threshold` | RouteLLM's `α`, default `0.5`. `null` disables auto-routing |
+| `cascade` | `{enabled, rungs, threshold, max_rungs, judge}` — omit `rungs` and they're built cheapest-first automatically |
+| `cache` | `{enabled, semantic, similarity, ttl_hours, max_entries, embed_model, max_temp}` |
+| `pricing` / `route` / `usage` / `extra_runtimes` | As before |
+
+## What lmm stores
+
+Two append-only JSONL files under `~/.lmm/`, both plain text you can `cat`:
+
+- `usage.jsonl` — one line per call: provider, model, tokens, USD, cache
+  status, cascade rung. This is what `lmm cost` reads, and what makes
+  `--days N` meaningful.
+- `cache.jsonl` — cached answers (and embeddings, if the semantic tier is on).
+  Drop it any time with `lmm cache --clear`.
+
+Still no secrets: API keys live in your config, are used, and are never copied
+into either file.
+
+## Tests
+
+```bash
+python3 -m unittest discover -s tests -v
+```
+
+Stdlib `unittest`, no network, no fixtures to install — the same
+zero-dependency rule the tool follows. `lmm.py` stays a single distributable
+file; the tests live outside it.
 
 ## How it works
 
@@ -106,7 +193,9 @@ keywords. See `lmm examples` for the shape.
 |----------------|-----------------------------------------------------------------|
 | Discovery      | Probe each runtime's process + data dir + endpoint              |
 | Secrets        | Only *check* existence of existing credentials; never store one |
-| Cost           | Aggregate real tokens from `~/.claude/projects/*.jsonl` × public pricing |
+| Cost           | Real tokens from `~/.claude/projects/*.jsonl` × public pricing, plus lmm's own metered hub calls |
+| Routing        | Lexical strength score vs a cost threshold; your `ask_order` overrides it |
+| Cache          | sha256 of the normalized conversation; optional local-embedding similarity tier |
 | Taskbar hide   | `WS_EX_TOOLWINDOW` on visible windows (Win); headless launch advised for servers |
 | Auto mode      | `watch` daemon hides new LLM windows every few seconds          |
 | Portability    | `expanduser` paths, `tasklist`/`pgrep`, `tkinter` for the GUI   |

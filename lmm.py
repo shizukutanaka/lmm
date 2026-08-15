@@ -19,19 +19,35 @@
 #   discover [--json]   list every detected runtime
 #   status              live status + GPU
 #   models              local models installed
-#   cost [--days N]     measured Anthropic token cost from session logs
-#   route "task ..."    recommend local vs remote for a task
+#   cost [--days N]     measured spend: Anthropic session logs + lmm's own hub
+#   route "task ..."    recommend local vs remote for a task (--explain)
+#   ask "prompt"        one question, routed across every backend (--cascade)
 #   serve <model>       pull + expose a local model endpoint (Ollama)
+#   serve --hub         OpenAI-compatible proxy over all configured providers
+#   cache               prompt-cache stats (--clear)
 #   stop  <runtime>     stop a running runtime
+#   hide  <runtime>     strip a runtime's taskbar button (Windows)
 #   dash                generate + open a self-contained HTML dashboard
 #   examples            show a sample config file you can copy
 #
 # Config (~/.lmm/config.json) lets anyone add their own runtimes, override
 # pricing, or change routing keywords. See `lmm examples`.
+#
+# The hub aims to be measurably cheaper than always calling the strongest
+# model. Three published techniques do the work, all stdlib-only:
+#   RouteLLM   arXiv:2406.18665 - score the prompt, route on a cost threshold
+#   FrugalGPT  arXiv:2305.05176 - cheap models first, escalate on a low score
+#   GPT Sem.   arXiv:2411.05276 - reuse answers instead of re-paying for them
+#                (with vCache arXiv:2502.03771 on why fuzzy hits must be opt-in)
+# Every call is metered to ~/.lmm/usage.jsonl so the savings are measured
+# rather than asserted -- see `lmm cost`.
 # ---------------------------------------------------------------------------
 import os
 import sys
 import json
+import time
+import math
+import hashlib
 import argparse
 import subprocess
 import datetime
@@ -40,6 +56,13 @@ import webbrowser
 import ctypes
 
 HOME = os.path.expanduser("~")
+
+# lmm's own state lives here: measured usage telemetry and the prompt cache.
+# Both are append-only JSONL so they stay inspectable with `cat`/`tail` and
+# never need a database.
+LMM_DIR   = os.path.join(HOME, ".lmm")
+USAGE_LOG = os.path.join(LMM_DIR, "usage.jsonl")
+CACHE_LOG = os.path.join(LMM_DIR, "cache.jsonl")
 
 # ---- Public pricing (USD per 1M tokens) — approximate, editable ----
 # Claude families (measured from ~/.claude session logs when available):
@@ -67,6 +90,56 @@ DEFAULT_ROUTE = {
     "heavy":   ["code", "design", "refactor", "debug", "architecture",
                 "リファクタ", "設計", "コード", "デバッグ", "大規模"],
 }
+
+# --- Cost-reduction defaults (see the three papers referenced below) --------
+# The hub is only worth having if it is measurably cheaper than calling the
+# strongest model every time. Three published techniques, all implemented here
+# with the stdlib alone:
+#
+#   routing  : RouteLLM (Ong et al., ICLR 2025, arXiv:2406.18665) — score the
+#              prompt, compare against a cost threshold, send weak-first when
+#              the strong model probably would not win.
+#   cascade  : FrugalGPT (Chen/Zaharia/Zou, arXiv:2305.05176) — run cheap
+#              models first and escalate only when a scorer rejects the answer.
+#   cache    : GPT Semantic Cache (arXiv:2411.05276) — reuse answers instead of
+#              re-paying for them. vCache (arXiv:2502.03771) shows a single
+#              static similarity threshold cannot bound false hits, so the
+#              semantic tier is opt-in and its default threshold is strict.
+DEFAULT_ROUTE_THRESHOLD = 0.5      # RouteLLM's alpha: s >= alpha -> strong-first
+
+DEFAULT_CASCADE = {
+    "enabled":   False,   # opt-in; --cascade turns it on for one call
+    "rungs":     [],      # empty -> auto-built cheapest-first from prices
+    "threshold": 0.6,     # accept an answer scoring >= this, else escalate
+    "max_rungs": 3,       # never spend more than this many calls on one prompt
+    "judge":     None,    # provider name for an LLM-as-judge second opinion
+}
+
+DEFAULT_CACHE = {
+    "enabled":     True,   # tier 1 (exact hash) is safe enough to default on
+    "semantic":    False,  # tier 2 needs local embeddings AND accepts fuzzy hits
+    "similarity":  0.95,   # strict on purpose — see vCache, arXiv:2502.03771
+    "ttl_hours":   168,    # a week; answers go stale, especially about code
+    "max_entries": 2000,
+    "embed_model": "nomic-embed-text",
+    "max_temp":    0.3,    # above this the caller wants variety, not a cache
+}
+
+# Cheap lexical features standing in for RouteLLM's learned win-predictor.
+# Each entry is (label, weight); the matching logic lives in prompt_strength().
+STRENGTH_CODE_MARKERS = ("```", "def ", "class ", "function ", "import ",
+                         "select ", "#include", "=>", "();", "async ")
+STRENGTH_REASON_MARKERS = ("step by step", "step-by-step", "explain why", "why ",
+                           "compare", "trade-off", "tradeoff", "prove", "derive",
+                           "なぜ", "理由", "比較", "手順", "設計")
+
+# FrugalGPT's scorer is learned from data; with no training set available we
+# approximate it by penalising the failure modes small models actually exhibit.
+VERIFY_REFUSAL_MARKERS = ("i can't", "i cannot", "i'm unable", "i am unable",
+                          "as an ai", "i don't have access", "sorry, i",
+                          "申し訳", "できません", "わかりません", "不明です")
+VERIFY_HEDGE_MARKERS = ("i think", "maybe", "probably", "not sure", "might be",
+                        "i believe", "たぶん", "おそらく", "かもしれ")
 
 # runtime name -> process names to kill
 STOP_TABLE = {
@@ -297,12 +370,29 @@ def merged_route(cfg):
     return r
 
 
+def merged_cascade(cfg):
+    c = dict(DEFAULT_CASCADE)
+    c.update(cfg.get("cascade") or {})
+    return c
+
+
+def merged_cache(cfg):
+    c = dict(DEFAULT_CACHE)
+    c.update(cfg.get("cache") or {})
+    return c
+
+
 def merged_providers(cfg):
     """Return the cloud/remote provider registry from config.
 
-    Each provider entry: {api_key, base_url, model, kind}. Used by `lmm ask`
-    and `lmm serve --hub` so a single `lmm` command can target any backend
-    through one OpenAI-compatible interface.
+    Each provider entry: {api_key, base_url, model, kind, price}. Used by
+    `lmm ask` and `lmm serve --hub` so a single `lmm` command can target any
+    backend through one OpenAI-compatible interface.
+
+    `price` is optional and binds the provider to a rate: either a key in the
+    pricing table ("deepseek-chat") or an inline {"in": .., "out": ..}. Without
+    it we fall back to matching the model name, so existing configs keep
+    working — it only makes the cost numbers exact.
     """
     provs = {}
     for name, v in (cfg.get("providers") or {}).items():
@@ -313,6 +403,7 @@ def merged_providers(cfg):
             "base_url": v.get("base_url", "https://api.openai.com/v1"),
             "model": v.get("model", ""),
             "kind": v.get("kind", "remote"),
+            "price": v.get("price"),
         }
     return provs
 
@@ -332,16 +423,56 @@ def http_post_json(url, payload, api_key, timeout=60):
         return {"error": str(e)}
 
 
-def call_provider(prov, prompt, temperature=0.7):
-    """Send `prompt` to one provider (OpenAI-compatible /chat/completions)."""
+# Request fields we hand straight to the backend. Anything else in an incoming
+# hub request is lmm's business, not the provider's.
+PASSTHROUGH_KEYS = ("temperature", "max_tokens", "max_completion_tokens", "top_p",
+                    "stop", "presence_penalty", "frequency_penalty", "seed",
+                    "response_format", "tools", "tool_choice", "n", "user")
+
+
+def as_messages(prompt):
+    """Accept either a bare prompt string or an OpenAI messages array and
+    always return a messages array. Callers upstream of the hub deal in whole
+    conversations; `lmm ask` deals in one string."""
+    if isinstance(prompt, str):
+        return [{"role": "user", "content": prompt}]
+    return list(prompt or [])
+
+
+def messages_text(messages):
+    """Flatten a messages array to plain text for scoring/keying/hashing.
+    Content may be a string or the OpenAI content-parts list."""
+    parts = []
+    for m in as_messages(messages):
+        c = m.get("content") if isinstance(m, dict) else None
+        if isinstance(c, str):
+            parts.append(c)
+        elif isinstance(c, list):        # content parts: [{type:text,text:..}]
+            for seg in c:
+                if isinstance(seg, dict) and isinstance(seg.get("text"), str):
+                    parts.append(seg["text"])
+    return "\n".join(parts)
+
+
+def call_provider(prov, prompt, temperature=0.7, extra=None):
+    """Send a prompt (str) or a full messages array to one provider over the
+    OpenAI-compatible /chat/completions API.
+
+    Passing the whole array matters: a system prompt and prior turns carry the
+    caller's intent, and dropping them silently changes the answer.
+    """
     if not prov.get("model"):
         return {"error": "provider has no model set"}
     url = prov["base_url"].rstrip("/") + "/chat/completions"
     payload = {
         "model": prov["model"],
-        "messages": [{"role": "user", "content": prompt}],
+        "messages": as_messages(prompt),
         "temperature": temperature,
     }
+    for k in PASSTHROUGH_KEYS:                  # caller-supplied params win
+        if extra and k in extra and extra[k] is not None:
+            payload[k] = extra[k]
+    payload.pop("stream", None)                 # we never stream upstream
     return http_post_json(url, payload, prov.get("api_key", ""))
 
 
@@ -542,6 +673,106 @@ def discover(cfg):
 
 
 # ------------------------------ cost ---------------------------------------
+# Metering: every real call lmm makes records what it actually cost. Without
+# this, the routing/cascade/cache savings below would be a claim rather than a
+# measurement — and `cost --days N` had nothing dated to filter on.
+def price_for(prov, model, pricing):
+    """Resolve one provider+model to a {in,out,cw,cr} USD/1M-token rate.
+
+    Order: explicit provider 'price' > model-name match in the rate table >
+    provider-name match > default. Local runtimes are free by definition.
+    """
+    if (prov or {}).get("kind") == "local":
+        return {"in": 0.0, "out": 0.0, "cw": 0.0, "cr": 0.0}
+    p = (prov or {}).get("price")
+    if isinstance(p, dict):
+        return {"in": float(p.get("in", 0.0)), "out": float(p.get("out", 0.0)),
+                "cw": float(p.get("cw", 0.0)), "cr": float(p.get("cr", 0.0))}
+    if isinstance(p, str) and p in pricing:
+        return pricing[p]
+    hay = (model or "").lower()
+    if hay:
+        # longest key first so "openai-gpt4o-mini" beats "openai-gpt4o"
+        for k in sorted(pricing, key=len, reverse=True):
+            if k in ("default",):
+                continue
+            core = k.split("-")[-1]
+            if k in hay or (len(core) > 3 and core in hay):
+                return pricing[k]
+    return pricing["default"]
+
+
+def usage_cost(usage, rate):
+    """USD for one OpenAI-compatible `usage` block at the given rate."""
+    u = usage or {}
+    cached = 0
+    det = u.get("prompt_tokens_details")
+    if isinstance(det, dict):
+        cached = det.get("cached_tokens", 0) or 0
+    fresh_in = max((u.get("prompt_tokens", 0) or 0) - cached, 0)
+    return (fresh_in / 1e6 * rate.get("in", 0.0)
+            + (u.get("completion_tokens", 0) or 0) / 1e6 * rate.get("out", 0.0)
+            + cached / 1e6 * rate.get("cr", 0.0))
+
+
+def log_usage(event):
+    """Append one metering event to ~/.lmm/usage.jsonl. Never raises: telemetry
+    must not be able to break the call it is measuring."""
+    try:
+        os.makedirs(LMM_DIR, exist_ok=True)
+        event = dict(event)
+        event.setdefault("ts", datetime.datetime.now().isoformat(timespec="seconds"))
+        with open(USAGE_LOG, "a", encoding="utf-8") as fh:
+            fh.write(json.dumps(event, ensure_ascii=False) + "\n")
+    except Exception:
+        pass
+
+
+def read_usage(days=None):
+    """Read metering events, optionally only the last `days`."""
+    if not os.path.isfile(USAGE_LOG):
+        return []
+    cutoff = None
+    if days:
+        cutoff = datetime.datetime.now() - datetime.timedelta(days=days)
+    out = []
+    try:
+        with open(USAGE_LOG, encoding="utf-8", errors="ignore") as fh:
+            for line in fh:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    ev = json.loads(line)
+                except Exception:
+                    continue
+                if cutoff:
+                    try:
+                        if datetime.datetime.fromisoformat(ev.get("ts", "")) < cutoff:
+                            continue
+                    except Exception:
+                        pass
+                out.append(ev)
+    except Exception:
+        return out
+    return out
+
+
+def meter_call(prov_name, prov, model, res, pricing, **extra):
+    """Price one provider response and record it. Returns the USD charged."""
+    usage = (res or {}).get("usage") if isinstance(res, dict) else None
+    rate = price_for(prov, model, pricing)
+    usd = usage_cost(usage, rate)
+    ev = {"provider": prov_name, "model": model,
+          "kind": (prov or {}).get("kind", "remote"),
+          "in": (usage or {}).get("prompt_tokens", 0) or 0,
+          "out": (usage or {}).get("completion_tokens", 0) or 0,
+          "usd": round(usd, 6)}
+    ev.update(extra)
+    log_usage(ev)
+    return usd
+
+
 def model_family(s):
     s = (s or "").lower()
     for fam in ("opus", "sonnet", "haiku"):
@@ -550,19 +781,32 @@ def model_family(s):
     return "default"
 
 
-def measured_tokens():
+def measured_tokens(days=None):
+    """Aggregate real Anthropic token usage from ~/.claude/projects/*.jsonl.
+
+    `days` filters by session-file mtime — the session logs carry no single
+    reliable timestamp field, but the file's last write is when the session
+    last ran, which is the granularity `cost --days N` actually needs.
+    """
     if not os.path.isdir(CLAUDE_PROJECTS):
         return None
+    cutoff = time.time() - days * 86400 if days else None
     agg = {}
     total_sessions = 0
     for root, _, files in os.walk(CLAUDE_PROJECTS):
         for f in files:
             if not f.endswith(".jsonl"):
                 continue
+            path = os.path.join(root, f)
+            if cutoff is not None:
+                try:
+                    if os.path.getmtime(path) < cutoff:
+                        continue
+                except OSError:
+                    continue
             total_sessions += 1
             fam = "default"
             seen = False
-            path = os.path.join(root, f)
             try:
                 with open(path, encoding="utf-8", errors="ignore") as fh:
                     for line in fh:
@@ -597,7 +841,8 @@ def measured_tokens():
                             a["out"] += o
                             a["cw"] += cw
                             a["cr"] += cr
-                            a["sessions"].add(f)
+                            a["sessions"].add(path)  # full path: same filename
+                                                     # recurs across projects
             except Exception:
                 pass
     for a in agg.values():
@@ -607,12 +852,14 @@ def measured_tokens():
 
 def cost_report(cfg, days=30):
     pricing = merged_pricing(cfg)
-    data = measured_tokens()
-    if not data:
-        return "No Claude session logs found at ~/.claude/projects"
-    out = [f"Anthropic measured usage (all-time, {data['total_sessions']} sessions)",
-           "-" * 64]
+    data = measured_tokens(days)
+    window = f"last {days}d" if days else "all-time"
     grand = 0.0
+    if not data or not data.get("by_family"):
+        out = [f"No Claude session logs found at {CLAUDE_PROJECTS} ({window})"]
+        return "\n".join(out + hub_cost_block(cfg, pricing, days))
+    out = [f"Anthropic measured usage ({window}, {data['total_sessions']} sessions)",
+           "-" * 64]
     for fam, a in sorted(data["by_family"].items(),
                          key=lambda x: -(x[1]["in"] + x[1]["out"])):
         p = pricing.get(fam, pricing["default"])
@@ -652,10 +899,70 @@ def cost_report(cfg, days=30):
         # assume ~50/50 in/out split of the baseline for a simple comparison
         c = (proxy / 2 / 1e6 * p["in"]) + (proxy / 2 / 1e6 * p["out"])
         out.append(f"  {k:22} ~${c:,.2f}")
-    out.append("")
-    out.append("Tip: set real cloud usage in lmm config 'usage' to replace "
-               "this estimate with measured cost.")
-    # ---- measured cloud usage (user-provided, replaces estimate) ----
+    return "\n".join(out + hub_cost_block(cfg, pricing, days, grand))
+
+
+def hub_cost_block(cfg, pricing, days=None, claude_total=0.0):
+    """Everything lmm measured itself: real hub spend, what the cache and the
+    local runtimes saved, plus any hand-entered cfg['usage']."""
+    out = []
+    events = read_usage(days)
+    window = f"last {days}d" if days else "all-time"
+    measured = 0.0
+
+    if events:
+        by_prov = {}
+        hits = {"exact": 0, "semantic": 0}
+        saved_cache = 0.0
+        local_calls, local_tokens = 0, 0
+        for ev in events:
+            hit = ev.get("cache")
+            if hit in hits:
+                hits[hit] += 1
+                saved_cache += float(ev.get("saved_usd", 0.0) or 0.0)
+                continue
+            name = ev.get("provider", "?")
+            a = by_prov.setdefault(name, {"calls": 0, "in": 0, "out": 0, "usd": 0.0,
+                                          "kind": ev.get("kind", "remote")})
+            a["calls"] += 1
+            a["in"] += ev.get("in", 0) or 0
+            a["out"] += ev.get("out", 0) or 0
+            a["usd"] += float(ev.get("usd", 0.0) or 0.0)
+            if ev.get("kind") == "local":
+                local_calls += 1
+                local_tokens += (ev.get("in", 0) or 0) + (ev.get("out", 0) or 0)
+        out.append("")
+        out.append("=" * 64)
+        out.append(f"HUB MEASURED USAGE ({window}, from {USAGE_LOG})")
+        out.append("-" * 64)
+        for name, a in sorted(by_prov.items(), key=lambda x: -x[1]["usd"]):
+            tag = "free" if a["kind"] == "local" else "paid"
+            out.append(f"  {name:22} {a['calls']:4d} calls  "
+                       f"in={a['in']:,} out={a['out']:,}  "
+                       f"${a['usd']:,.4f} ({tag})")
+            measured += a["usd"]
+        out.append("-" * 64)
+        out.append(f"HUB MEASURED TOTAL  ${measured:,.4f}")
+
+        # The savings side of the ledger — the whole point of the cascade,
+        # the router and the cache.
+        strong = max((r.get("out", 0.0) for k, r in pricing.items()
+                      if k != "default"), default=0.0)
+        if local_calls:
+            would = local_tokens / 1e6 * strong
+            out.append(f"  LOCAL (free)         {local_calls:4d} calls, "
+                       f"{local_tokens:,} tok — would cost ~${would:,.4f} "
+                       f"at the priciest configured rate")
+        if hits["exact"] or hits["semantic"]:
+            out.append(f"  CACHE                {hits['exact'] + hits['semantic']:4d} hits "
+                       f"(exact {hits['exact']} / semantic {hits['semantic']}) — "
+                       f"saved ~${saved_cache:,.4f}")
+    else:
+        out.append("")
+        out.append(f"No hub telemetry yet ({USAGE_LOG}). Run `lmm ask ...` or "
+                   "`lmm serve --hub` and spend will be measured automatically.")
+
+    # ---- hand-entered cloud usage (still supported alongside telemetry) ----
     # cfg['usage'] accepts either a USD amount per provider:
     #   "usage": {"openai": 12.50, "gemini": 3.20}
     # or token counts priced via the rate table:
@@ -666,7 +973,7 @@ def cost_report(cfg, days=30):
         out.append("=" * 64)
         out.append("MEASURED CLOUD USAGE (from lmm config 'usage')")
         out.append("-" * 64)
-        measured = 0.0
+        manual = 0.0
         for name, val in sorted(usage.items()):
             if isinstance(val, dict):
                 p = pricing.get(name, pricing["default"])
@@ -676,14 +983,44 @@ def cost_report(cfg, days=30):
             else:
                 c = float(val)
                 out.append(f"  {name:22} ${c:,.2f}")
-            measured += c
+            manual += c
         out.append("-" * 64)
-        out.append(f"MEASURED CLOUD TOTAL  ${measured:,.2f}")
-        out.append(f"ALL-IN TOTAL (Claude + cloud)  ${grand + measured:,.2f}")
-    return "\n".join(out)
+        out.append(f"MEASURED CLOUD TOTAL  ${manual:,.2f}")
+        measured += manual
+    if measured:
+        out.append("")
+        out.append(f"ALL-IN TOTAL (Claude + cloud)  ${claude_total + measured:,.2f}")
+    return out
 
 
 # ------------------------------ routing ------------------------------------
+def cmd_route(cfg, task, explain=False):
+    """Recommend local vs remote, and with --explain show the RouteLLM-style
+    strength score that drives provider ordering."""
+    print(f"task: {task}\n=> recommend: {route_task(cfg, task)}")
+    if not explain:
+        return
+    score, feats = prompt_strength(cfg, task)
+    thr = cfg.get("route_threshold", DEFAULT_ROUTE_THRESHOLD)
+    print("")
+    print("strength features (RouteLLM-style, arXiv:2406.18665):")
+    for label, w in feats or [("(no features matched)", 0.0)]:
+        print(f"  {label:38} {w:+.2f}")
+    if is_private(cfg, task):
+        print("  private keyword -> local pinned regardless of score")
+    rel = ">=" if thr is not None and score >= thr else "<"
+    print(f"  strength s = {score:.2f}  {rel}  threshold {thr}")
+    targets = resolve_ask_targets(cfg, task, None)
+    if targets:
+        mode = "strong-first" if thr is not None and score >= thr else "weak-first"
+        if cfg.get("ask_order"):
+            mode = "user ask_order (auto-routing deferred)"
+        print(f"=> {mode}: "
+              + ", ".join(n for n, _ in order_targets(cfg, task, targets)))
+    else:
+        print("=> no providers configured; add 'providers' or start Ollama")
+
+
 def route_task(cfg, task):
     t = (task or "").lower()
     rt = merged_route(cfg)
@@ -802,9 +1139,10 @@ def cmd_serve_hub(cfg, host, port):
     each request. This is the hub: one endpoint, many backends."""
     import http.server, socketserver, threading
     provs = merged_providers(cfg)
-    if not provs:
-        print("[hub] no providers configured. Add 'providers' to lmm config "
-              "(see `lmm examples`). Nothing to proxy.")
+    if not provs and not local_ollama_provider():
+        print("[hub] no providers configured and no local Ollama running. "
+              "Start Ollama (`lmm serve <model>`) or add 'providers' to lmm "
+              "config (see `lmm examples`). Nothing to proxy.")
         return
 
     class Handler(http.server.BaseHTTPRequestHandler):
@@ -834,26 +1172,28 @@ def cmd_serve_hub(cfg, host, port):
             except Exception as e:
                 self._send(400, {"error": f"bad json: {e}"})
                 return
-            # routing: reuse the SAME intelligence as `lmm ask` —
-            # cfg['ask_order'] + auto-routing + implicit-Ollama fallback.
+            # Routing, cascade, cache and metering are the SAME code path as
+            # `lmm ask` (hub_complete) — one hub, one routing brain. The whole
+            # messages array is forwarded, so system prompts and prior turns
+            # survive the hop.
             msgs = req.get("messages", [])
-            prompt = msgs[0].get("content", "") if msgs else ""
             explicit = req.get("model", "")  # may be a configured provider name
-            targets = resolve_ask_targets(cfg, prompt, explicit if explicit in provs else None)
+            targets = resolve_ask_targets(
+                cfg, messages_text(msgs), explicit if explicit in provs else None)
             if not targets:
                 self._send(400, {"error": "no provider available for model '%s'" % explicit})
                 return
-            last_err = None
-            for name, prov in targets:
-                fwd = dict(req)
-                fwd["model"] = prov["model"]
-                res = call_provider(prov, prompt, temperature=fwd.get("temperature", 0.7))
-                if isinstance(res, dict) and res.get("error"):
-                    last_err = res["error"]
-                    continue
-                self._send(200, res)
+            no_cache = (bool(req.get("lmm_no_cache"))
+                        or self.headers.get("X-LMM-No-Cache") is not None)
+            extra = {k: req[k] for k in PASSTHROUGH_KEYS if k in req}
+            res, _trace = hub_complete(cfg, msgs, targets,
+                                       {"cascade": bool(req.get("lmm_cascade")),
+                                        "cache": not no_cache,
+                                        "extra": extra, "source": "hub"})
+            if isinstance(res, dict) and res.get("error"):
+                self._send(502, {"error": "all providers failed: %s" % res["error"]})
                 return
-            self._send(502, {"error": "all providers failed: %s" % last_err})
+            self._send(200, res)
 
         def log_message(self, *a):
             pass
@@ -1152,12 +1492,35 @@ def cmd_examples():
         "route": {"private": ["secret", "社内"], "heavy": ["code", "設計"]},
         "providers": {
             "openai": {"api_key": "sk-...", "base_url": "https://api.openai.com/v1",
-                       "model": "gpt-4o", "kind": "remote"},
+                       "model": "gpt-4o", "kind": "remote",
+                       "price": "openai-gpt4o"},
             "gemini": {"api_key": "AIza...", "base_url": "https://generativelanguage.googleapis.com/v1beta/openai/",
-                       "model": "gemini-1.5-pro", "kind": "remote"},
+                       "model": "gemini-1.5-pro", "kind": "remote",
+                       "price": {"in": 1.25, "out": 5.0}},
             "my-local": {"api_key": "ollama", "base_url": "http://localhost:11434/v1",
                          "model": "qwen2.5-coder:7b", "kind": "local"}
         },
+        # Provider priority. Set it and lmm follows your order exactly;
+        # leave it out and route_threshold below decides.
+        "ask_order": ["my-local", "openai"],
+        # RouteLLM-style cost threshold (arXiv:2406.18665). Prompts scoring
+        # below it try the cheap providers first. null disables auto-routing.
+        "route_threshold": 0.5,
+        # FrugalGPT-style cascade (arXiv:2305.05176): run cheap models first,
+        # escalate only when the answer scores below `threshold`.
+        "cascade": {
+            "enabled": False, "rungs": ["my-local", "openai"],
+            "threshold": 0.6, "max_rungs": 3, "judge": None
+        },
+        # Prompt cache. The semantic tier needs a local embedding model and
+        # accepts fuzzy matches, so it is opt-in (see vCache, arXiv:2502.03771).
+        "cache": {
+            "enabled": True, "semantic": False, "similarity": 0.95,
+            "ttl_hours": 168, "max_entries": 2000,
+            "embed_model": "nomic-embed-text", "max_temp": 0.3
+        },
+        # Optional: hand-entered cloud spend, added on top of what lmm
+        # measures itself in ~/.lmm/usage.jsonl.
         "usage": {
             "openai": 12.50,
             "gemini": {"in": 1000000, "out": 2000000}
@@ -1231,32 +1594,515 @@ def resolve_ask_targets(cfg, prompt, explicit):
 
 
 
-def cmd_ask(prompt, provider, cfg):
-    """Unified inference with auto-routing + fallback: tries providers in order
-    (explicit > private/local > configured > implicit running Ollama) and
-    falls through to the next on error. This is the hub's intelligence. Priority is set by cfg['ask_order']."""
+# ------------------- (2) RouteLLM-style threshold routing -------------------
+# Ong et al., "RouteLLM: Learning to Route LLMs with Preference Data",
+# ICLR 2025 (arXiv:2406.18665). Their router predicts the probability that the
+# strong model wins and converts it into a strong-vs-weak decision with a cost
+# threshold alpha; they report ~40% fewer strong-model calls at <5% quality
+# loss. Their predictor is trained on Chatbot Arena preferences, which we have
+# neither the data nor the dependencies to reproduce, so the win probability is
+# approximated by cheap lexical features. The threshold half of the framework
+# is exactly as published, and it is the half the user tunes.
+def is_private(cfg, text):
+    """Privacy beats price: a prompt matching route.private stays local even if
+    a cloud model would answer it better."""
+    low = (text or "").lower()
+    return any(k.lower() in low for k in merged_route(cfg).get("private", []))
+
+
+def prompt_strength(cfg, prompt):
+    """Score how likely a prompt needs the strong model. Returns (score, feats)
+    where score is in [0,1] and feats is a list of (label, weight) for
+    `lmm route --explain`."""
+    text = prompt if isinstance(prompt, str) else messages_text(prompt)
+    t = (text or "").strip()
+    low = t.lower()
+    feats, raw = [], 0.0
+
+    hit = next((k for k in merged_route(cfg).get("heavy", []) if k.lower() in low), None)
+    if hit:
+        feats.append((f"heavy keyword ({hit})", 0.30)); raw += 0.30
+    cm = next((m for m in STRENGTH_CODE_MARKERS if m in low), None)
+    if cm:
+        feats.append((f"code marker ({cm.strip()})", 0.25)); raw += 0.25
+    rm = next((m for m in STRENGTH_REASON_MARKERS if m in low), None)
+    if rm:
+        feats.append((f"reasoning marker ({rm.strip()})", 0.20)); raw += 0.20
+    n = len(t)
+    if n > 1000:
+        feats.append((f"long prompt ({n} chars)", 0.25)); raw += 0.25
+    elif n > 200:
+        feats.append((f"medium prompt ({n} chars)", 0.15)); raw += 0.15
+    q = low.count("?") + low.count("？")
+    if q >= 3:
+        feats.append((f"multi-question ({q})", 0.10)); raw += 0.10
+    # The short-prompt discount catches "hi" / "what time is it", not a terse
+    # but demanding "refactor this" — so it only applies when nothing above
+    # already flagged the prompt as hard.
+    if n < 40 and q <= 1 and not feats:
+        feats.append((f"short one-liner ({n} chars)", -0.30)); raw -= 0.30
+
+    # Logistic squash centred so that a single "heavy" keyword lands exactly on
+    # the default threshold — i.e. the pre-existing keyword behaviour is the
+    # calibration point, and everything else moves relative to it.
+    score = 1.0 / (1.0 + math.exp(-6.0 * (raw - 0.30)))
+    return score, feats
+
+
+def target_price(cfg, prov, pricing=None):
+    """Output-token price for one target, used to order cheap->expensive."""
+    pricing = pricing or merged_pricing(cfg)
+    return price_for(prov, prov.get("model"), pricing)["out"]
+
+
+def order_targets(cfg, prompt, targets):
+    """Reorder candidate providers by predicted need, cheapest-first when the
+    prompt looks easy. A user-defined cfg['ask_order'] is absolute and is never
+    reordered — auto-routing only decides what was left undecided."""
+    if not targets or cfg.get("ask_order"):
+        return targets
+    thr = cfg.get("route_threshold", DEFAULT_ROUTE_THRESHOLD)
+    if thr is None:
+        return targets
+    text = prompt if isinstance(prompt, str) else messages_text(prompt)
+    if is_private(cfg, text):
+        return sorted(targets, key=lambda t: 0 if t[1].get("kind") == "local" else 1)
+    pricing = merged_pricing(cfg)
+    score, _ = prompt_strength(cfg, prompt)
+    if score >= thr:                       # strong-first: priciest is the proxy
+        return sorted(targets, key=lambda t: -target_price(cfg, t[1], pricing))
+    return sorted(targets, key=lambda t: target_price(cfg, t[1], pricing))
+
+
+# --------------------- (1) FrugalGPT-style LLM cascade ----------------------
+# Chen, Zaharia & Zou, "FrugalGPT" (arXiv:2305.05176): query cheap models
+# first, score the answer, and only escalate when the score is too low — up to
+# 98% cost reduction at GPT-4-level accuracy. Their scoring function is a
+# trained DistilBERT regressor. With stdlib-only as a hard constraint we
+# instead penalise the failure modes small models actually exhibit, and let the
+# user bolt on a real LLM judge via cascade.judge when they want one.
+def verify_answer(prompt, answer, cfg=None, judge=None):
+    """Score an answer in [0,1] and explain the deductions. Low means the
+    cheap model probably failed and the request should escalate."""
+    text = (answer or "").strip()
+    if not text or len(text.split()) < 3:
+        return 0.0, ["empty or near-empty answer"]
+    low = text.lower()
+    ptext = (prompt if isinstance(prompt, str) else messages_text(prompt)) or ""
+    score, why = 1.0, []
+
+    m = next((k for k in VERIFY_REFUSAL_MARKERS if k in low), None)
+    if m:
+        score -= 0.5; why.append(f"refusal marker ({m.strip()})")
+    m = next((k for k in VERIFY_HEDGE_MARKERS if k in low), None)
+    if m:
+        score -= 0.15; why.append(f"hedging ({m.strip()})")
+    if text.count("```") % 2 == 1:
+        score -= 0.25; why.append("unclosed code fence")
+    elif text[-1] not in ".!?)\"'`}】。！？」…":
+        score -= 0.25; why.append("truncated mid-sentence")
+    lines = [l.strip() for l in text.splitlines() if l.strip()]
+    if lines and len(lines) - len(set(lines)) >= 2:
+        score -= 0.30; why.append("degenerate repetition")
+    wants_code = any(m in ptext.lower() for m in STRENGTH_CODE_MARKERS)
+    if wants_code and "```" not in text:
+        score -= 0.30; why.append("code was asked for, none returned")
+    if len(text) < len(ptext) * 0.1 and ptext.count(".") + ptext.count("?") > 1:
+        score -= 0.20; why.append("answer far shorter than a multi-part prompt")
+
+    score = max(0.0, min(1.0, score))
+    if judge:
+        js = judge_answer(judge, ptext, text)
+        if js is not None:
+            why.append(f"llm judge {js:.2f}")
+            score = (score + js) / 2.0
+    return score, why
+
+
+def judge_answer(judge_prov, prompt, answer):
+    """Optional second opinion: ask a configured provider to grade the answer.
+    Returns a float in [0,1] or None if the judge was unusable."""
+    q = ("Grade how well the ANSWER addresses the QUESTION. "
+         "Reply with only a number between 0.0 and 1.0, nothing else.\n\n"
+         "QUESTION:\n%s\n\nANSWER:\n%s" % (prompt[:4000], answer[:4000]))
+    res = call_provider(judge_prov, q, temperature=0.0)
+    if not isinstance(res, dict) or res.get("error"):
+        return None
+    try:
+        raw = res["choices"][0]["message"]["content"].strip()
+    except (KeyError, IndexError, TypeError):
+        return None
+    num = ""
+    for ch in raw:
+        if ch.isdigit() or ch == ".":
+            num += ch
+        elif num:
+            break
+    try:
+        return max(0.0, min(1.0, float(num)))
+    except ValueError:
+        return None
+
+
+def cascade_rungs(cfg, targets, prompt=None):
+    """Order the rungs cheapest-first, which is what makes a cascade cheap.
+    An explicit cascade.rungs list wins; otherwise it is derived from price, so
+    a zero-config user still gets local -> cheap cloud -> expensive cloud.
+
+    Escalation must never leak: a prompt matching route.private stays on local
+    rungs, because "the cheap model did badly" is not a reason to ship a secret
+    to a cloud API.
+    """
+    casc = merged_cascade(cfg)
+    cap = max(1, int(casc.get("max_rungs", 3)))
+    text = prompt if isinstance(prompt, str) else messages_text(prompt)
+    if text and is_private(cfg, text):
+        local = [t for t in targets if t[1].get("kind") == "local"]
+        if local:
+            return local[:cap]
+    named = list(casc.get("rungs") or [])
+    if named:
+        by_name = dict(targets)
+        rungs = [(n, by_name[n]) for n in named if n in by_name]
+        if rungs:
+            return rungs[:cap]
+    pricing = merged_pricing(cfg)
+    ordered = sorted(targets, key=lambda t: (0 if t[1].get("kind") == "local" else 1,
+                                             target_price(cfg, t[1], pricing)))
+    return ordered[:cap]
+
+
+# ------------------ (3) prompt cache, exact + semantic tiers ----------------
+# GPT Semantic Cache (arXiv:2411.05276) reports up to 68.8% fewer API calls by
+# reusing answers to semantically similar prompts. vCache (arXiv:2502.03771)
+# shows a single static similarity threshold cannot bound the false-hit rate,
+# so tier 2 is opt-in, its default threshold is deliberately strict, and every
+# near miss is recorded so the threshold can be tuned from evidence.
+def normalize_prompt(text):
+    """Whitespace-insensitive but indentation-preserving: trailing spaces and
+    blank-line runs never change an answer, but leading indentation does (it is
+    syntax in Python and YAML), so it is kept."""
+    lines = [l.rstrip() for l in (text or "").strip().splitlines()]
+    return "\n".join(l for i, l in enumerate(lines) if l or (i and lines[i - 1]))
+
+
+def cache_key(messages, model):
+    payload = normalize_prompt(messages_text(messages)) + "\x00" + (model or "")
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def cosine(a, b):
+    if not a or not b or len(a) != len(b):
+        return 0.0
+    dot = sum(x * y for x, y in zip(a, b))
+    na = math.sqrt(sum(x * x for x in a))
+    nb = math.sqrt(sum(y * y for y in b))
+    return dot / (na * nb) if na and nb else 0.0
+
+
+def embed_text(text, model):
+    """Embed via the LOCAL Ollama server only. Paying a cloud provider to
+    populate a cache that exists to avoid paying cloud providers would be
+    self-defeating, so there is deliberately no remote embedding path."""
+    body = http_post_json("http://localhost:11434/api/embed",
+                          {"model": model, "input": text[:8000]}, "", timeout=20)
+    if isinstance(body, dict) and body.get("embeddings"):
+        return body["embeddings"][0]
+    # older Ollama builds only speak the singular /api/embeddings form
+    body = http_post_json("http://localhost:11434/api/embeddings",
+                          {"model": model, "prompt": text[:8000]}, "", timeout=20)
+    if isinstance(body, dict) and body.get("embedding"):
+        return body["embedding"]
+    return None
+
+
+def cache_entries(conf):
+    """Live (unexpired) cache entries, oldest first."""
+    if not os.path.isfile(CACHE_LOG):
+        return []
+    ttl = float(conf.get("ttl_hours", 168)) * 3600
+    now = time.time()
+    out = []
+    try:
+        with open(CACHE_LOG, encoding="utf-8", errors="ignore") as fh:
+            for line in fh:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    e = json.loads(line)
+                except Exception:
+                    continue
+                if ttl > 0 and now - float(e.get("at", 0)) > ttl:
+                    continue
+                out.append(e)
+    except Exception:
+        pass
+    return out
+
+
+def cache_lookup(cfg, messages, model):
+    """Return (entry, how, similarity). `how` is 'exact', 'semantic' or None."""
+    conf = merged_cache(cfg)
+    if not conf.get("enabled", True):
+        return None, None, 0.0
+    entries = cache_entries(conf)
+    if not entries:
+        return None, None, 0.0
+    key = cache_key(messages, model)
+    for e in reversed(entries):                  # newest wins
+        if e.get("key") == key:
+            return e, "exact", 1.0
+    if not conf.get("semantic"):
+        return None, None, 0.0
+    text = normalize_prompt(messages_text(messages))
+    emb = embed_text(text, conf.get("embed_model", "nomic-embed-text"))
+    if not emb:
+        return None, None, 0.0
+    best, best_sim = None, 0.0
+    for e in entries:
+        if e.get("model") != model or not e.get("emb"):
+            continue
+        sim = cosine(emb, e["emb"])
+        if sim > best_sim:
+            best, best_sim = e, sim
+    thr = float(conf.get("similarity", 0.95))
+    if best and best_sim >= thr:
+        return best, "semantic", best_sim
+    if best:                                     # near miss: evidence for tuning
+        log_usage({"provider": "cache", "model": model, "kind": "local",
+                   "in": 0, "out": 0, "usd": 0.0, "cache": "near-miss",
+                   "similarity": round(best_sim, 4), "threshold": thr})
+    return None, None, best_sim
+
+
+def cache_store(cfg, messages, model, result, usd=0.0, temperature=None):
+    """Store one answer. `temperature` is the caller's EXPLICIT setting, or
+    None if they never set one — only an explicit high temperature means the
+    caller wants a fresh sample every time."""
+    conf = merged_cache(cfg)
+    if not conf.get("enabled", True):
+        return
+    if temperature is not None and float(temperature) > float(conf.get("max_temp", 0.3)):
+        return                                   # caller wants variety, not reuse
+    text = normalize_prompt(messages_text(messages))
+    entry = {"at": time.time(), "key": cache_key(messages, model), "model": model,
+             "usd": round(usd, 6), "result": result}
+    if conf.get("semantic"):
+        emb = embed_text(text, conf.get("embed_model", "nomic-embed-text"))
+        if emb:
+            entry["emb"] = emb
+    try:
+        os.makedirs(LMM_DIR, exist_ok=True)
+        with open(CACHE_LOG, "a", encoding="utf-8") as fh:
+            fh.write(json.dumps(entry, ensure_ascii=False) + "\n")
+    except Exception:
+        return
+    cache_prune(conf)
+
+
+def cache_prune(conf):
+    """Rewrite the log when it outgrows max_entries, keeping the newest."""
+    cap = int(conf.get("max_entries", 2000))
+    try:
+        entries = cache_entries(conf)
+        if len(entries) <= cap * 1.5:
+            return
+        keep = entries[-cap:]
+        tmp = CACHE_LOG + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as fh:
+            for e in keep:
+                fh.write(json.dumps(e, ensure_ascii=False) + "\n")
+        os.replace(tmp, CACHE_LOG)
+    except Exception:
+        pass
+
+
+# ------------------------- unified completion path --------------------------
+def hub_complete(cfg, messages, targets, opts=None):
+    """One request path shared by `lmm ask` and `lmm serve --hub`:
+
+        cache lookup -> threshold routing -> cascade -> metering -> cache store
+
+    Returns (result, trace). `result` is an OpenAI-shaped response dict (or one
+    carrying an "error"); `trace` is human-readable lines for --explain.
+    """
+    opts = opts or {}
+    pricing = merged_pricing(cfg)
+    casc = merged_cascade(cfg)
+    extra = dict(opts.get("extra") or {})
+    # None means "the caller never asked for a temperature". Only an explicit
+    # high temperature signals a want for variety, so only that should suppress
+    # caching — lmm's own 0.7 default must not disable the cache by accident.
+    req_temp = extra.get("temperature")
+    temp = 0.7 if req_temp is None else req_temp
+    source = opts.get("source", "ask")
+    trace = []
+
+    use_cache = opts.get("cache", True)
+    use_cascade = opts.get("cascade", casc.get("enabled", False))
+
+    targets = order_targets(cfg, messages, targets)
+    if not targets:
+        return {"error": "no provider available"}, trace
+
+    # Privacy is pinned in order_targets/cascade_rungs, but only if a local
+    # provider exists at all. When none does, say so out loud rather than
+    # quietly shipping a prompt the user flagged as private to a remote API.
+    if (is_private(cfg, messages_text(as_messages(messages)))
+            and not any(t[1].get("kind") == "local" for t in targets)):
+        trace.append("[warn] prompt matches route.private but no local provider "
+                     "is running — it will be sent to a remote API "
+                     "(start one with `lmm serve <model>`)")
+
+    # The cache key identifies the REQUEST, not whoever ended up answering it:
+    # a cascade may answer from rung 2, and next time that answer should be
+    # served for the same question. Ordering is deterministic given cfg, so the
+    # first target is a stable identity for the request.
+    cache_model = targets[0][1].get("model")
+
+    # ---- (1) cache -----------------------------------------------------
+    if use_cache:
+        probe_model = cache_model
+        entry, how, sim = cache_lookup(cfg, messages, probe_model)
+        if entry:
+            saved = float(entry.get("usd", 0.0) or 0.0)
+            log_usage({"provider": "cache", "model": probe_model, "kind": "local",
+                       "in": 0, "out": 0, "usd": 0.0, "cache": how,
+                       "similarity": round(sim, 4), "saved_usd": round(saved, 6),
+                       "source": source})
+            trace.append(f"[cache] {how} hit (sim={sim:.3f}) — $0.0000, "
+                         f"saved ~${saved:.4f}")
+            return entry["result"], trace
+
+    # ---- (2)+(3) routing already applied; now walk the rungs -----------
+    rungs = cascade_rungs(cfg, targets, messages) if use_cascade else targets
+    judge = None
+    if use_cascade and casc.get("judge"):
+        judge = merged_providers(cfg).get(casc["judge"])
+    threshold = float(casc.get("threshold", 0.6))
+    spent = 0.0
+    best = None                      # (score, result, name) fallback
+    last_err = None
+
+    for i, (name, prov) in enumerate(rungs):
+        res = call_provider(prov, messages, temperature=temp, extra=extra)
+        if isinstance(res, dict) and res.get("error"):
+            last_err = res["error"]
+            trace.append(f"[{'cascade' if use_cascade else 'ask'}] "
+                         f"rung{i} {name} failed: {last_err} -> next")
+            continue
+        try:
+            answer = res["choices"][0]["message"]["content"]
+        except (KeyError, IndexError, TypeError):
+            last_err = "unexpected response shape"
+            trace.append(f"[ask] rung{i} {name} returned an unexpected shape -> next")
+            continue
+
+        if not use_cascade:
+            usd = meter_call(name, prov, prov.get("model"), res, pricing,
+                             source=source, cache="miss", rung=i, accepted=True)
+            trace.append(f"[ask] {name} ({prov.get('model')}) ${usd:.4f}")
+            if use_cache:
+                cache_store(cfg, messages, cache_model, res, usd, req_temp)
+            return res, trace
+
+        score, why = verify_answer(messages, answer, cfg, judge)
+        accept = score >= threshold or i == len(rungs) - 1
+        usd = meter_call(name, prov, prov.get("model"), res, pricing,
+                         source=source, cache="miss", rung=i,
+                         score=round(score, 3), accepted=bool(accept))
+        spent += usd
+        verdict = "accept" if score >= threshold else "escalate"
+        trace.append(f"[cascade] rung{i} {name} score={score:.2f} ${usd:.4f} "
+                     f"-> {verdict}" + (f" ({', '.join(why)})" if why else ""))
+        if best is None or score > best[0]:
+            best = (score, res, name)
+        if score >= threshold:
+            if use_cache:
+                cache_store(cfg, messages, cache_model, res, spent, req_temp)
+            trace.append(f"[cascade] total ${spent:.4f} over {i + 1} rung(s)")
+            return res, trace
+
+    if best:
+        # Every rung scored low. FrugalGPT keeps the best-scoring answer rather
+        # than trusting whichever model happened to be last.
+        trace.append(f"[cascade] no rung cleared {threshold:.2f}; "
+                     f"returning best ({best[2]}, score={best[0]:.2f}), "
+                     f"total ${spent:.4f}")
+        if use_cache:
+            cache_store(cfg, messages, cache_model, best[1], spent, req_temp)
+        return best[1], trace
+    return {"error": last_err or "all providers failed"}, trace
+
+
+def cmd_ask(prompt, provider, cfg, cascade=False, no_cache=False, explain=False):
+    """Unified inference over every backend: cache, threshold routing, optional
+    cheap-first cascade, and metering — all of it the same code path the hub
+    serves, so `lmm ask` and an app pointed at `lmm serve --hub` behave alike."""
+    if not (prompt or "").strip():
+        print("usage: lmm ask \"your question\" [--provider NAME] [--cascade]")
+        return
     targets = resolve_ask_targets(cfg, prompt, provider)
     if not targets:
         print("[ask] no provider available. Start Ollama (`lmm serve <model>`) "
               "or add 'providers' to lmm config (see `lmm examples`).")
         return
-    last_err = None
-    for name, prov in targets:
-        print(f"[ask] -> trying {name} ({prov['model'] or 'no model set'})")
-        res = call_provider(prov, prompt)
-        if isinstance(res, dict) and res.get("error"):
-            last_err = res["error"]
-            print(f"[ask]    {name} failed: {last_err} -- fallback")
-            continue
+    if explain:
+        score, feats = prompt_strength(cfg, prompt)
+        thr = cfg.get("route_threshold", DEFAULT_ROUTE_THRESHOLD)
+        print(f"[route] strength={score:.2f} threshold={thr} -> "
+              + ", ".join(n for n, _ in order_targets(cfg, prompt, targets)))
+    res, trace = hub_complete(cfg, prompt, targets,
+                              {"cascade": cascade, "cache": not no_cache,
+                               "source": "ask"})
+    for line in trace:               # warnings are never hidden behind --explain
+        if explain or line.startswith("[warn]"):
+            print(line)
+    if isinstance(res, dict) and res.get("error"):
+        print(f"[ask] all providers failed. last error: {res['error']}")
+        return
+    try:
+        print(res["choices"][0]["message"]["content"])
+    except (KeyError, IndexError, TypeError):
+        print("[ask] unexpected response shape from provider")
+
+
+def cmd_cache(clear=False):
+    """Inspect or drop the prompt cache. The near-miss similarities are the
+    evidence for tuning cache.similarity — vCache (arXiv:2502.03771) makes the
+    case that a static threshold picked blind is not safe."""
+    if clear:
         try:
-            msg = res["choices"][0]["message"]["content"]
-            print(msg)
-            return
-        except (KeyError, IndexError, TypeError):
-            last_err = "unexpected response"
-            print(f"[ask]    {name} returned unexpected shape -- fallback")
-            continue
-    print(f"[ask] all providers failed. last error: {last_err}")
+            if os.path.isfile(CACHE_LOG):
+                os.remove(CACHE_LOG)
+            print("[cache] cleared")
+        except OSError as e:
+            print(f"[cache] could not clear: {e}")
+        return
+    entries = cache_entries(DEFAULT_CACHE)
+    print(f"[cache] {CACHE_LOG}")
+    print(f"[cache] {len(entries)} live entries, "
+          f"{sum(1 for e in entries if e.get('emb'))} with embeddings")
+    if entries:
+        oldest = min(e.get("at", 0) for e in entries)
+        print("[cache] oldest: "
+              + datetime.datetime.fromtimestamp(oldest).strftime("%Y-%m-%d %H:%M"))
+        print(f"[cache] value stored: ${sum(float(e.get('usd', 0) or 0) for e in entries):,.4f}")
+    hits = {"exact": 0, "semantic": 0, "near-miss": 0}
+    sims = []
+    for ev in read_usage():
+        h = ev.get("cache")
+        if h in hits:
+            hits[h] += 1
+        if h == "near-miss":
+            sims.append(ev.get("similarity", 0.0))
+    print(f"[cache] hits: exact={hits['exact']} semantic={hits['semantic']} "
+          f"near-miss={hits['near-miss']}")
+    if sims:
+        print(f"[cache] near-miss similarity: max={max(sims):.3f} "
+              f"avg={sum(sims) / len(sims):.3f} "
+              f"(threshold {DEFAULT_CACHE['similarity']})")
 
 
 
@@ -1266,12 +2112,16 @@ def main():
     ap.add_argument("-v", "--version", action="store_true", help="show version")
     sub = ap.add_subparsers(dest="cmd")
     sub.add_parser("discover").add_argument("--json", action="store_true")
+    sub.add_parser("cli", help="same as discover (explicit CLI mode)")
     sub.add_parser("status")
     sub.add_parser("models")
     p = sub.add_parser("cost")
-    p.add_argument("--days", type=int, default=30)
+    p.add_argument("--days", type=int, default=30,
+                   help="only count the last N days (0 = all-time)")
     p = sub.add_parser("route")
     p.add_argument("task", nargs="?")
+    p.add_argument("--explain", action="store_true",
+                   help="show the strength-score breakdown and provider order")
     p = sub.add_parser("serve")
     p.add_argument("model", nargs="?")
     p.add_argument("--hub", action="store_true",
@@ -1289,6 +2139,14 @@ def main():
     p = sub.add_parser("ask")
     p.add_argument("prompt", nargs="*")
     p.add_argument("--provider", default=None, help="provider name from config")
+    p.add_argument("--cascade", action="store_true",
+                   help="cheap-first cascade: escalate only on a low-scoring answer")
+    p.add_argument("--no-cache", action="store_true", help="bypass the prompt cache")
+    p.add_argument("--explain", action="store_true",
+                   help="show routing score, rung scores and per-call cost")
+    p = sub.add_parser("cache")
+    p.add_argument("--clear", action="store_true", help="delete all cached answers")
+    p.add_argument("--stats", action="store_true", help="show cache stats (default)")
     sub.add_parser("examples")
     args = ap.parse_args()
     if args.version:
@@ -1308,9 +2166,9 @@ def main():
     elif cmd == "models":
         cmd_models()
     elif cmd == "cost":
-        print(cost_report(cfg, args.days))
+        print(cost_report(cfg, args.days or None))
     elif cmd == "route":
-        print(f"task: {args.task}\n=> recommend: {route_task(cfg, args.task)}")
+        cmd_route(cfg, args.task, getattr(args, "explain", False))
     elif cmd == "serve":
         if getattr(args, "hub", False):
             cmd_serve_hub(cfg, args.host, args.port)
@@ -1326,8 +2184,16 @@ def main():
         cmd_watch(cfg, args.interval)
     elif cmd == "autostart":
         cmd_autostart()
+    elif cmd == "hide":
+        cmd_hide(args.runtime)
     elif cmd == "ask":
-        cmd_ask(" ".join(getattr(args, "prompt", [])), getattr(args, "provider", None), cfg)
+        cmd_ask(" ".join(getattr(args, "prompt", [])),
+                getattr(args, "provider", None), cfg,
+                cascade=getattr(args, "cascade", False),
+                no_cache=getattr(args, "no_cache", False),
+                explain=getattr(args, "explain", False))
+    elif cmd == "cache":
+        cmd_cache(getattr(args, "clear", False))
     elif cmd == "examples":
         cmd_examples()
 
