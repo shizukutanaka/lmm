@@ -41,12 +41,24 @@ import ctypes
 
 HOME = os.path.expanduser("~")
 
-# ---- Claude public pricing (USD per 1M tokens) — approximate, editable ----
+# ---- Public pricing (USD per 1M tokens) — approximate, editable ----
+# Claude families (measured from ~/.claude session logs when available):
 DEFAULT_PRICING = {
     "opus":   {"in": 15.0,  "out": 75.0,  "cw": 18.75, "cr": 1.50},
     "sonnet": {"in": 3.0,   "out": 15.0,  "cw": 3.75,  "cr": 0.30},
     "haiku":  {"in": 0.25,  "out": 1.25,  "cw": 0.30,  "cr": 0.03},
     "default":{"in": 3.0,   "out": 15.0,  "cw": 3.75,  "cr": 0.30},
+    # Cloud API providers (no local session log; estimate-only from token counts):
+    # values are [input, output] USD / 1M tokens (cache fields unused -> 0).
+    "openai-gpt4o":     {"in": 2.50,  "out": 10.0,  "cw": 0.0, "cr": 0.0},
+    "openai-gpt4o-mini":{"in": 0.15,  "out": 0.60,  "cw": 0.0, "cr": 0.0},
+    "gemini-1.5-pro":   {"in": 1.25,  "out": 5.0,   "cw": 0.0, "cr": 0.0},
+    "gemini-1.5-flash": {"in": 0.075, "out": 0.30,  "cw": 0.0, "cr": 0.0},
+    "mistral-large":    {"in": 2.0,   "out": 6.0,   "cw": 0.0, "cr": 0.0},
+    "groq-llama":       {"in": 0.59,  "out": 0.79,  "cw": 0.0, "cr": 0.0},
+    "deepseek-chat":    {"in": 0.27,  "out": 1.10,  "cw": 0.0, "cr": 0.0},
+    "cohere-command":   {"in": 1.0,   "out": 3.0,   "cw": 0.0, "cr": 0.0},
+    "together-llama":   {"in": 0.80,  "out": 0.80,  "cw": 0.0, "cr": 0.0},
 }
 
 DEFAULT_ROUTE = {
@@ -555,6 +567,31 @@ def cost_report(cfg, days=30):
     out.append("-" * 64)
     out.append(f"TOTAL est ${grand:,.2f}  "
                "(pricing approximate; verify on your Anthropic billing page)")
+    # ---- cross-provider estimate (cloud APIs have no local session log) ----
+    # Use the local Ollama token volume as a proxy baseline: if the same
+    # workload ran on each cloud provider, what would it cost? This makes
+    # `lmm cost` cover local->cloud without requiring API telemetry.
+    proxy = 0
+    if data and data.get("by_family"):
+        proxy = max((a["in"] + a["out"] for a in data["by_family"].values()),
+                    default=0)
+    if proxy <= 0:
+        proxy = 1_000_000  # default 1M-token baseline for comparison
+    out.append("")
+    out.append("=" * 64)
+    out.append(f"CROSS-PROVIDER ESTIMATE (baseline = "
+               f"{proxy/1e6:.2f}M tok in+out, illustrative)")
+    out.append("-" * 64)
+    cloud_keys = [k for k in pricing
+                  if k not in ("opus", "sonnet", "haiku", "default")]
+    for k in sorted(cloud_keys):
+        p = pricing[k]
+        # assume ~50/50 in/out split of the baseline for a simple comparison
+        c = (proxy / 2 / 1e6 * p["in"]) + (proxy / 2 / 1e6 * p["out"])
+        out.append(f"  {k:22} ~${c:,.2f}")
+    out.append("")
+    out.append("Tip: set real cloud usage in lmm config 'usage' to replace "
+               "this estimate with measured cost.")
     return "\n".join(out)
 
 
