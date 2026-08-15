@@ -809,23 +809,26 @@ def cmd_serve_hub(cfg, host, port):
             except Exception as e:
                 self._send(400, {"error": f"bad json: {e}"})
                 return
-            # provider selection: body["model"] may be a configured provider name
-            name = req.get("model", "")
-            prov = provs.get(name)
-            if not prov:
-                prov = provs.get(pick_provider_for_task(cfg, req.get("messages", [{}])[0].get("content", "") if req.get("messages") else "", provs))
-            if not prov:
-                self._send(400, {"error": "no provider for model '%s'" % name})
+            # routing: reuse the SAME intelligence as `lmm ask` —
+            # cfg['ask_order'] + auto-routing + implicit-Ollama fallback.
+            msgs = req.get("messages", [])
+            prompt = msgs[0].get("content", "") if msgs else ""
+            explicit = req.get("model", "")  # may be a configured provider name
+            targets = resolve_ask_targets(cfg, prompt, explicit if explicit in provs else None)
+            if not targets:
+                self._send(400, {"error": "no provider available for model '%s'" % explicit})
                 return
-            # rewrite body model to the provider's actual model
-            fwd = dict(req)
-            fwd["model"] = prov["model"]
-            res = call_provider(prov, fwd.get("messages", [{}])[0].get("content", ""),
-                                temperature=fwd.get("temperature", 0.7))
-            if isinstance(res, dict) and res.get("error"):
-                self._send(502, {"error": res["error"]})
+            last_err = None
+            for name, prov in targets:
+                fwd = dict(req)
+                fwd["model"] = prov["model"]
+                res = call_provider(prov, prompt, temperature=fwd.get("temperature", 0.7))
+                if isinstance(res, dict) and res.get("error"):
+                    last_err = res["error"]
+                    continue
+                self._send(200, res)
                 return
-            self._send(200, res)
+            self._send(502, {"error": "all providers failed: %s" % last_err})
 
         def log_message(self, *a):
             pass
