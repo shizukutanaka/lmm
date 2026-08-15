@@ -25,7 +25,7 @@ The real problem isn't "I need an LLM manager app." It's:
 
 ```bash
 # download the single file
-curl -fsSL https://raw.githubusercontent.com/<you>/lmm/main/lmm.py -o ~/.local/bin/lmm && chmod +x ~/.local/bin/lmm
+curl -fsSL https://raw.githubusercontent.com/shizukutanaka/lmm/main/lmm.py -o ~/.local/bin/lmm && chmod +x ~/.local/bin/lmm
 # or just:  python lmm.py <command>
 
 # install + shell alias (macOS/Linux)
