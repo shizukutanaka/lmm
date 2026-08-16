@@ -56,6 +56,8 @@ lmm route "task"    -> recommend local vs remote for a task
 lmm ask "prompt" [--provider NAME]   -> one-shot inference, auto-routed + fallback
 lmm chat [--provider NAME]           -> interactive REPL (keeps conversation history)
 lmm serve --hub [--host H] [--port P] -> OpenAI-compatible proxy (zero-config)
+lmm models          -> unified model registry (local + every cloud backend)
+lmm pull <model>    -> pull a model into the local Ollama store
 lmm hub-status       -> probe every backend's health (measures, doesn't assume)
 lmm log [N]          -> show last N hub routing events (proof of what it did)
 lmm selftest         -> self-prove the hub works (syntax, routing, observability)
@@ -96,6 +98,24 @@ $ lmm config set ask_order '["openai","local-ollama(implicit)"]'
 $ lmm log
 [OK ] 2026-08-17T02:44:22 ask   -> local-ollama(implicit) prompt='What is 2+2?'
 [OK ] 2026-08-17T02:51:18 serve -> local-ollama(implicit) reply='STREAMOK'
+```
+
+### Unified model registry
+
+`lmm models` lists models across **every** detected backend — local Ollama *and*
+any configured cloud OpenAI-compatible endpoint (`/v1/models`). It measures each
+live; unreachable backends are reported, not assumed-present.
+
+```bash
+$ lmm models
+Ollama (local):
+  - qwen2.5-coder:7b
+  - qwen2.5-coder:3b
+openai (cloud):
+  - gpt-4o
+  - gpt-4o-mini
+
+$ lmm pull qwen2.5-coder:7b   # stock the local store, then route to it
 ```
 
 ### Self-prove it works (`selftest`)
