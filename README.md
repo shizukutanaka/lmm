@@ -91,6 +91,12 @@ hub> Recursion is when a function calls itself to solve smaller subproblems.
 $ lmm serve --hub --port 8080
 # now:  curl http://localhost:8080/v1/chat/completions  (OpenAI SDK works)
 
+# 3b. Real models, real routing — point any OpenAI SDK at the hub:
+$ python -c "from openai import OpenAI; c=OpenAI(base_url='http://localhost:8080/v1',api_key='lmm'); print([m.id for m in c.models.list().data])"
+# -> ['qwen2.5-coder:3b', 'qwen2.5-coder:7b', 'qwen2.5-coder:14b']
+$ python -c "from openai import OpenAI; c=OpenAI(base_url='http://localhost:8080/v1',api_key='lmm'); print(c.chat.completions.create(model='qwen2.5-coder:3b', messages=[{'role':'user','content':'hi'}]).model)"
+# -> qwen2.5-coder:3b   (routed to the exact model you asked for)
+
 # 4. User-controlled routing priority
 $ lmm config set ask_order '["openai","local-ollama(implicit)"]'
 
