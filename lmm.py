@@ -836,12 +836,15 @@ def fetch_models(prov):
     """Return a list of model-id strings for a provider, or [] on failure.
     Ollama uses /api/tags; OpenAI-compatible clouds use /v1/models."""
     try:
-        if prov.get("kind") == "local" and "11434" in prov.get("base_url", ""):
-            r = http_get_json(prov["base_url"].rstrip("/") + "/api/tags")
+        base = prov.get("base_url", "")
+        if prov.get("kind") == "local" and "11434" in base:
+            # Ollama's native tags endpoint (strip any /v1 suffix)
+            root = base.replace("/v1", "").rstrip("/")
+            r = http_get_json(root + "/api/tags")
             if r and "models" in r:
                 return [m.get("name", "?") for m in r["models"]]
         # OpenAI-compatible: /v1/models
-        r = http_get_json(prov["base_url"].rstrip("/") + "/v1/models",
+        r = http_get_json(base.rstrip("/") + "/v1/models",
                           api_key=prov.get("api_key"))
         if r and "data" in r:
             return [m.get("id", m.get("name", "?")) for m in r["data"]]
@@ -895,6 +898,17 @@ def cmd_serve(model):
     print("endpoint ready: http://localhost:11434  (OpenAI-compatible)")
 
 
+def resolve_provider_by_model(provs, model_id):
+    """Map a real model id (from /v1/models) back to its provider name.
+    Lets OpenAI clients pick a model and have it routed correctly."""
+    if not model_id:
+        return None
+    for n, p in provs.items():
+        if model_id in fetch_models(p):
+            return n
+    return None
+
+
 def cmd_serve_hub(cfg, host, port):
     """Start an OpenAI-compatible proxy that fans out to every configured
     provider (cloud + local). Apps point at this one endpoint; `lmm` routes
@@ -925,9 +939,22 @@ def cmd_serve_hub(cfg, host, port):
 
         def do_GET(self):
             if self.path.rstrip("/").endswith("/v1/models"):
-                self._send(200, {"object": "list", "data": [
-                    {"id": n, "object": "model", "owned_by": p["kind"]}
-                    for n, p in provs.items()]})
+                # Real model IDs from every backend (not stubs). An OpenAI
+                # client calling models.list() must see actual selectable models.
+                data = []
+                for n, p in provs.items():
+                    for mid in fetch_models(p):
+                        data.append({
+                            "id": mid,
+                            "object": "model",
+                            "owned_by": p.get("kind", "unknown"),
+                            "lmm_provider": n,
+                        })
+                if not data:
+                    data = [{"id": n, "object": "model",
+                             "owned_by": p.get("kind", "unknown")}
+                            for n, p in provs.items()]
+                self._send(200, {"object": "list", "data": data})
             else:
                 self._send(404, {"error": "not found"})
 
@@ -945,16 +972,26 @@ def cmd_serve_hub(cfg, host, port):
             # cfg['ask_order'] + auto-routing + implicit-Ollama fallback.
             msgs = req.get("messages", [])
             prompt = msgs[0].get("content", "") if msgs else ""
-            explicit = req.get("model", "")  # may be a configured provider name
+            explicit = req.get("model", "")  # may be a provider name OR a real model id
+            requested_model = explicit  # remember what the client asked for
+            if explicit and explicit not in provs:
+                # client picked a real model id from /v1/models — map it back
+                mapped = resolve_provider_by_model(provs, explicit)
+                explicit = mapped if mapped else None
             targets = resolve_ask_targets(cfg, prompt, explicit if explicit in provs else None)
             if not targets:
-                self._send(400, {"error": "no provider available for model '%s'" % explicit})
+                self._send(400, {"error": "no provider available for model '%s'" % requested_model})
                 return
             last_err = None
             want_stream = bool(req.get("stream"))
             for name, prov in targets:
                 fwd = dict(req)
-                fwd["model"] = prov["model"]
+                # honor the client's requested model id if it resolved to this
+                # provider (otherwise fall back to the provider's default model)
+                use_model = requested_model if (requested_model and requested_model in fetch_models(prov)) else prov["model"]
+                fwd["model"] = use_model
+                prov = dict(prov)  # don't mutate the shared provider dict
+                prov["model"] = use_model
                 gen = call_provider(prov, prompt,
                                     temperature=fwd.get("temperature", 0.7),
                                     messages=fwd.get("messages"),
@@ -1480,10 +1517,16 @@ def resolve_ask_targets(cfg, prompt, explicit):
     (keyword match, then all configured, then implicit Ollama) applies.
     """
     provs = merged_providers(cfg)
+    # fold in the implicit running-Ollama safety net so explicit references
+    # to it (e.g. a model id resolved back to "local-ollama(implicit)")
+    # are recognized as a valid target.
+    lo = local_ollama_provider()
+    if lo and "local-ollama(implicit)" not in provs:
+        provs = dict(provs)
+        provs["local-ollama(implicit)"] = lo
     if explicit:
         if explicit in provs:
             return [(explicit, provs[explicit])]
-        lo = local_ollama_provider()
         if explicit in ("local", "ollama", "local-ollama") and lo:
             return [("local-ollama(implicit)", lo)]
         return []
