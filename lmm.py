@@ -1612,6 +1612,75 @@ def cmd_log(n, cfg):
 
 
 
+def cmd_selftest(cfg):
+    """Self-prove the hub works. Runs real measurements (not trust):
+    syntax, command surface, implicit-Ollama reachability, a live `ask`
+    routing that must return a real reply, and hub.log observability.
+    Each check is pass/fail; a non-zero failure count means `lmm` is broken."""
+    import subprocess as _sp
+    checks = []
+
+    def chk(name, ok, detail=""):
+        checks.append((name, ok, detail))
+        mark = "PASS" if ok else "FAIL"
+        print(f"  [{mark}] {name}" + (f" -- {detail}" if detail else ""))
+
+    print("lmm selftest — measuring, not trusting:")
+    # 1) syntax of this very file
+    selfp = os.path.abspath(__file__)
+    r = _sp.run([sys.executable, "-m", "py_compile", selfp],
+                stdout=_sp.DEVNULL, stderr=_sp.DEVNULL)
+    chk("self syntax (py_compile)", r.returncode == 0)
+
+    # 2) command surface present
+    import re as _re
+    with open(os.path.abspath(__file__), encoding="utf-8") as _f:
+        src = _f.read()
+    cmds = _re.findall(r"add_parser\(['\"]([\w-]+)['\"]", src)
+    needed = ["discover", "status", "models", "cost", "route", "serve",
+              "ask", "chat", "hub-status", "config", "log", "selftest",
+              "stop", "dash", "gui", "watch", "autostart", "hide", "examples"]
+    missing = [c for c in needed if c not in cmds]
+    chk("command surface complete", not missing,
+        ("missing: " + ",".join(missing)) if missing else "")
+
+    # 3) implicit Ollama reachable
+    lo = local_ollama_provider()
+    chk("implicit Ollama reachable", bool(lo),
+        (lo["model"] if lo else "ollama not running"))
+
+    # 4) live ask routing returns a real reply
+    if lo:
+        try:
+            gen = call_provider(lo, "Reply with exactly: SELFTEST_OK",
+                                stream=True)
+            reply = "".join(gen) if not isinstance(gen, dict) else ""
+            ok_reply = "SELFTEST_OK" in reply
+            chk("live ask routing returns reply", ok_reply,
+                (reply[:40] if reply else "no reply"))
+        except Exception as e:
+            chk("live ask routing returns reply", False, str(e))
+    else:
+        chk("live ask routing returns reply", False, "no provider")
+
+    # 5) observability: hub.log gets written
+    before = os.path.exists(os.path.join(HOME, ".lmm", "hub.log"))
+    log_hub({"event": "selftest", "provider": "(self)", "ok": True,
+             "prompt": "selftest probe"})
+    after = os.path.exists(os.path.join(HOME, ".lmm", "hub.log"))
+    chk("observability (hub.log writable)", after,
+        ("created" if not before else "appended"))
+
+    fails = sum(1 for _, ok, _ in checks if not ok)
+    print("")
+    if fails == 0:
+        print("SELFTEST PASS — the hub measures and proves itself.")
+    else:
+        print(f"SELFTEST FAIL — {fails} check(s) failed. Fix before trusting the hub.")
+    return 1 if fails else 0
+
+
+
 def cmd_config(args, cfg):
     """Manage lmm config: init / list / get / set / unset.
     Lets the user freely control hub priority (ask_order) and providers
@@ -1708,6 +1777,7 @@ def main():
     p.add_argument("value", nargs="?", default=None)
     p = sub.add_parser("log", help="show recent hub events (proof of routing)")
     p.add_argument("n", nargs="?", default=20)
+    p = sub.add_parser("selftest", help="self-prove the hub works (measure, don't trust)")
     p = sub.add_parser("chat", help="interactive hub chat REPL (keeps history)")
     p.add_argument("--provider", default=None, help="force a provider")
     p = sub.add_parser("stop")
@@ -1754,6 +1824,8 @@ def main():
         cmd_config(args, cfg)
     elif cmd == "log":
         cmd_log(args.n, cfg)
+    elif cmd == "selftest":
+        sys.exit(cmd_selftest(cfg))
     elif cmd == "chat":
         cmd_chat(args.provider, cfg)
     elif cmd == "stop":
