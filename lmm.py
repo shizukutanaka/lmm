@@ -332,14 +332,17 @@ def http_post_json(url, payload, api_key, timeout=60):
         return {"error": str(e)}
 
 
-def call_provider(prov, prompt, temperature=0.7):
-    """Send `prompt` to one provider (OpenAI-compatible /chat/completions)."""
+def call_provider(prov, prompt, temperature=0.7, messages=None):
+    """Send a completion request to one provider (OpenAI-compatible
+    /chat/completions). If `messages` (full history) is given, it is sent
+    verbatim; otherwise a single-turn [user: prompt] is used."""
     if not prov.get("model"):
         return {"error": "provider has no model set"}
     url = prov["base_url"].rstrip("/") + "/chat/completions"
     payload = {
         "model": prov["model"],
-        "messages": [{"role": "user", "content": prompt}],
+        "messages": messages if messages is not None
+                     else [{"role": "user", "content": prompt}],
         "temperature": temperature,
     }
     return http_post_json(url, payload, prov.get("api_key", ""))
@@ -1412,6 +1415,63 @@ def cmd_ask(prompt, provider, cfg):
     print(f"[ask] all providers failed. last error: {last_err}")
 
 
+def cmd_chat(provider, cfg):
+    """Interactive chat REPL over the hub. Keeps conversation history
+    (messages) across turns and routes every user turn through the SAME
+    unified routing (ask_order + fallback) as `lmm ask`. Each turn is logged
+    to hub.log. Local OR cloud, one interface. Type 'exit'/'quit'/'/exit' to
+    leave."""
+    print("lmm chat — type 'exit' to quit. Routes every turn via the hub.")
+    messages = []
+    try:
+        while True:
+            try:
+                line = input("you> ").strip()
+            except (EOFError, KeyboardInterrupt):
+                print("")
+                break
+            if not line:
+                continue
+            if line.lower() in ("exit", "quit", "/exit"):
+                break
+            messages.append({"role": "user", "content": line})
+            targets = resolve_ask_targets(cfg, line, provider)
+            if not targets:
+                print("[chat] no provider available.")
+                messages.pop()  # drop the unsendable turn
+                continue
+            last_err = None
+            replied = False
+            for name, prov in targets:
+                res = call_provider(prov, line,
+                                    messages=messages[:-1] + [{"role": "user",
+                                                               "content": line}])
+                if isinstance(res, dict) and res.get("error"):
+                    last_err = res["error"]
+                    log_hub({"event": "chat", "provider": name, "ok": False,
+                             "error": last_err, "prompt": line})
+                    continue
+                try:
+                    msg = res["choices"][0]["message"]["content"]
+                    log_hub({"event": "chat", "provider": name, "ok": True,
+                             "prompt": line})
+                    messages.append({"role": "assistant", "content": msg})
+                    print("hub> " + msg)
+                    replied = True
+                    break
+                except (KeyError, IndexError, TypeError):
+                    last_err = "unexpected response"
+                    log_hub({"event": "chat", "provider": name, "ok": False,
+                             "error": last_err, "prompt": line})
+                    continue
+            if not replied:
+                print(f"[chat] all providers failed: {last_err}")
+                messages.pop()  # drop the turn we couldn't send
+    except Exception as e:
+        print(f"[chat] stopped: {e}")
+
+
+
 def save_config(cfg):
     """Write config to ~/.lmm/config.json (primary candidate)."""
     d = os.path.join(HOME, ".lmm")
@@ -1565,6 +1625,8 @@ def main():
     p.add_argument("value", nargs="?", default=None)
     p = sub.add_parser("log", help="show recent hub events (proof of routing)")
     p.add_argument("n", nargs="?", default=20)
+    p = sub.add_parser("chat", help="interactive hub chat REPL (keeps history)")
+    p.add_argument("--provider", default=None, help="force a provider")
     p = sub.add_parser("stop")
     p.add_argument("runtime", nargs="?")
     sub.add_parser("dash")
@@ -1609,6 +1671,8 @@ def main():
         cmd_config(args, cfg)
     elif cmd == "log":
         cmd_log(args.n, cfg)
+    elif cmd == "chat":
+        cmd_chat(args.provider, cfg)
     elif cmd == "stop":
         cmd_stop(args.runtime, cfg)
     elif cmd == "dash":
