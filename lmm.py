@@ -1745,12 +1745,19 @@ def cmd_selftest(cfg):
         ("missing: " + ",".join(missing)) if missing else "")
 
     # 3) implicit Ollama reachable
-    lo = local_ollama_provider()
-    chk("implicit Ollama reachable", bool(lo),
-        (lo["model"] if lo else "ollama not running"))
+    skip_live = os.environ.get("LMM_SELFTEST_SKIP_LIVE", "") in ("1", "true", "yes")
+    if skip_live:
+        print("  [SKIP] implicit Ollama reachable -- LMM_SELFTEST_SKIP_LIVE=1")
+        lo = None
+    else:
+        lo = local_ollama_provider()
+        chk("implicit Ollama reachable", bool(lo),
+            (lo["model"] if lo else "ollama not running"))
 
     # 4) live ask routing returns a real reply
-    if lo:
+    if skip_live:
+        print("  [SKIP] live ask routing returns reply -- LMM_SELFTEST_SKIP_LIVE=1")
+    elif lo:
         try:
             gen = call_provider(lo, "Reply with exactly: SELFTEST_OK",
                                 stream=True)
