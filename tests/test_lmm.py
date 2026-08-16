@@ -1112,6 +1112,126 @@ class TestBenchMetrics(unittest.TestCase):
         self.assertEqual(lmm.median([]), 0.0)
 
 
+class TestDiscovery(unittest.TestCase):
+    """The registry lists 16 runtimes; discovery has to actually cover them."""
+
+    def setUp(self):
+        self._probe = lmm.probe_port
+        self._models = lmm.probe_models
+        self._procs = lmm.proc_count
+        lmm.probe_models = lambda base, timeout=1.0: []
+        lmm.proc_count = lambda names: 0
+
+    def tearDown(self):
+        lmm.probe_port = self._probe
+        lmm.probe_models = self._models
+        lmm.proc_count = self._procs
+
+    def test_every_registry_runtime_has_a_label(self):
+        for name, spec in lmm.RUNTIME_REGISTRY.items():
+            self.assertTrue(spec.get("label"), name)
+
+    def test_every_registry_runtime_is_detectable(self):
+        lmm.probe_port = lambda port, host="127.0.0.1", timeout=0.25: False
+        for name in lmm.RUNTIME_REGISTRY:
+            got = lmm.detect_runtime(name)
+            self.assertIn("running", got)
+            self.assertEqual(got["key"], name)
+
+    def test_discover_covers_the_whole_registry(self):
+        lmm.probe_port = lambda port, host="127.0.0.1", timeout=0.25: False
+        keys = {it.get("key") for it in lmm.discover({}, with_models=False)}
+        self.assertTrue(set(lmm.RUNTIME_REGISTRY).issubset(keys))
+
+    def test_an_open_port_marks_a_runtime_as_serving(self):
+        lmm.probe_port = lambda port, host="127.0.0.1", timeout=0.25: port == 1337
+        got = lmm.detect_runtime("jan")
+        self.assertTrue(got["serving"])
+        self.assertTrue(got["running"])
+        self.assertIn("1337", got["endpoint"])
+        self.assertNotIn("closed", got["endpoint"])
+
+    def test_a_closed_port_is_labelled_closed(self):
+        lmm.probe_port = lambda port, host="127.0.0.1", timeout=0.25: False
+        self.assertIn("closed", lmm.detect_runtime("jan")["endpoint"])
+
+    def test_shared_default_port_needs_a_matching_process(self):
+        # llama.cpp's server and Open WebUI both default to 8080, so an open
+        # socket alone cannot say which one is there.
+        lmm.probe_port = lambda port, host="127.0.0.1", timeout=0.25: port == 8080
+        self.assertFalse(lmm.detect_runtime("llamacpp")["serving"])
+        lmm.proc_count = lambda names: 1
+        self.assertTrue(lmm.detect_runtime("llamacpp")["serving"])
+
+    def test_unambiguous_port_does_not_need_a_process(self):
+        lmm.probe_port = lambda port, host="127.0.0.1", timeout=0.25: port == 11434
+        self.assertTrue(lmm.detect_runtime("ollama")["serving"])
+
+    def test_desktop_only_apps_have_no_invented_port(self):
+        # Guessing an endpoint for an app with no documented local API would
+        # produce confident wrong output.
+        for name in ("chatgpt", "cursor", "perplexity", "devin", "chatbox"):
+            self.assertIsNone(lmm.RUNTIME_REGISTRY[name]["port"], name)
+
+    def test_documented_ports_are_the_published_defaults(self):
+        expect = {"ollama": 11434, "lmstudio": 1234, "jan": 1337, "gpt4all": 4891,
+                  "anythingllm": 3001, "koboldcpp": 5001, "vllm": 8000,
+                  "llamacpp": 8080, "openwebui": 8080}
+        for name, port in expect.items():
+            self.assertEqual(lmm.RUNTIME_REGISTRY[name]["port"], port, name)
+
+    def test_probe_port_on_a_closed_port_is_false_and_fast(self):
+        # port 1 is reserved and never listening
+        self.assertFalse(self._probe(1, timeout=0.2))
+        self.assertFalse(self._probe(None))
+
+    def test_probe_models_tolerates_a_dead_endpoint(self):
+        self.assertEqual(self._models("http://127.0.0.1:1/v1", timeout=0.2), [])
+
+
+class TestMeasuredTokens(unittest.TestCase):
+    """`walk` yields one usage block per record; descending past one
+    double-counts every total in `lmm cost`."""
+
+    def walk_totals(self, record):
+        # exercise the nested walker through the public path
+        import tempfile as tf
+        d = tf.mkdtemp(prefix="lmm-claude-")
+        proj = os.path.join(d, "projects", "p")
+        os.makedirs(proj)
+        path = os.path.join(proj, "s.jsonl")
+        with open(path, "w", encoding="utf-8") as fh:
+            fh.write(json.dumps(record) + "\n")
+        saved = lmm.CLAUDE_PROJECTS
+        lmm.CLAUDE_PROJECTS = os.path.join(d, "projects")
+        try:
+            return lmm.measured_tokens()
+        finally:
+            lmm.CLAUDE_PROJECTS = saved
+            os.remove(path)
+            os.rmdir(proj)
+            os.rmdir(os.path.join(d, "projects"))
+            os.rmdir(d)
+
+    def test_nested_usage_is_counted_once(self):
+        rec = {"type": "assistant", "model": "claude-sonnet-x",
+               "message": {"model": "claude-sonnet-x",
+                           "usage": {"input_tokens": 10, "output_tokens": 20}}}
+        got = self.walk_totals(rec)
+        fam = got["by_family"]["sonnet"]
+        self.assertEqual(fam["in"], 10)
+        self.assertEqual(fam["out"], 20)
+
+    def test_duplicated_usage_at_two_levels_is_not_doubled(self):
+        u = {"input_tokens": 10, "output_tokens": 20}
+        rec = {"model": "claude-opus-x", "usage": dict(u),
+               "message": {"usage": dict(u)}}
+        got = self.walk_totals(rec)
+        fam = got["by_family"]["opus"]
+        self.assertEqual(fam["in"], 10)
+        self.assertEqual(fam["out"], 20)
+
+
 class temp_state(object):
     """Point lmm's usage log and cache at a throwaway directory."""
 

@@ -286,6 +286,53 @@ RUNTIME_REGISTRY = {
 # runtime name -> window-title keywords for hide (derived; editable)
 HIDE_KEYWORDS = {k: v.get("titles", []) for k, v in RUNTIME_REGISTRY.items()}
 
+# Default local API ports, taken from each project's own documentation. These
+# are what turn "the app is installed" into "the app is actually serving" —
+# a running process proves neither, and an endpoint that answers proves both.
+# Entries without a port are desktop or remote-only apps with no documented
+# local API; guessing one would produce confident wrong output.
+#
+#   ollama      11434  docs.ollama.com
+#   lmstudio     1234  lmstudio.ai local server
+#   jan          1337  jan.ai/docs/desktop/api-server
+#   gpt4all      4891  docs.gpt4all.io/gpt4all_api_server
+#   anythingllm  3001  AnythingLLM desktop/docker default
+#   koboldcpp    5001  KoboldCpp OpenAI-compatible API
+#   vllm         8000  vllm.entrypoints.openai.api_server default
+#   llamacpp     8080  llama-server default
+#   openwebui    8080  Open WebUI container port
+RUNTIME_ENDPOINTS = {
+    "ollama":      (11434, "/v1"),
+    "lmstudio":    (1234,  "/v1"),
+    "jan":         (1337,  "/v1"),
+    "gpt4all":     (4891,  "/v1"),
+    "anythingllm": (3001,  "/api/v1"),
+    "koboldcpp":   (5001,  "/v1"),
+    "vllm":        (8000,  "/v1"),
+    "llamacpp":    (8080,  "/v1"),
+    "openwebui":   (8080,  "/api"),
+}
+
+# llama.cpp's server and Open WebUI both default to 8080, so an open port alone
+# cannot say which is there. Ports listed here are only believed when a
+# matching process is also running.
+AMBIGUOUS_PORTS = {8080}
+
+RUNTIME_LABELS = {
+    "ollama": "Ollama", "lmstudio": "LM Studio", "claude": "Claude Code (Anthropic)",
+    "chatgpt": "ChatGPT", "cursor": "Cursor", "perplexity": "Perplexity",
+    "jan": "Jan", "gpt4all": "GPT4All", "anythingllm": "AnythingLLM",
+    "chatbox": "Chatbox", "msty": "Msty", "koboldcpp": "KoboldCPP",
+    "openwebui": "Open WebUI", "vllm": "vLLM", "devin": "Devin/Cua",
+    "llamacpp": "llama.cpp server",
+}
+
+for _name, _spec in RUNTIME_REGISTRY.items():
+    _port, _api = RUNTIME_ENDPOINTS.get(_name, (None, None))
+    _spec["port"], _spec["api"] = _port, _api
+    _spec["label"] = RUNTIME_LABELS.get(_name, _name.title())
+del _name, _spec, _port, _api
+
 CLAUDE_PROJECTS = os.path.join(HOME, ".claude", "projects")
 CLAUDE_CREDS    = os.path.join(HOME, ".claude", ".credentials.json")
 
@@ -970,6 +1017,80 @@ def hide_taskbar(runtime):
             f"Restart the app to restore its taskbar button.")
 
 
+def probe_port(port, host="127.0.0.1", timeout=0.25):
+    """Is something listening? A TCP connect is the cheapest possible check —
+    no HTTP, no auth, no model load — so all 16 runtimes can be probed in the
+    time one `ollama list` subprocess would take."""
+    if not port:
+        return False
+    import socket
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    s.settimeout(timeout)
+    try:
+        return s.connect_ex((host, port)) == 0
+    except OSError:
+        return False
+    finally:
+        s.close()
+
+
+def probe_models(base_url, timeout=1.0):
+    """Best-effort model list from an OpenAI-compatible /models endpoint.
+    Anything unexpected (auth required, different schema, HTML) yields []
+    rather than an error — this is a nicety, not a detection signal."""
+    import urllib.request
+    try:
+        req = urllib.request.Request(base_url.rstrip("/") + "/models",
+                                     headers={"Accept": "application/json"})
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            body = json.loads(resp.read().decode("utf-8", "ignore"))
+    except Exception:
+        return []
+    data = body.get("data") if isinstance(body, dict) else None
+    out = []
+    for m in data or []:
+        if isinstance(m, dict) and m.get("id"):
+            out.append(str(m["id"]))
+    return out
+
+
+def installed_dirs(spec):
+    """Has this runtime ever been installed? Checks its data dir and the
+    per-OS application-data names already recorded in the registry."""
+    data = spec.get("data")
+    if data and os.path.isdir(os.path.expanduser(data)):
+        return True
+    ad = app_data()
+    return any(os.path.isdir(os.path.join(ad, d)) for d in spec.get("appdirs", []))
+
+
+def detect_runtime(name, spec=None, with_models=True):
+    """Registry-driven detection: process + open port + install footprint.
+
+    Every entry in RUNTIME_REGISTRY goes through here, which is what makes the
+    registry's 16 runtimes actually discoverable instead of only hideable.
+    """
+    spec = spec or RUNTIME_REGISTRY[name]
+    procs = proc_count(spec.get("procs", []))
+    port = spec.get("port")
+    serving = probe_port(port)
+    if serving and port in AMBIGUOUS_PORTS and procs == 0:
+        serving = False           # shared default port, no matching process
+    endpoint = "-"
+    models = []
+    if port:
+        endpoint = "http://localhost:%d%s" % (port, spec.get("api") or "")
+        if serving and with_models and (spec.get("api") or "").endswith("/v1"):
+            models = probe_models(endpoint)
+    installed = installed_dirs(spec)
+    return {"name": spec.get("label", name), "key": name,
+            "type": spec.get("kind", "local"), "paid": spec.get("paid", False),
+            "running": bool(serving or procs > 0), "serving": serving,
+            "procs": procs, "models": models,
+            "endpoint": endpoint if (serving or not port) else endpoint + " (closed)",
+            "installed": installed or serving or procs > 0}
+
+
 def detect_extra(cfg):
     out = []
     for e in cfg.get("extra_runtimes", []):
@@ -992,11 +1113,43 @@ def detect_extra(cfg):
     return out
 
 
-def discover(cfg):
-    items = [detect_ollama(), detect_lmstudio(), detect_llamacpp(),
-             detect_claude()]
-    items += detect_extra(cfg)
-    return items
+def discover(cfg, with_models=True):
+    """Every registry runtime plus the user's own, probed concurrently.
+
+    Serially this would be 16 process scans plus 16 socket connects; the
+    process scans shell out and dominate. Running them in a pool keeps
+    `discover` faster than the four-runtime version it replaces, which matters
+    because the GUI calls it on a timer.
+    """
+    from concurrent.futures import ThreadPoolExecutor
+    names = list(RUNTIME_REGISTRY)
+    with ThreadPoolExecutor(max_workers=min(8, len(names))) as pool:
+        futures = [pool.submit(detect_runtime, n, None, with_models) for n in names]
+        items = []
+        for n, f in zip(names, futures):
+            try:
+                items.append(f.result(timeout=30))
+            except Exception:
+                spec = RUNTIME_REGISTRY[n]
+                items.append({"name": spec.get("label", n), "key": n,
+                              "type": spec.get("kind", "local"),
+                              "paid": spec.get("paid", False), "running": False,
+                              "serving": False, "procs": 0, "models": [],
+                              "endpoint": "-", "installed": False})
+    # Ollama's own CLI lists models the API would not show until pulled, and
+    # Claude's credential check is bespoke, so those two keep their detectors
+    # and are merged over the generic result.
+    by_key = {it["key"]: it for it in items}
+    oll = detect_ollama()
+    if oll.get("models"):
+        by_key["ollama"]["models"] = oll["models"]
+    by_key["ollama"]["running"] = by_key["ollama"]["running"] or oll["running"]
+    cl = detect_claude()
+    by_key["claude"]["running"] = by_key["claude"]["running"] or cl["running"]
+    by_key["claude"]["has_auth"] = cl.get("has_auth", False)
+    if cl.get("endpoint") and by_key["claude"]["endpoint"] == "-":
+        by_key["claude"]["endpoint"] = cl["endpoint"]
+    return items + detect_extra(cfg)
 
 
 # ------------------------------ cost ---------------------------------------
@@ -1149,6 +1302,14 @@ def measured_tokens(days=None):
                                     seen = True
                                     break
                         def walk(o):
+                            """Yield at most ONE usage block per record.
+
+                            Descending past a usage block double-counts: a
+                            Claude session record carries its usage under
+                            `message.usage` and some writers repeat it at the
+                            top level, so counting every nested occurrence
+                            inflated every total in `lmm cost`.
+                            """
                             if isinstance(o, dict):
                                 if isinstance(o.get("usage"), dict):
                                     u = o["usage"]
@@ -1156,6 +1317,7 @@ def measured_tokens(days=None):
                                            u.get("output_tokens", 0),
                                            u.get("cache_creation_input_tokens", 0),
                                            u.get("cache_read_input_tokens", 0))
+                                    return          # this record is accounted for
                                 for v in o.values():
                                     yield from walk(v)
                             elif isinstance(o, list):
@@ -1919,18 +2081,24 @@ def launch_gui(cfg):
         if not rt:
             messagebox.showwarning("LMM", "select a runtime first")
             return
-        if fn_name == "hide":
-            msg = hide_taskbar(rt)
-        elif fn_name == "stop":
-            cmd_stop(rt, cfg)
-            msg = f"stopped {rt} (if running)"
-        elif fn_name == "serve":
-            cmd_serve(mdl_var.get().strip() or "qwen2.5-coder:7b")
-            msg = f"served {mdl_var.get().strip() or 'qwen2.5-coder:7b'}"
-        else:
-            msg = "?"
-        messagebox.showinfo("LMM", msg)
-        refresh()
+        model = mdl_var.get().strip() or "qwen2.5-coder:7b"
+
+        def work():
+            # `serve` shells out to `ollama pull`, which can run for minutes on
+            # a cold model. On the Tk thread that is an unresponsive window, so
+            # every action runs on a worker and reports back via root.after.
+            if fn_name == "hide":
+                msg = hide_taskbar(rt)
+            elif fn_name == "stop":
+                cmd_stop(rt, cfg)
+                msg = f"stopped {rt} (if running)"
+            elif fn_name == "serve":
+                cmd_serve(model)
+                msg = f"served {model}"
+            else:
+                msg = "?"
+            root.after(0, lambda: (messagebox.showinfo("LMM", msg), refresh()))
+        threading.Thread(target=work, daemon=True).start()
 
     ttk.Button(bar, text="▶ Serve", command=lambda: act("serve")).pack(side="left", padx=2)
     ttk.Button(bar, text="■ Stop", command=lambda: act("stop")).pack(side="left", padx=2)
@@ -1938,22 +2106,31 @@ def launch_gui(cfg):
     ttk.Button(bar, text="⟳ Refresh", command=lambda: refresh()).pack(side="right", padx=2)
 
     # --- live refresh ----------------------------------------------------
-    def refresh():
-        # GPU + cost
+    def gather():
+        """Everything slow: subprocesses, socket probes, and a full walk of the
+        session logs. Runs on a worker thread — doing it on the Tk thread froze
+        the window for the duration of every refresh."""
         gpu = gpu_info()
+        try:
+            cost_line = cost_report(cfg).splitlines()[-1]
+        except Exception:
+            cost_line = ""
+        return gpu, cost_line, discover(cfg)
+
+    def paint(data):
+        """Everything touching widgets. Tk is not thread-safe, so this only
+        ever runs on the main thread, marshalled back via root.after."""
+        gpu, cost_line, items = data
         gpu_var.set(f"GPU: {gpu['name']} {gpu['used']}/{gpu['total']} MiB ({gpu['pct']}%)"
                     if gpu else "GPU: n/a")
         # color the GPU red when VRAM is tight (backstage->frontstage on exception)
         if gpu and gpu["pct"] >= 85:
             gpu_var.set(gpu_var.get() + "  ⚠")
-        try:
-            cost_label.config(text=cost_report(cfg).splitlines()[-1])
-        except Exception:
-            pass
-        # table
+        if cost_line:
+            cost_label.config(text=cost_line)
         for row in tree.get_children():
             tree.delete(row)
-        for it in discover(cfg):
+        for it in items:
             tag = "on" if it["running"] else "off"
             tree.insert("", "end", values=(
                 it["name"], it["type"],
@@ -1965,6 +2142,24 @@ def launch_gui(cfg):
             ), tags=(tag,))
         tree.tag_configure("on", foreground="#1b5e20")
         tree.tag_configure("off", foreground="#9e9e9e")
+
+    busy = {"running": False}
+
+    def refresh():
+        if busy["running"]:
+            return               # a slow probe must not queue up behind itself
+        busy["running"] = True
+
+        def work():
+            try:
+                data = gather()
+            except Exception:
+                data = None
+            finally:
+                busy["running"] = False
+            if data is not None:
+                root.after(0, lambda: paint(data))
+        threading.Thread(target=work, daemon=True).start()
 
     refresh()
     # auto-refresh every 5s (visibility of system status, continuously)

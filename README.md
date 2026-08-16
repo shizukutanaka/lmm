@@ -256,6 +256,27 @@ Ollama · LM Studio · Jan · GPT4All · AnythingLLM · Chatbox · Msty · Kobol
 Open WebUI · vLLM · llama.cpp · Claude · ChatGPT · Cursor · Perplexity ·
 Devin/Cua. Add your own in `~/.lmm/config.json` (see `lmm examples`).
 
+Detection combines three signals: a running process, an **open API port**, and
+an install footprint on disk. The ports are each project's documented default:
+
+| Runtime | Port | | Runtime | Port |
+|---|---|---|---|---|
+| Ollama | 11434 | | KoboldCPP | 5001 |
+| LM Studio | 1234 | | vLLM | 8000 |
+| Jan | 1337 | | llama.cpp server | 8080 |
+| GPT4All | 4891 | | Open WebUI | 8080 |
+| AnythingLLM | 3001 | | | |
+
+Two honesty rules. **llama.cpp and Open WebUI share 8080**, so an open socket
+alone can't say which is there — those are only reported as serving when a
+matching process is running too. And the desktop-only apps (ChatGPT, Cursor,
+Perplexity, Chatbox, Msty, Devin) get **no invented endpoint**: they have no
+documented local API, and printing a plausible-looking one would be confident
+nonsense.
+
+Probing is a TCP connect, not an HTTP call — no auth, no model load — and all
+16 run concurrently, so `lmm discover` finishes in about 0.1s.
+
 ## Configuration
 
 Works with zero config. `~/.lmm/config.json` (or `~/.config/lmm/config.json`,
@@ -299,7 +320,7 @@ file; the tests live outside it.
 
 | Concern        | Approach                                                        |
 |----------------|-----------------------------------------------------------------|
-| Discovery      | Probe each runtime's process + data dir + endpoint              |
+| Discovery      | Every registry runtime: process + TCP port probe + data dir, all concurrent |
 | Secrets        | Only *check* existence of existing credentials; never store one |
 | Cost           | Real tokens from `~/.claude/projects/*.jsonl` × public pricing, plus lmm's own metered hub calls |
 | Routing        | Lexical strength score vs a cost threshold; your `ask_order` overrides it |
