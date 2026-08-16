@@ -59,6 +59,16 @@ while read -r local_ref local_sha remote_ref remote_sha; do
     fi
     rm -f "${tmp}"
   done <<< "${changed_py}"
+
+  # 3) full offline self-guard (CI equivalent) — runs the hub's own selftest on
+  #    the whole tree, so a broken hub is caught even when GitHub Actions is
+  #    unavailable. Keeps the "measure, don't trust" promise server-independent.
+  if [ -x "$(dirname "$0")/guard.sh" ]; then
+    if ! bash "$(dirname "$0")/guard.sh" >/dev/null 2>&1; then
+      echo "[pre-push] BLOCKED: $(dirname "$0")/guard.sh reported a broken hub." >&2
+      status=1
+    fi
+  fi
 done
 
 if [ "$status" -ne 0 ]; then
