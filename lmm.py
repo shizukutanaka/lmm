@@ -627,6 +627,7 @@ def http_stream_sse(url, payload, api_key, timeout=300):
     except Exception as e:
         yield None, {"error": str(e)}
         return
+    saw_frame = False
     try:
         for raw in resp:                      # urllib responses iterate by line
             line = raw.decode("utf-8", "ignore").strip()
@@ -634,6 +635,7 @@ def http_stream_sse(url, payload, api_key, timeout=300):
                 continue
             if not line.startswith("data:"):
                 continue
+            saw_frame = True
             body = line[5:].strip()
             if body == "[DONE]":
                 break
@@ -649,6 +651,14 @@ def http_stream_sse(url, payload, api_key, timeout=300):
             resp.close()
         except Exception:
             pass
+    if not saw_frame:
+        # A provider that ignores `stream: true` answers with an ordinary JSON
+        # body. Every line fails the `data:` test, so this would otherwise look
+        # like a clean empty stream: the caller writes nothing, meters nothing,
+        # and never fails over — the user just gets silence. Report it instead.
+        yield None, {"error": "upstream returned no SSE frames "
+                              "(did it ignore stream:true?)"}
+        return
     yield None, None                          # clean end of stream
 
 
@@ -1232,22 +1242,37 @@ def hub_cost_block(cfg, pricing, days=None, claude_total=0.0):
         hits = {"exact": 0, "semantic": 0}
         saved_cache = 0.0
         local_calls, local_tokens = 0, 0
+        est_usd, partial_usd, partial_calls = 0.0, 0.0, 0
+        ttfts = []
         for ev in events:
             hit = ev.get("cache")
             if hit in hits:
                 hits[hit] += 1
                 saved_cache += float(ev.get("saved_usd", 0.0) or 0.0)
                 continue
+            if hit == "near-miss":
+                continue                     # not a call; accounted in `lmm cache`
             name = ev.get("provider", "?")
             a = by_prov.setdefault(name, {"calls": 0, "in": 0, "out": 0, "usd": 0.0,
                                           "kind": ev.get("kind", "remote")})
+            usd = float(ev.get("usd", 0.0) or 0.0)
             a["calls"] += 1
             a["in"] += ev.get("in", 0) or 0
             a["out"] += ev.get("out", 0) or 0
-            a["usd"] += float(ev.get("usd", 0.0) or 0.0)
+            a["usd"] += usd
+            if ev.get("estimated"):
+                est_usd += usd
+            if ev.get("partial"):
+                partial_usd += usd
+                partial_calls += 1
+            # TTFT only means something where tokens arrived incrementally; a
+            # buffered cascade has a first-byte time but not a first-TOKEN one.
+            if ev.get("stream") and not ev.get("buffered") and ev.get("ttft_ms"):
+                ttfts.append(float(ev["ttft_ms"]))
             if ev.get("kind") == "local":
                 local_calls += 1
                 local_tokens += (ev.get("in", 0) or 0) + (ev.get("out", 0) or 0)
+    if events and (by_prov or hits["exact"] or hits["semantic"]):
         out.append("")
         out.append("=" * 64)
         out.append(f"HUB MEASURED USAGE ({window}, from {USAGE_LOG})")
@@ -1260,6 +1285,19 @@ def hub_cost_block(cfg, pricing, days=None, claude_total=0.0):
             measured += a["usd"]
         out.append("-" * 64)
         out.append(f"HUB MEASURED TOTAL  ${measured:,.4f}")
+        # A line labelled MEASURED must not quietly contain guesses. Both of
+        # these are real spend, but neither is a clean measurement, so they are
+        # named rather than blended away.
+        if est_usd:
+            out.append(f"  of which ESTIMATED   ${est_usd:,.4f} — provider omitted "
+                       "usage from its stream; tokens inferred from text length")
+        if partial_usd:
+            out.append(f"  of which PARTIAL     ${partial_usd:,.4f} over "
+                       f"{partial_calls} stream(s) the client abandoned mid-flight")
+        if ttfts:
+            out.append(f"  STREAM TTFT          p50 {median(ttfts):.0f}ms  "
+                       f"p90 {percentile(ttfts, 90):.0f}ms  "
+                       f"over {len(ttfts)} streamed call(s)")
 
         # The savings side of the ledger — the whole point of the cascade,
         # the router and the cache.
@@ -1276,8 +1314,9 @@ def hub_cost_block(cfg, pricing, days=None, claude_total=0.0):
                        f"saved ~${saved_cache:,.4f}")
     else:
         out.append("")
-        out.append(f"No hub telemetry yet ({USAGE_LOG}). Run `lmm ask ...` or "
-                   "`lmm serve --hub` and spend will be measured automatically.")
+        out.append(f"No metered hub calls yet ({USAGE_LOG}). Run `lmm ask ...` "
+                   "or `lmm serve --hub` and spend will be measured "
+                   "automatically.")
 
     # ---- hand-entered cloud usage (still supported alongside telemetry) ----
     # cfg['usage'] accepts either a USD amount per provider:
@@ -1596,6 +1635,14 @@ def cmd_serve_hub(cfg, host, port):
                     self.wfile.flush()
             except (BrokenPipeError, ConnectionResetError):
                 pass          # client hung up mid-stream; nothing to report
+            finally:
+                # Closing explicitly runs hub_stream's own finally, which is
+                # what records the spend on an abandoned stream. Relying on
+                # refcounting to finalise the generator happens to work on
+                # CPython but is not a language guarantee.
+                close = getattr(frames, "close", None)
+                if close:
+                    close()
 
         def do_GET(self):
             if self.path.rstrip("/").endswith("/v1/models"):
@@ -2388,8 +2435,16 @@ def hub_complete(cfg, messages, targets, opts=None):
 
     use_cache = opts.get("cache", True)
     use_cascade = opts.get("cascade", casc.get("enabled", False))
+    # hub_stream buffers through here for the cascade; it has already ordered
+    # the targets and owns the cache, so neither is redone.
+    streamed = bool(opts.get("stream"))
+    # Optional out-parameter: a caller that owns the cache (hub_stream) needs
+    # to know what this call actually cost, so the cached entry records the
+    # real saving rather than $0.
+    stats = opts.get("_stats")
 
-    targets = order_targets(cfg, messages, targets)
+    if not opts.get("ordered"):
+        targets = order_targets(cfg, messages, targets)
     if not targets:
         return {"error": "no provider available"}, trace
 
@@ -2451,8 +2506,11 @@ def hub_complete(cfg, messages, targets, opts=None):
         if not use_cascade:
             usd = meter_call(name, prov, prov.get("model"), res, pricing,
                              source=source, cache="miss", rung=i, accepted=True,
-                             ms=elapsed_ms, stream=False)
+                             ms=elapsed_ms, stream=streamed, buffered=streamed,
+                             ttft_ms=elapsed_ms if streamed else None)
             trace.append(f"[ask] {name} ({prov.get('model')}) ${usd:.4f}")
+            if stats is not None:
+                stats["spent"] = usd
             if use_cache:
                 cache_store(cfg, messages, cache_model, res, usd, req_temp)
             return res, trace
@@ -2462,7 +2520,8 @@ def hub_complete(cfg, messages, targets, opts=None):
         usd = meter_call(name, prov, prov.get("model"), res, pricing,
                          source=source, cache="miss", rung=i,
                          score=round(score, 3), accepted=bool(accept),
-                         ms=elapsed_ms, stream=False)
+                         ms=elapsed_ms, stream=streamed, buffered=streamed,
+                         ttft_ms=elapsed_ms if streamed else None)
         spent += usd
         verdict = "accept" if score >= threshold else "escalate"
         trace.append(f"[cascade] rung{i} {name} score={score:.2f} ${usd:.4f} "
@@ -2470,6 +2529,8 @@ def hub_complete(cfg, messages, targets, opts=None):
         if best is None or score > best[0]:
             best = (score, res, name)
         if score >= threshold:
+            if stats is not None:
+                stats["spent"] = spent
             if use_cache:
                 cache_store(cfg, messages, cache_model, res, spent, req_temp)
             trace.append(f"[cascade] total ${spent:.4f} over {i + 1} rung(s)")
@@ -2481,6 +2542,8 @@ def hub_complete(cfg, messages, targets, opts=None):
         trace.append(f"[cascade] no rung cleared {threshold:.2f}; "
                      f"returning best ({best[2]}, score={best[0]:.2f}), "
                      f"total ${spent:.4f}")
+        if stats is not None:
+            stats["spent"] = spent
         if use_cache:
             cache_store(cfg, messages, cache_model, best[1], spent, req_temp)
         return best[1], trace
@@ -2543,8 +2606,17 @@ def hub_stream(cfg, messages, targets, opts=None):
 
     # Cascade needs the complete text to score it, so buffer and replay.
     if use_cascade:
+        # cache=False and ordered=True: the lookup and the ordering already
+        # happened above. Letting hub_complete redo them would re-embed the
+        # prompt (a second Ollama round-trip when the semantic tier is on) and
+        # double-log every near-miss, which is the very statistic `lmm cache`
+        # reports for tuning the threshold. source is resolved here too, or the
+        # delegate would default it back to "ask".
+        casc_stats = {}
         res, _trace = hub_complete(cfg, messages, targets,
-                                   dict(opts, cache=use_cache, cascade=True))
+                                   dict(opts, cache=False, cascade=True,
+                                        ordered=True, stream=True,
+                                        source=source, _stats=casc_stats))
         if isinstance(res, dict) and res.get("error"):
             yield sse_frame({"error": {"message": res["error"]}})
             yield SSE_DONE
@@ -2555,6 +2627,9 @@ def hub_stream(cfg, messages, targets, opts=None):
             yield sse_frame({"error": {"message": "unexpected response shape"}})
             yield SSE_DONE
             return
+        if use_cache and text:
+            cache_store(cfg, messages, cache_model, res,
+                        casc_stats.get("spent", 0.0), req_temp)
         for frame in synth_stream(text, cache_model,
                                   res.get("usage") if want_usage else None):
             yield frame
@@ -2724,6 +2799,17 @@ def median(xs):
     return xs[n // 2] if n % 2 else (xs[n // 2 - 1] + xs[n // 2]) / 2.0
 
 
+def percentile(xs, p):
+    """Nearest-rank percentile. Only meaningful with enough samples — roughly
+    10/(1-p) of them — which is why `bench` reports a median and a range, and
+    p90 appears only over accumulated production traffic in `lmm cost`."""
+    xs = sorted(xs)
+    if not xs:
+        return 0.0
+    k = max(0, min(len(xs) - 1, int(math.ceil(p / 100.0 * len(xs))) - 1))
+    return xs[k]
+
+
 def cmd_bench(cfg, provider=None, runs=3, prompt=None, max_tokens=128):
     """Measure TTFT / TPOT / throughput per provider so the local-vs-cloud
     decision has latency data, not just price."""
@@ -2760,8 +2846,12 @@ def cmd_bench(cfg, provider=None, runs=3, prompt=None, max_tokens=128):
             print(f"  {name:<26} failed: {warm['error']}")
             continue
         samples = []
-        for _ in range(max(1, runs)):
-            r = bench_once(prov, prompt, max_tokens)
+        for i in range(max(1, runs)):
+            # Vary the prefix per run. Repeating an identical prompt would hit
+            # the server's prefix cache (Ollama and vLLM both keep one) and
+            # report a cache-hit TTFT instead of a real prefill — the run would
+            # measure the cache, not the model.
+            r = bench_once(prov, "(%d) %s" % (i, prompt), max_tokens)
             if not r.get("error"):
                 samples.append(r)
         if not samples:

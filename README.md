@@ -173,8 +173,18 @@ Details that matter for a proxy:
 - **`stream_options.include_usage` is always requested upstream** so streamed
   calls can be metered — but the resulting usage chunk is withheld from clients
   that didn't ask for it. When a provider ignores the option, tokens are
-  estimated and the event is flagged `estimated`, so `lmm cost` never shows a
-  guess as a measurement.
+  estimated and the event is flagged `estimated`.
+- **A provider that ignores `stream: true` entirely** — answering with an
+  ordinary JSON body — used to look like a clean empty stream: no output, no
+  metering, no failover, no explanation. It's now reported as an error, so the
+  request fails over to the next provider instead of going silent.
+
+`lmm cost` keeps these distinctions rather than blending them into one number:
+a line labelled `HUB MEASURED TOTAL` breaks out `of which ESTIMATED` (tokens
+inferred, not reported) and `of which PARTIAL` (streams the client abandoned —
+still billed upstream, so still counted), and reports p50/p90 TTFT across
+genuinely streamed calls. Buffered cascade responses are excluded from that
+TTFT series: they have a first-*byte* time but not a first-*token* one.
 
 ### `lmm bench` — the third axis
 

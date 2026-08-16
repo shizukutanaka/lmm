@@ -838,6 +838,215 @@ class TestHubStream(unittest.TestCase):
         self.assertTrue(out.endswith(lmm.SSE_DONE))
 
 
+class TestStreamingRegressions(unittest.TestCase):
+    """Defects found by probing the first streaming implementation. Each of
+    these reproduced before its fix."""
+
+    def setUp(self):
+        self.calls = []
+        self.lookups = []
+        self.orders = []
+        self._stream = lmm.call_provider_stream
+        self._call = lmm.call_provider
+        self._lookup = lmm.cache_lookup
+        self._order = lmm.order_targets
+
+    def tearDown(self):
+        lmm.call_provider_stream = self._stream
+        lmm.call_provider = self._call
+        lmm.cache_lookup = self._lookup
+        lmm.order_targets = self._order
+
+    def targets(self):
+        return [("p", {"kind": "remote", "model": "p",
+                       "price": {"in": 1.0, "out": 2.0}}),
+                ("q", {"kind": "remote", "model": "q",
+                       "price": {"in": 2.0, "out": 4.0}})]
+
+    def count_calls(self):
+        def _lookup(cfg, messages, model):
+            self.lookups.append(model)
+            return self._lookup(cfg, messages, model)
+
+        def _order(cfg, prompt, targets):
+            self.orders.append(1)
+            return self._order(cfg, prompt, targets)
+        lmm.cache_lookup = _lookup
+        lmm.order_targets = _order
+
+    def cascade_fake(self):
+        def _call(prov, prompt, temperature=0.7, extra=None):
+            self.calls.append(prov.get("model"))
+            return {"choices": [{"message": {"content": "The answer is 4, truly."}}],
+                    "usage": {"prompt_tokens": 100, "completion_tokens": 100}}
+        lmm.call_provider = _call
+
+    # --- defect 1 -------------------------------------------------------
+    def test_provider_ignoring_stream_true_is_an_error_not_silence(self):
+        # A provider that answers a streamed request with a plain JSON body
+        # produced zero frames, zero metering and no failover — just silence.
+        import io
+
+        class FakeResp(io.BytesIO):
+            def close(self):
+                pass
+        real_open = lmm.__dict__.get("_urlopen_patch")
+        import urllib.request
+        saved = urllib.request.urlopen
+        urllib.request.urlopen = lambda *a, **k: FakeResp(
+            b'{"choices":[{"message":{"content":"not a stream"}}]}')
+        try:
+            frames = list(lmm.http_stream_sse("http://x/v1/chat/completions",
+                                              {}, ""))
+        finally:
+            urllib.request.urlopen = saved
+        self.assertEqual(len(frames), 1)
+        self.assertIsNotNone(frames[0][1])
+        self.assertIn("no SSE frames", frames[0][1]["error"])
+
+    def test_a_provider_ignoring_stream_now_fails_over(self):
+        def _s(prov, prompt, temperature=0.7, extra=None):
+            self.calls.append(prov.get("model"))
+            if prov.get("model") == "p":
+                yield None, {"error": "upstream returned no SSE frames"}
+                return
+            obj = {"choices": [{"delta": {"content": "ok"}}]}
+            yield ("data: " + json.dumps(obj) + "\n").encode(), obj
+            yield None, None
+        lmm.call_provider_stream = _s
+        with temp_state():
+            out = b"".join(lmm.hub_stream({}, "hi", self.targets(),
+                                          {"cache": False}))
+        self.assertEqual(self.calls, ["p", "q"])
+        self.assertIn(b"ok", out)
+
+    # --- defect 2 -------------------------------------------------------
+    def test_buffered_cascade_is_metered_as_a_stream(self):
+        self.cascade_fake()
+        lmm.call_provider_stream = None
+        with temp_state():
+            b"".join(lmm.hub_stream({}, "hi", self.targets(),
+                                    {"cascade": True, "cache": False}))
+            events = lmm.read_usage()
+        self.assertTrue(events[0]["stream"])
+        self.assertTrue(events[0]["buffered"])
+        self.assertIsNotNone(events[0]["ttft_ms"])
+
+    def test_non_streamed_calls_are_still_marked_not_streamed(self):
+        self.cascade_fake()
+        with temp_state():
+            lmm.hub_complete({}, "hi", self.targets(),
+                             {"cascade": False, "cache": False})
+            events = lmm.read_usage()
+        self.assertFalse(events[0]["stream"])
+        self.assertFalse(events[0]["buffered"])
+
+    # --- defects 3 and 4 ------------------------------------------------
+    def test_streamed_cascade_looks_up_the_cache_once(self):
+        # Two lookups meant two embeddings and two near-miss log rows, which
+        # doubled the very statistic `lmm cache` reports for tuning.
+        self.cascade_fake()
+        lmm.call_provider_stream = None
+        self.count_calls()
+        with temp_state():
+            b"".join(lmm.hub_stream({}, "hi", self.targets(),
+                                    {"cascade": True, "cache": True}))
+        self.assertEqual(len(self.lookups), 1)
+
+    def test_streamed_cascade_orders_targets_once(self):
+        self.cascade_fake()
+        lmm.call_provider_stream = None
+        self.count_calls()
+        with temp_state():
+            b"".join(lmm.hub_stream({}, "hi", self.targets(),
+                                    {"cascade": True, "cache": False}))
+        self.assertEqual(len(self.orders), 1)
+
+    def test_streamed_cascade_still_caches_with_the_real_spend(self):
+        # hub_stream now owns the store; if it recorded $0 the next hit would
+        # report saving nothing.
+        self.cascade_fake()
+        lmm.call_provider_stream = None
+        with temp_state():
+            b"".join(lmm.hub_stream({}, "hi", self.targets(),
+                                    {"cascade": True, "cache": True}))
+            entry, how, _ = lmm.cache_lookup({}, lmm.as_messages("hi"), "p")
+            self.assertEqual(how, "exact")
+            self.assertGreater(entry["usd"], 0.0)
+            out = b"".join(lmm.hub_stream({}, "hi", self.targets(),
+                                          {"cascade": True, "cache": True}))
+            events = lmm.read_usage()
+        self.assertEqual(len(self.calls), 1)          # served from cache
+        self.assertIn(b"The answer is 4", out)
+        self.assertGreater(events[-1]["saved_usd"], 0.0)
+
+    # --- defect 5 -------------------------------------------------------
+    def test_source_is_not_downgraded_to_ask_by_the_delegate(self):
+        self.cascade_fake()
+        lmm.call_provider_stream = None
+        with temp_state():
+            b"".join(lmm.hub_stream({}, "hi", self.targets(),
+                                    {"cascade": True, "cache": False,
+                                     "source": "hub"}))
+            events = lmm.read_usage()
+        self.assertEqual(events[0]["source"], "hub")
+
+    # --- defect 6 -------------------------------------------------------
+    def test_cost_report_separates_estimates_from_measurements(self):
+        pricing = lmm.merged_pricing({})
+        with temp_state():
+            lmm.log_usage({"provider": "p", "kind": "remote", "in": 100,
+                           "out": 100, "usd": 1.0, "estimated": True,
+                           "stream": True, "ttft_ms": 120})
+            lmm.log_usage({"provider": "p", "kind": "remote", "in": 100,
+                           "out": 100, "usd": 2.0, "stream": True,
+                           "ttft_ms": 80})
+            block = "\n".join(lmm.hub_cost_block({}, pricing))
+        self.assertIn("HUB MEASURED TOTAL  $3.0000", block)
+        self.assertIn("ESTIMATED", block)
+        self.assertIn("$1.0000", block)
+        self.assertIn("STREAM TTFT", block)
+
+    def test_cost_report_names_partial_spend(self):
+        pricing = lmm.merged_pricing({})
+        with temp_state():
+            lmm.log_usage({"provider": "p", "kind": "remote", "in": 10,
+                           "out": 10, "usd": 0.5, "partial": True,
+                           "stream": True})
+            block = "\n".join(lmm.hub_cost_block({}, pricing))
+        self.assertIn("PARTIAL", block)
+        self.assertIn("abandoned", block)
+
+    def test_buffered_cascade_ttft_is_excluded_from_the_stream_ttft_series(self):
+        pricing = lmm.merged_pricing({})
+        with temp_state():
+            lmm.log_usage({"provider": "p", "kind": "remote", "in": 1, "out": 1,
+                           "usd": 0.1, "stream": True, "buffered": True,
+                           "ttft_ms": 9999})
+            block = "\n".join(lmm.hub_cost_block({}, pricing))
+        self.assertNotIn("STREAM TTFT", block)
+
+    def test_near_miss_rows_are_not_counted_as_calls(self):
+        pricing = lmm.merged_pricing({})
+        with temp_state():
+            lmm.log_usage({"provider": "cache", "kind": "local", "in": 0,
+                           "out": 0, "usd": 0.0, "cache": "near-miss",
+                           "similarity": 0.9})
+            block = "\n".join(lmm.hub_cost_block({}, pricing))
+        # A near-miss is a cache probe, not a billable call: it must not create
+        # a phantom provider row, and an all-near-miss log is not "usage".
+        self.assertNotIn("HUB MEASURED TOTAL", block)
+        self.assertIn("No metered hub calls yet", block)
+
+    def test_percentile(self):
+        xs = list(range(1, 101))
+        self.assertEqual(lmm.percentile(xs, 50), 50)
+        self.assertEqual(lmm.percentile(xs, 90), 90)
+        self.assertEqual(lmm.percentile(xs, 100), 100)
+        self.assertEqual(lmm.percentile([], 90), 0.0)
+        self.assertEqual(lmm.percentile([7], 90), 7)
+
+
 class TestBenchMetrics(unittest.TestCase):
     """TTFT / TPOT / e2e per the standard serving decomposition."""
 
