@@ -1880,6 +1880,8 @@ def main():
     p = sub.add_parser("log", help="show recent hub events (proof of routing)")
     p.add_argument("n", nargs="?", default=20)
     p = sub.add_parser("selftest", help="self-prove the hub works (measure, don't trust)")
+    p.add_argument("--guard", action="store_true",
+                   help="machine-readable mode: no banner, exit code only (for external verifiers)")
     p = sub.add_parser("chat", help="interactive hub chat REPL (keeps history)")
     p.add_argument("--provider", default=None, help="force a provider")
     p = sub.add_parser("stop")
