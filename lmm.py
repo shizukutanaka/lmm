@@ -1398,6 +1398,86 @@ def cmd_ask(prompt, provider, cfg):
     print(f"[ask] all providers failed. last error: {last_err}")
 
 
+def save_config(cfg):
+    """Write config to ~/.lmm/config.json (primary candidate)."""
+    d = os.path.join(HOME, ".lmm")
+    os.makedirs(d, exist_ok=True)
+    p = os.path.join(d, "config.json")
+    with open(p, "w", encoding="utf-8") as f:
+        json.dump(cfg, f, indent=2, ensure_ascii=False)
+    return p
+
+
+def cmd_config(args, cfg):
+    """Manage lmm config: init / list / get / set / unset.
+    Lets the user freely control hub priority (ask_order) and providers
+    without hand-editing JSON. Zero-dep, stdlib only."""
+    act = getattr(args, "config_action", None)
+    if act == "init":
+        if os.path.exists(os.path.join(HOME, ".lmm", "config.json")):
+            print("[config] ~/.lmm/config.json already exists; not overwriting.")
+            return
+        save_config({})
+        print("[config] created ~/.lmm/config.json")
+        return
+    if act == "list":
+        print(json.dumps(cfg, indent=2, ensure_ascii=False))
+        return
+    if act == "get":
+        key = args.key
+        cur = cfg
+        for part in key.split("."):
+            if isinstance(cur, dict) and part in cur:
+                cur = cur[part]
+            else:
+                cur = None
+                break
+        print("null" if cur is None else json.dumps(cur, ensure_ascii=False))
+        return
+    if act == "set":
+        key, val = args.key, args.value
+        # parse value: bool/int/float/json else string
+        lv = val.lower()
+        if lv in ("true", "false"):
+            typed = (lv == "true")
+        else:
+            try:
+                typed = json.loads(val)
+            except Exception:
+                typed = val
+        # navigate to parent, create dicts as needed
+        parts = key.split(".")
+        node = cfg
+        for part in parts[:-1]:
+            node = node.setdefault(part, {})
+            if not isinstance(node, dict):
+                print(f"[config] cannot set '{key}': '{part}' is not a dict")
+                return
+        node[parts[-1]] = typed
+        save_config(cfg)
+        print(f"[config] set {key} = {json.dumps(typed, ensure_ascii=False)}")
+        return
+    if act == "unset":
+        key = args.key
+        parts = key.split(".")
+        node = cfg
+        for part in parts[:-1]:
+            if isinstance(node, dict) and part in node:
+                node = node[part]
+            else:
+                print(f"[config] key '{key}' not found")
+                return
+        if isinstance(node, dict) and parts[-1] in node:
+            del node[parts[-1]]
+            save_config(cfg)
+            print(f"[config] unset {key}")
+        else:
+            print(f"[config] key '{key}' not found")
+        return
+    print("[config] usage: lmm config <init|list|get|set|unset>")
+
+
+
 
 def main():
     ap = argparse.ArgumentParser(
@@ -1418,6 +1498,10 @@ def main():
     p.add_argument("--host", default="127.0.0.1")
     p.add_argument("--port", type=int, default=8080)
     sub.add_parser("hub-status")
+    p = sub.add_parser("config", help="manage lmm config (init/list/get/set/unset)")
+    p.add_argument("config_action", nargs="?", default="list")
+    p.add_argument("key", nargs="?", default=None)
+    p.add_argument("value", nargs="?", default=None)
     p = sub.add_parser("stop")
     p.add_argument("runtime", nargs="?")
     sub.add_parser("dash")
@@ -1458,6 +1542,8 @@ def main():
             cmd_serve(args.model)
     elif cmd == "hub-status":
         cmd_hub_status(cfg)
+    elif cmd == "config":
+        cmd_config(args, cfg)
     elif cmd == "stop":
         cmd_stop(args.runtime, cfg)
     elif cmd == "dash":
