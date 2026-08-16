@@ -228,3 +228,10 @@ keywords. See `lmm examples` for the shape.
 MIT — see [LICENSE](LICENSE).
 
 # lmm -- proof-before-ship: every push passes the embedded selftest.
+
+Every `git push` runs the hub's own `selftest --guard` on the exact blob being
+pushed (via `.githooks/pre-push`, wired through `git config core.hooksPath
+.githooks`). A broken hub (valid Python, broken logic) is blocked before it
+reaches the remote. Survives fresh clones — no manual `cp` needed.
+
+Override (explicit, per self-edit-gate): `LMM_SKIP_HOOK=1 git push`.
