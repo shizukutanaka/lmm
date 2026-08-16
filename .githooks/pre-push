@@ -43,7 +43,11 @@ while read -r local_ref local_sha remote_ref remote_sha; do
   while IFS= read -r f; do
     [ -z "$f" ] && continue
     # Extract the EXACT blob about to be pushed.
-    tmp=$(mktemp -t "lmm_hook_XXXXXX.py" 2>/dev/null || mktemp "C:/Users/HP/AppData/Local/Temp/lmm_hook_XXXXXX.py")
+    # NOTE: on MSYS, `mktemp -t` yields /tmp/... which python resolves as
+    # C:\tmp\... (nonexistent) -> can't open file -> false selftest failure.
+    # Always use an explicit Windows temp path on this PC.
+    tmp="C:/Users/HP/AppData/Local/Temp/lmm_hook_${local_sha:0:8}_XXXXXX.py"
+    tmp=$(mktemp "$tmp" 2>/dev/null || mktemp "C:/Users/HP/AppData/Local/Temp/lmm_hook_XXXXXX.py")
     if ! git show "${local_sha}:${f}" >"${tmp}" 2>/dev/null; then
       rm -f "${tmp}"
       continue
