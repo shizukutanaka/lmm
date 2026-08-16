@@ -1020,6 +1020,89 @@ WantedBy=default.target
             print("systemd registration failed:", e)
 
 
+
+def setup_tray(root, tooltip="LMM Dashboard"):
+    """Add a Windows system-tray icon so minimizing keeps lmm running in the
+    background (zero-dep: pure ctypes / Win32). On non-Windows this is a no-op.
+    Returns a cleanup callable, or None."""
+    if os.name != "nt":
+        return None
+    try:
+        import ctypes
+        from ctypes import wintypes
+        user = ctypes.windll.user32
+        shell = ctypes.windll.shell32
+        user.LoadIconW.argtypes = [ctypes.c_void_p, ctypes.c_uint]
+        user.LoadIconW.restype = ctypes.c_void_p
+        shell.Shell_NotifyIconW.argtypes = [ctypes.c_uint, ctypes.c_void_p]
+        user.SetWindowLongPtrW.argtypes = [ctypes.c_void_p, ctypes.c_int,
+                                           ctypes.c_void_p]
+        user.DefWindowProcW.argtypes = [ctypes.c_void_p, ctypes.c_uint,
+                                        wintypes.WPARAM, wintypes.LPARAM]
+        user.DefWindowProcW.restype = ctypes.c_long
+    except Exception:
+        return None
+
+    WM_TRAYMSG = 0x401
+    hwnd = int(root.winfo_id())
+
+    class NOTIFYICONDATA(ctypes.Structure):
+        _fields_ = [
+            ("cbSize", ctypes.c_ulong),
+            ("hWnd", ctypes.c_void_p),
+            ("uID", ctypes.c_uint),
+            ("uFlags", ctypes.c_uint),
+            ("uCallbackMessage", ctypes.c_uint),
+            ("hIcon", ctypes.c_void_p),
+            ("szTip", ctypes.c_wchar * 128),
+        ]
+    nid = NOTIFYICONDATA()
+    nid.cbSize = ctypes.sizeof(NOTIFYICONDATA)
+    nid.hWnd = hwnd
+    nid.uID = 1
+    nid.uFlags = 0x1 | 0x2 | 0x4
+    nid.uCallbackMessage = WM_TRAYMSG
+    nid.hIcon = user.LoadIconW(0, 32512)
+    nid.szTip = tooltip[:127]   # ctypes assigns str into c_wchar array
+    shell.Shell_NotifyIconW(0x0, ctypes.byref(nid))
+
+    def restore():
+        root.deiconify()
+        root.lift()
+        root.focus_force()
+
+    def wndproc(h, msg, w, l):
+        if msg == WM_TRAYMSG and l == 0x205:   # right-click
+            m = user.CreatePopupMenu()
+            user.AppendMenuW(m, 0, 1001, "Open")
+            user.AppendMenuW(m, 0, 1002, "Quit")
+            pt = wintypes.POINT()
+            user.GetCursorPos(ctypes.byref(pt))
+            cmd = user.TrackPopupMenu(m, 0x100, pt.x, pt.y, 0, hwnd, None)
+            if cmd == 1001:
+                restore()
+            elif cmd == 1002:
+                cleanup()
+                root.destroy()
+            return 0
+        if msg == WM_TRAYMSG and l == 0x203:   # double-click
+            restore()
+            return 0
+        return user.DefWindowProcW(ctypes.c_void_p(h), msg, w, l)
+
+    wp = ctypes.WINFUNCTYPE(ctypes.c_long, ctypes.c_void_p, ctypes.c_uint,
+                            wintypes.WPARAM, wintypes.LPARAM)(wndproc)
+    user.SetWindowLongPtrW(ctypes.c_void_p(hwnd), -4,
+                           ctypes.cast(wp, ctypes.c_void_p))
+    root.protocol("WM_DELETE_WINDOW", lambda: root.withdraw())  # X -> tray
+
+    def cleanup():
+        shell.Shell_NotifyIconW(0x2, ctypes.byref(nid))
+
+    return cleanup
+
+
+
 def launch_gui(cfg):
     """Zero-dependency live dashboard (tkinter). Implements the UX principles
     gathered from the research:
@@ -1040,6 +1123,9 @@ def launch_gui(cfg):
     root = tk.Tk()
     root.title("LMM — Local/remote Model Manager")
     root.geometry("920x560")
+    _tray_cleanup = setup_tray(root)  # minimize -> stay in system tray
+    _tray_cleanup = setup_tray(root)
+    root.bind("<Map>", lambda e: None)  # restored from tray -> no-op
 
     style = ttk.Style()
     try:
