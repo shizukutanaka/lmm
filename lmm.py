@@ -858,10 +858,16 @@ def cmd_serve_hub(cfg, host, port):
                 res = call_provider(prov, prompt, temperature=fwd.get("temperature", 0.7))
                 if isinstance(res, dict) and res.get("error"):
                     last_err = res["error"]
+                    log_hub({"event": "serve", "provider": name, "ok": False,
+                             "error": last_err, "prompt": prompt})
                     continue
+                log_hub({"event": "serve", "provider": name, "ok": True,
+                         "prompt": prompt})
                 self._send(200, res)
                 return
             self._send(502, {"error": "all providers failed: %s" % last_err})
+            log_hub({"event": "serve", "provider": "(all)", "ok": False,
+                     "error": last_err, "prompt": prompt})
 
         def log_message(self, *a):
             pass
@@ -1385,16 +1391,24 @@ def cmd_ask(prompt, provider, cfg):
         res = call_provider(prov, prompt)
         if isinstance(res, dict) and res.get("error"):
             last_err = res["error"]
+            log_hub({"event": "ask", "provider": name, "ok": False,
+                     "error": last_err, "prompt": prompt})
             print(f"[ask]    {name} failed: {last_err} -- fallback")
             continue
         try:
             msg = res["choices"][0]["message"]["content"]
+            log_hub({"event": "ask", "provider": name, "ok": True,
+                     "prompt": prompt})
             print(msg)
             return
         except (KeyError, IndexError, TypeError):
             last_err = "unexpected response"
+            log_hub({"event": "ask", "provider": name, "ok": False,
+                     "error": last_err, "prompt": prompt})
             print(f"[ask]    {name} returned unexpected shape -- fallback")
             continue
+    log_hub({"event": "ask", "provider": "(all)", "ok": False,
+             "error": last_err, "prompt": prompt})
     print(f"[ask] all providers failed. last error: {last_err}")
 
 
@@ -1406,6 +1420,53 @@ def save_config(cfg):
     with open(p, "w", encoding="utf-8") as f:
         json.dump(cfg, f, indent=2, ensure_ascii=False)
     return p
+
+
+def log_hub(entry):
+    """Append a structured hub event to ~/.lmm/hub.log (JSONL). This is how the
+    hub proves what it actually did — measurement, not assumption. The hub is
+    only as trustworthy as this log."""
+    import datetime
+    try:
+        d = os.path.join(HOME, ".lmm")
+        os.makedirs(d, exist_ok=True)
+        entry = dict(entry)
+        entry.setdefault("ts", datetime.datetime.now().isoformat(timespec="seconds"))
+        with open(os.path.join(d, "hub.log"), "a", encoding="utf-8") as f:
+            f.write(json.dumps(entry, ensure_ascii=False) + chr(10))
+    except Exception:
+        pass
+
+
+def cmd_log(n, cfg):
+    """Show the last n hub events from ~/.lmm/hub.log (proof of what the hub
+    actually routed/served). Defaults to 20."""
+    p = os.path.join(HOME, ".lmm", "hub.log")
+    if not os.path.exists(p):
+        print("[log] no hub.log yet. Run `lmm ask` or `lmm serve --hub` first.")
+        return
+    try:
+        n = int(n)
+    except Exception:
+        n = 20
+    lines = [l for l in open(p, encoding="utf-8").read().splitlines() if l.strip()]
+    for l in lines[-n:]:
+        try:
+            e = json.loads(l)
+        except Exception:
+            print(l); continue
+        ts = e.get("ts", "?")
+        kind = e.get("event", "?")
+        prov = e.get("provider", "-")
+        ok = e.get("ok")
+        st = "OK " if ok else ("ERR" if ok is False else ".. ")
+        extra = ""
+        if "error" in e:
+            extra = f" err={e['error']}"
+        if "prompt" in e:
+            extra += f" prompt={e['prompt'][:40]!r}"
+        print(f"  [{st}] {ts} {kind:8} -> {prov}{extra}")
+
 
 
 def cmd_config(args, cfg):
@@ -1502,6 +1563,8 @@ def main():
     p.add_argument("config_action", nargs="?", default="list")
     p.add_argument("key", nargs="?", default=None)
     p.add_argument("value", nargs="?", default=None)
+    p = sub.add_parser("log", help="show recent hub events (proof of routing)")
+    p.add_argument("n", nargs="?", default=20)
     p = sub.add_parser("stop")
     p.add_argument("runtime", nargs="?")
     sub.add_parser("dash")
@@ -1544,6 +1607,8 @@ def main():
         cmd_hub_status(cfg)
     elif cmd == "config":
         cmd_config(args, cfg)
+    elif cmd == "log":
+        cmd_log(args.n, cfg)
     elif cmd == "stop":
         cmd_stop(args.runtime, cfg)
     elif cmd == "dash":
