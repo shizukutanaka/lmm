@@ -367,6 +367,20 @@ def http_post_stream(url, payload, api_key, timeout=120):
 
 
 
+def http_get_json(url, api_key=None, timeout=30):
+    """Minimal GET returning parsed JSON, or {'error': ...} on failure."""
+    import urllib.request
+    headers = {"Accept": "application/json"}
+    if api_key:
+        headers["Authorization"] = f"Bearer {api_key}"
+    req = urllib.request.Request(url, headers=headers, method="GET")
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return json.loads(resp.read().decode("utf-8", "ignore"))
+    except Exception as e:
+        return {"error": str(e)}
+
+
 def call_provider(prov, prompt, temperature=0.7, messages=None, stream=False):
     """Send a completion request to one provider (OpenAI-compatible
     /chat/completions). If `messages` (full history) is given, it is sent
@@ -818,14 +832,57 @@ def cmd_status(cfg):
               f"procs={it.get('procs', 0)}")
 
 
-def cmd_models():
-    ms = detect_ollama()["models"]
-    if ms:
-        print("Ollama local models:")
-        for m in ms:
-            print("  -", m)
-    else:
-        print("no ollama models (or ollama not running)")
+def fetch_models(prov):
+    """Return a list of model-id strings for a provider, or [] on failure.
+    Ollama uses /api/tags; OpenAI-compatible clouds use /v1/models."""
+    try:
+        if prov.get("kind") == "local" and "11434" in prov.get("base_url", ""):
+            r = http_get_json(prov["base_url"].rstrip("/") + "/api/tags")
+            if r and "models" in r:
+                return [m.get("name", "?") for m in r["models"]]
+        # OpenAI-compatible: /v1/models
+        r = http_get_json(prov["base_url"].rstrip("/") + "/v1/models",
+                          api_key=prov.get("api_key"))
+        if r and "data" in r:
+            return [m.get("id", m.get("name", "?")) for m in r["data"]]
+    except Exception:
+        return []
+    return []
+
+
+def cmd_models(cfg):
+    """Unified model registry: list models across every detected provider
+    (local Ollama + configured cloud backends). Measures each, does not assume."""
+    provs = merged_providers(cfg)
+    if not provs:
+        ms = detect_ollama()["models"]
+        if ms:
+            print("Ollama local models:")
+            for m in ms:
+                print("  -", m)
+        else:
+            print("no providers detected (no Ollama, no config)")
+        return
+    for name, prov in provs.items():
+        models = fetch_models(prov)
+        if models:
+            print(f"{name} ({prov.get('kind', '?')}):")
+            for m in models:
+                print("  -", m)
+        else:
+            print(f"{name} ({prov.get('kind', '?')}): unreachable / no models")
+
+
+def cmd_pull(model):
+    """Pull a model into the local Ollama base (the unified local model store).
+    The hub's default backend is Ollama, so `lmm pull` keeps it stocked."""
+    if not model:
+        print("usage: lmm pull <ollama-model>  e.g. lmm pull qwen2.5-coder:7b")
+        return
+    print(f"pulling {model} into local Ollama ...")
+    r = run(f"ollama pull {model}")
+    print((r.stdout.strip() if r else "(pull failed/timeout)"))
+    print("done. Use `lmm models` to confirm, `lmm ask` to route to it.")
 
 
 def cmd_serve(model):
@@ -1760,6 +1817,8 @@ def main():
     sub.add_parser("discover").add_argument("--json", action="store_true")
     sub.add_parser("status")
     sub.add_parser("models")
+    p = sub.add_parser("pull", help="pull a model into local Ollama (unified model store)")
+    p.add_argument("model", nargs="?")
     p = sub.add_parser("cost")
     p.add_argument("--days", type=int, default=30)
     p = sub.add_parser("route")
@@ -1808,7 +1867,9 @@ def main():
     elif cmd == "status":
         cmd_status(cfg)
     elif cmd == "models":
-        cmd_models()
+        cmd_models(cfg)
+    elif cmd == "pull":
+        cmd_pull(args.model)
     elif cmd == "cost":
         print(cost_report(cfg, args.days))
     elif cmd == "route":
