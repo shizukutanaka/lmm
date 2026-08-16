@@ -802,10 +802,18 @@ def cmd_serve_hub(cfg, host, port):
     each request. This is the hub: one endpoint, many backends."""
     import http.server, socketserver, threading
     provs = merged_providers(cfg)
-    if not provs:
-        print("[hub] no providers configured. Add 'providers' to lmm config "
-              "(see `lmm examples`). Nothing to proxy.")
+    # zero-config: if no providers configured but Ollama is running, expose it
+    targets = resolve_ask_targets(cfg, "", None) if "resolve_ask_targets" in globals() else [(n, p) for n, p in provs.items()]
+    if not targets and not provs:
+        # final safety net: implicit running Ollama even without config
+        lo = local_ollama_provider()
+        if lo:
+            targets = [("local-ollama(implicit)", lo)]
+    if not targets:
+        print("[hub] no providers configured and no Ollama running. Add "
+              "'providers' to lmm config (see `lmm examples`), or start Ollama.")
         return
+    provs = dict(targets)
 
     class Handler(http.server.BaseHTTPRequestHandler):
         def _send(self, code, obj):
@@ -870,6 +878,51 @@ def cmd_serve_hub(cfg, host, port):
     except KeyboardInterrupt:
         print("")
         print("[hub] stopped.")
+
+
+
+def cmd_hub_status(cfg):
+    """Measure hub health: list every backend lmm would route to, and probe
+    each one for liveness (zero-config Ollama included). The hub is only as
+    trustworthy as what this reports — measure, don't assume."""
+    targets = resolve_ask_targets(cfg, "", None)
+    if not targets:
+        lo = local_ollama_provider()
+        if lo:
+            targets = [("local-ollama(implicit)", lo)]
+    if not targets:
+        print("[hub-status] no backends available (no config, no Ollama).")
+        return
+    print(f"HUB STATUS — {len(targets)} backend(s):")
+    print("-" * 68)
+    for name, prov in targets:
+        # probe: a tiny completion request, or a models fetch for local
+        ok = False
+        detail = ""
+        try:
+            if prov.get("kind") == "local" and "11434" in prov["base_url"]:
+                r = run("ollama list")
+                ok = bool(r and r.returncode == 0)
+                detail = "ollama reachable" if ok else "ollama not responding"
+            else:
+                # cloud: lightweight models list (GET) to test connectivity/auth
+                import urllib.request
+                url = prov["base_url"].rstrip("/") + "/models"
+                req = urllib.request.Request(
+                    url, headers={"Authorization": f"Bearer {prov.get('api_key','')}"})
+                with urllib.request.urlopen(req, timeout=8) as resp:
+                    ok = resp.status == 200
+                    detail = f"HTTP {resp.status}"
+        except Exception as e:
+            detail = str(e)[:60]
+        flag = "OK " if ok else "DOWN"
+        print(f"  [{flag}] {name:24} {prov['model'] or '(no model)'}")
+        print(f"         {prov['base_url']}  -> {detail}")
+    print("-" * 68)
+    live = sum(1 for n, p in targets
+               if (p.get("kind") == "local" and "11434" in p["base_url"]
+                    and bool(run("ollama list"))) or False)
+    print("Tip: `lmm serve --hub` exposes these as one OpenAI-compatible endpoint.")
 
 
 
@@ -1364,6 +1417,7 @@ def main():
                    help="start OpenAI-compatible proxy over all configured providers")
     p.add_argument("--host", default="127.0.0.1")
     p.add_argument("--port", type=int, default=8080)
+    sub.add_parser("hub-status")
     p = sub.add_parser("stop")
     p.add_argument("runtime", nargs="?")
     sub.add_parser("dash")
@@ -1402,6 +1456,8 @@ def main():
             cmd_serve_hub(cfg, args.host, args.port)
         else:
             cmd_serve(args.model)
+    elif cmd == "hub-status":
+        cmd_hub_status(cfg)
     elif cmd == "stop":
         cmd_stop(args.runtime, cfg)
     elif cmd == "dash":
