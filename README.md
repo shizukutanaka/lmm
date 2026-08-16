@@ -58,6 +58,7 @@ lmm chat [--provider NAME]           -> interactive REPL (keeps conversation his
 lmm serve --hub [--host H] [--port P] -> OpenAI-compatible proxy (zero-config)
 lmm hub-status       -> probe every backend's health (measures, doesn't assume)
 lmm log [N]          -> show last N hub routing events (proof of what it did)
+lmm selftest         -> self-prove the hub works (syntax, routing, observability)
 
 # --- management ---
 lmm serve <model>   -> pull + expose a local model endpoint (Ollama)
@@ -97,7 +98,23 @@ $ lmm log
 [OK ] 2026-08-17T02:51:18 serve -> local-ollama(implicit) reply='STREAMOK'
 ```
 
-### Unified routing brain (`ask_order` + fallback)
+### Self-prove it works (`selftest`)
+
+```bash
+$ lmm selftest
+lmm selftest — measuring, not trusting:
+  [PASS] self syntax (py_compile)
+  [PASS] command surface complete
+  [PASS] implicit Ollama reachable -- qwen2.5-coder:7b
+  [PASS] live ask routing returns reply -- SELFTEST_OK
+  [PASS] observability (hub.log writable) -- created
+
+SELFTEST PASS — the hub measures and proves itself.
+```
+
+`lmm selftest` runs **real measurements** (not trust): it compiles itself, checks
+the command surface, probes Ollama, performs a live routed `ask`, and confirms
+`hub.log` is writable. Non-zero exit on any failure — usable as a fleet/CI gate.
 
 `lmm` routes every `ask` / `chat` / `serve --hub` request through the **same**
 logic:
