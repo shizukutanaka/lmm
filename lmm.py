@@ -332,10 +332,46 @@ def http_post_json(url, payload, api_key, timeout=60):
         return {"error": str(e)}
 
 
-def call_provider(prov, prompt, temperature=0.7, messages=None):
+def http_post_stream(url, payload, api_key, timeout=120):
+    """Streaming OpenAI-compatible chat completion (SSE, zero-dep stdlib).
+    Yields content chunks as they arrive. Stops on [DONE]."""
+    import urllib.request
+    import http.client
+    data = json.dumps(payload).encode("utf-8")
+    req = urllib.request.Request(
+        url, data=data,
+        headers={"Content-Type": "application/json",
+                 "Authorization": f"Bearer {api_key}",
+                 "Accept": "text/event-stream"})
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            buf = ""
+            for raw in resp:
+                line = raw.decode("utf-8", "ignore").rstrip(chr(10))
+                if not line.startswith("data:"):
+                    continue
+                payload_s = line[len("data:"):].strip()
+                if payload_s == "[DONE]":
+                    break
+                try:
+                    obj = json.loads(payload_s)
+                except Exception:
+                    continue
+                choices = obj.get("choices") or [{}]
+                delta = choices[0].get("delta") or {}
+                piece = delta.get("content")
+                if piece:
+                    yield piece
+    except Exception as e:
+        yield f"[stream error: {e}]"
+
+
+
+def call_provider(prov, prompt, temperature=0.7, messages=None, stream=False):
     """Send a completion request to one provider (OpenAI-compatible
     /chat/completions). If `messages` (full history) is given, it is sent
-    verbatim; otherwise a single-turn [user: prompt] is used."""
+    verbatim; otherwise a single-turn [user: prompt] is used. When `stream`
+    is True, returns a generator yielding content chunks (SSE)."""
     if not prov.get("model"):
         return {"error": "provider has no model set"}
     url = prov["base_url"].rstrip("/") + "/chat/completions"
@@ -344,7 +380,10 @@ def call_provider(prov, prompt, temperature=0.7, messages=None):
         "messages": messages if messages is not None
                      else [{"role": "user", "content": prompt}],
         "temperature": temperature,
+        "stream": stream,
     }
+    if stream:
+        return http_post_stream(url, payload, prov.get("api_key", ""))
     return http_post_json(url, payload, prov.get("api_key", ""))
 
 
@@ -855,18 +894,49 @@ def cmd_serve_hub(cfg, host, port):
                 self._send(400, {"error": "no provider available for model '%s'" % explicit})
                 return
             last_err = None
+            want_stream = bool(req.get("stream"))
             for name, prov in targets:
                 fwd = dict(req)
                 fwd["model"] = prov["model"]
-                res = call_provider(prov, prompt, temperature=fwd.get("temperature", 0.7))
-                if isinstance(res, dict) and res.get("error"):
-                    last_err = res["error"]
+                gen = call_provider(prov, prompt,
+                                    temperature=fwd.get("temperature", 0.7),
+                                    messages=fwd.get("messages"),
+                                    stream=want_stream)
+                if isinstance(gen, dict) and gen.get("error"):
+                    last_err = gen["error"]
                     log_hub({"event": "serve", "provider": name, "ok": False,
                              "error": last_err, "prompt": prompt})
                     continue
+                if want_stream:
+                    # SSE pass-through: forward each chunk as it arrives
+                    full = []
+                    try:
+                        self.send_response(200)
+                        self.send_header("Content-Type", "text/event-stream")
+                        self.send_header("Cache-Control", "no-cache")
+                        self.end_headers()
+                        for piece in gen:
+                            if piece.startswith("[stream error:"):
+                                self.wfile.write(
+                                    ("data: " + json.dumps({"error": piece})
+                                     + chr(10) + chr(10)).encode("utf-8"))
+                                break
+                            full.append(piece)
+                            self.wfile.write(
+                                ("data: " + json.dumps({"choices": [
+                                    {"delta": {"content": piece}}]})
+                                 + chr(10) + chr(10)).encode("utf-8"))
+                            self.wfile.flush()
+                        self.wfile.write(
+                            ("data: [DONE]" + chr(10) + chr(10)).encode("utf-8"))
+                    except (BrokenPipeError, ConnectionAbortedError, OSError):
+                        pass  # client disconnected mid-stream
+                    log_hub({"event": "serve", "provider": name, "ok": True,
+                             "prompt": prompt, "reply": "".join(full)[:200]})
+                    return
                 log_hub({"event": "serve", "provider": name, "ok": True,
                          "prompt": prompt})
-                self._send(200, res)
+                self._send(200, gen)
                 return
             self._send(502, {"error": "all providers failed: %s" % last_err})
             log_hub({"event": "serve", "provider": "(all)", "ok": False,
@@ -1382,7 +1452,7 @@ def resolve_ask_targets(cfg, prompt, explicit):
 def cmd_ask(prompt, provider, cfg):
     """Unified inference with auto-routing + fallback: tries providers in order
     (explicit > private/local > configured > implicit running Ollama) and
-    falls through to the next on error. This is the hub's intelligence. Priority is set by cfg['ask_order']."""
+    falls through to the next on error. This is the hub's intelligence. Priority is set by cfg['ask_order']. Responses stream token-by-token."""
     targets = resolve_ask_targets(cfg, prompt, provider)
     if not targets:
         print("[ask] no provider available. Start Ollama (`lmm serve <model>`) "
@@ -1391,24 +1461,29 @@ def cmd_ask(prompt, provider, cfg):
     last_err = None
     for name, prov in targets:
         print(f"[ask] -> trying {name} ({prov['model'] or 'no model set'})")
-        res = call_provider(prov, prompt)
-        if isinstance(res, dict) and res.get("error"):
-            last_err = res["error"]
+        gen = call_provider(prov, prompt, stream=True)
+        if isinstance(gen, dict) and gen.get("error"):
+            last_err = gen["error"]
             log_hub({"event": "ask", "provider": name, "ok": False,
                      "error": last_err, "prompt": prompt})
             print(f"[ask]    {name} failed: {last_err} -- fallback")
             continue
         try:
-            msg = res["choices"][0]["message"]["content"]
+            full = []
+            for piece in gen:
+                if piece.startswith("[stream error:"):
+                    raise RuntimeError(piece)
+                full.append(piece)
+                print(piece, end="", flush=True)
+            print("")
             log_hub({"event": "ask", "provider": name, "ok": True,
-                     "prompt": prompt})
-            print(msg)
+                     "prompt": prompt, "reply": "".join(full)[:200]})
             return
-        except (KeyError, IndexError, TypeError):
-            last_err = "unexpected response"
+        except (KeyError, IndexError, TypeError, RuntimeError) as e:
+            last_err = f"stream failed: {e}"
             log_hub({"event": "ask", "provider": name, "ok": False,
                      "error": last_err, "prompt": prompt})
-            print(f"[ask]    {name} returned unexpected shape -- fallback")
+            print(f"[ask]    {name} stream error -- fallback")
             continue
     log_hub({"event": "ask", "provider": "(all)", "ok": False,
              "error": last_err, "prompt": prompt})
@@ -1443,24 +1518,32 @@ def cmd_chat(provider, cfg):
             last_err = None
             replied = False
             for name, prov in targets:
-                res = call_provider(prov, line,
+                gen = call_provider(prov, line,
                                     messages=messages[:-1] + [{"role": "user",
-                                                               "content": line}])
-                if isinstance(res, dict) and res.get("error"):
-                    last_err = res["error"]
+                                                               "content": line}],
+                                    stream=True)
+                if isinstance(gen, dict) and gen.get("error"):
+                    last_err = gen["error"]
                     log_hub({"event": "chat", "provider": name, "ok": False,
                              "error": last_err, "prompt": line})
                     continue
                 try:
-                    msg = res["choices"][0]["message"]["content"]
+                    print("hub> ", end="", flush=True)
+                    full = []
+                    for piece in gen:
+                        if piece.startswith("[stream error:"):
+                            raise RuntimeError(piece)
+                        full.append(piece)
+                        print(piece, end="", flush=True)
+                    print("")
                     log_hub({"event": "chat", "provider": name, "ok": True,
-                             "prompt": line})
-                    messages.append({"role": "assistant", "content": msg})
-                    print("hub> " + msg)
+                             "prompt": line, "reply": "".join(full)[:200]})
+                    messages.append({"role": "assistant",
+                                     "content": "".join(full)})
                     replied = True
                     break
-                except (KeyError, IndexError, TypeError):
-                    last_err = "unexpected response"
+                except (KeyError, IndexError, TypeError, RuntimeError) as e:
+                    last_err = f"stream failed: {e}"
                     log_hub({"event": "chat", "provider": name, "ok": False,
                              "error": last_err, "prompt": line})
                     continue
