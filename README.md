@@ -226,3 +226,5 @@ keywords. See `lmm examples` for the shape.
 ## License
 
 MIT — see [LICENSE](LICENSE).
+
+# lmm -- proof-before-ship: every push passes the embedded selftest.
