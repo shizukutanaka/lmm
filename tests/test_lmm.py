@@ -576,6 +576,333 @@ class TestVramFit(unittest.TestCase):
         self.assertEqual(lmm.params_from_name("mistral"), 0.0)
 
 
+class TestSSEFraming(unittest.TestCase):
+    """SSE events are terminated by a BLANK LINE. Get that wrong and every
+    client concatenates the whole stream into one event."""
+
+    def test_frame_ends_with_a_blank_line(self):
+        f = lmm.sse_frame({"a": 1})
+        self.assertTrue(f.startswith(b"data: "))
+        self.assertTrue(f.endswith(b"\n\n"))
+
+    def test_frame_payload_is_single_line_json(self):
+        f = lmm.sse_frame({"a": "x\ny"})
+        body = f[len(b"data: "):-2]
+        self.assertNotIn(b"\n", body)          # newline must be escaped in JSON
+        self.assertEqual(json.loads(body.decode())["a"], "x\ny")
+
+    def test_relay_restores_the_terminator(self):
+        # http_stream_sse consumes the blank separator while parsing, so a
+        # relayed line arrives with a single newline and must be re-terminated.
+        self.assertEqual(lmm.sse_relay(b'data: {"a":1}\n'), b'data: {"a":1}\n\n')
+        self.assertEqual(lmm.sse_relay(b'data: {"a":1}\r\n'), b'data: {"a":1}\n\n')
+        self.assertEqual(lmm.sse_relay(b'data: {"a":1}'), b'data: {"a":1}\n\n')
+
+    def test_relay_does_not_double_terminate(self):
+        self.assertEqual(lmm.sse_relay(b'data: {"a":1}\n\n'), b'data: {"a":1}\n\n')
+
+    def test_done_sentinel(self):
+        self.assertEqual(lmm.SSE_DONE, b"data: [DONE]\n\n")
+
+    def test_chunk_text_extracts_the_delta(self):
+        self.assertEqual(lmm.chunk_text(
+            {"choices": [{"delta": {"content": "hi"}}]}), "hi")
+
+    def test_chunk_text_tolerates_every_empty_shape(self):
+        for bad in ({}, {"choices": []}, {"choices": [{}]},
+                    {"choices": [{"delta": {}}]},
+                    {"choices": [{"delta": {"role": "assistant"}}]},
+                    {"choices": [{"delta": {"content": None}}]}):
+            self.assertEqual(lmm.chunk_text(bad), "")
+
+
+class TestSynthStream(unittest.TestCase):
+    """A cached or cascaded answer still has to reach the client as a stream."""
+
+    def frames(self, text, **kw):
+        return lmm.synth_stream(text, "m", **kw)
+
+    def parsed(self, frames):
+        out = []
+        for f in frames:
+            body = f[len(b"data: "):].strip()
+            if body != b"[DONE]":
+                out.append(json.loads(body.decode()))
+        return out
+
+    def test_ends_with_done(self):
+        self.assertEqual(self.frames("hello")[-1], lmm.SSE_DONE)
+
+    def test_first_chunk_carries_the_role(self):
+        first = self.parsed(self.frames("hello"))[0]
+        self.assertEqual(first["choices"][0]["delta"]["role"], "assistant")
+        self.assertEqual(first["object"], "chat.completion.chunk")
+
+    def test_content_reassembles_exactly(self):
+        text = "The answer is 4. " * 20
+        got = "".join(lmm.chunk_text(c) for c in self.parsed(self.frames(text)))
+        self.assertEqual(got, text)
+
+    def test_last_content_chunk_has_finish_reason(self):
+        chunks = self.parsed(self.frames("hello"))
+        self.assertEqual(chunks[-1]["choices"][0]["finish_reason"], "stop")
+
+    def test_usage_chunk_when_usage_is_known(self):
+        chunks = self.parsed(self.frames("hello", usage={"completion_tokens": 5}))
+        self.assertEqual(chunks[-1]["usage"]["completion_tokens"], 5)
+        self.assertEqual(chunks[-1]["choices"], [])   # usage chunk carries none
+
+    def test_empty_text_still_produces_a_valid_stream(self):
+        frames = self.frames("")
+        self.assertEqual(frames[-1], lmm.SSE_DONE)
+        self.assertTrue(all(f.endswith(b"\n\n") for f in frames))
+
+
+class TestEstimateTokens(unittest.TestCase):
+    def test_ascii_is_about_four_chars_per_token(self):
+        self.assertAlmostEqual(lmm.estimate_tokens("a" * 400), 100, delta=2)
+
+    def test_cjk_counts_closer_to_one_per_char(self):
+        self.assertGreater(lmm.estimate_tokens("日本語" * 10), 25)
+
+    def test_empty_is_zero_and_short_is_at_least_one(self):
+        self.assertEqual(lmm.estimate_tokens(""), 0)
+        self.assertEqual(lmm.estimate_tokens(None), 0)
+        self.assertGreaterEqual(lmm.estimate_tokens("a"), 1)
+
+
+class TestHubStream(unittest.TestCase):
+    def setUp(self):
+        self.calls = []
+        self._real = lmm.call_provider_stream
+        self._real_call = lmm.call_provider
+
+    def tearDown(self):
+        lmm.call_provider_stream = self._real
+        lmm.call_provider = self._real_call
+
+    def fake_stream(self, words, usage=True, fail_at=None):
+        def _s(prov, prompt, temperature=0.7, extra=None):
+            self.calls.append(prov.get("model"))
+            yield (b'data: {"choices":[{"delta":{"role":"assistant"}}]}\n',
+                   {"choices": [{"delta": {"role": "assistant"}}]})
+            for i, w in enumerate(words):
+                if fail_at is not None and i == fail_at:
+                    yield None, {"error": "upstream exploded"}
+                    return
+                obj = {"choices": [{"delta": {"content": w}}]}
+                yield ("data: " + json.dumps(obj) + "\n").encode(), obj
+            if usage:
+                u = {"choices": [], "usage": {"prompt_tokens": 10,
+                                              "completion_tokens": len(words)}}
+                yield ("data: " + json.dumps(u) + "\n").encode(), u
+            yield None, None
+        lmm.call_provider_stream = _s
+
+    def targets(self):
+        return [("p", {"kind": "remote", "model": "p",
+                       "price": {"in": 1.0, "out": 2.0}})]
+
+    def collect(self, gen):
+        return b"".join(gen)
+
+    def test_passthrough_relays_terminated_frames_and_ends_with_done(self):
+        self.fake_stream(["a", "b"])
+        with temp_state():
+            out = self.collect(lmm.hub_stream({}, "hi", self.targets(),
+                                              {"cache": False}))
+        self.assertTrue(out.endswith(lmm.SSE_DONE))
+        for block in out.split(b"\n\n")[:-1]:
+            self.assertTrue(block.startswith(b"data: "))
+
+    def test_passthrough_meters_with_real_usage_and_ttft(self):
+        self.fake_stream(["a", "b", "c"])
+        with temp_state():
+            self.collect(lmm.hub_stream({}, "hi", self.targets(), {"cache": False}))
+            events = lmm.read_usage()
+        self.assertEqual(len(events), 1)
+        self.assertTrue(events[0]["stream"])
+        self.assertFalse(events[0]["estimated"])
+        self.assertFalse(events[0]["partial"])
+        self.assertEqual(events[0]["out"], 3)
+        self.assertIsNotNone(events[0]["ttft_ms"])
+
+    def test_missing_usage_chunk_is_estimated_and_flagged(self):
+        self.fake_stream(["hello "] * 4, usage=False)
+        with temp_state():
+            self.collect(lmm.hub_stream({}, "hi", self.targets(), {"cache": False}))
+            events = lmm.read_usage()
+        self.assertTrue(events[0]["estimated"])
+        self.assertGreater(events[0]["out"], 0)
+
+    def test_client_hangup_still_meters_as_partial(self):
+        # Tokens were generated and billed upstream even though nobody read
+        # them; recording nothing would understate real spend.
+        self.fake_stream(["a", "b", "c", "d", "e"])
+        with temp_state():
+            gen = lmm.hub_stream({}, "hi", self.targets(), {"cache": False})
+            next(gen)
+            next(gen)
+            gen.close()                      # client hangs up
+            events = lmm.read_usage()
+        self.assertEqual(len(events), 1)
+        self.assertTrue(events[0]["partial"])
+        self.assertFalse(events[0]["accepted"])
+
+    def test_partial_stream_is_never_cached(self):
+        self.fake_stream(["a", "b", "c", "d", "e"])
+        with temp_state():
+            gen = lmm.hub_stream({}, "hi", self.targets(), {"cache": True})
+            next(gen)
+            next(gen)
+            gen.close()
+            entry, how, _ = lmm.cache_lookup({}, lmm.as_messages("hi"), "p")
+        self.assertIsNone(entry)
+
+    def test_cache_hit_is_replayed_as_a_synthetic_stream(self):
+        self.fake_stream(["The answer is 4."])
+        opts = {"cache": True}
+        with temp_state():
+            self.collect(lmm.hub_stream({}, "hi", self.targets(), opts))
+            self.assertEqual(len(self.calls), 1)
+            out = self.collect(lmm.hub_stream({}, "hi", self.targets(), opts))
+            events = lmm.read_usage()
+        self.assertEqual(len(self.calls), 1)          # no second upstream call
+        self.assertTrue(out.endswith(lmm.SSE_DONE))
+        self.assertIn(b"The answer is 4.", out)
+        self.assertEqual(events[-1]["provider"], "cache")
+
+    def test_usage_chunk_is_withheld_unless_the_client_asked(self):
+        # lmm always requests include_usage upstream so it can meter, but must
+        # not hand the client a chunk it never asked for.
+        self.fake_stream(["a", "b"])
+        with temp_state():
+            out = self.collect(lmm.hub_stream({}, "hi", self.targets(),
+                                              {"cache": False}))
+            events = lmm.read_usage()
+        self.assertNotIn(b'"usage"', out)
+        self.assertEqual(events[0]["out"], 2)      # still metered exactly
+
+    def test_usage_chunk_is_relayed_when_the_client_asked(self):
+        self.fake_stream(["a", "b"])
+        with temp_state():
+            out = self.collect(lmm.hub_stream({}, "hi", self.targets(),
+                                              {"cache": False, "client_usage": True}))
+        self.assertIn(b'"usage"', out)
+
+    def test_upstream_failure_before_any_byte_fails_over(self):
+        def _s(prov, prompt, temperature=0.7, extra=None):
+            self.calls.append(prov.get("model"))
+            if prov.get("model") == "bad":
+                yield None, {"error": "401"}
+                return
+            obj = {"choices": [{"delta": {"content": "ok"}}]}
+            yield ("data: " + json.dumps(obj) + "\n").encode(), obj
+            yield None, None
+        lmm.call_provider_stream = _s
+        targets = [("bad", {"kind": "remote", "model": "bad"}),
+                   ("good", {"kind": "remote", "model": "good"})]
+        with temp_state():
+            out = self.collect(lmm.hub_stream({}, "hi", targets, {"cache": False}))
+        self.assertEqual(self.calls, ["bad", "good"])
+        self.assertIn(b"ok", out)
+
+    def test_mid_stream_failure_reports_instead_of_failing_over(self):
+        # Bytes are already on the wire; a retry would duplicate output.
+        self.fake_stream(["a", "b", "c"], fail_at=1)
+        targets = self.targets() + [("p2", {"kind": "remote", "model": "p2"})]
+        with temp_state():
+            out = self.collect(lmm.hub_stream({}, "hi", targets, {"cache": False}))
+        self.assertIn(b"mid-stream", out)
+        self.assertTrue(out.endswith(lmm.SSE_DONE))
+        self.assertEqual(self.calls, ["p"])           # no retry on p2
+
+    def test_cascade_buffers_then_replays(self):
+        # The verifier needs the whole answer, so streaming is synthesised.
+        def _call(prov, prompt, temperature=0.7, extra=None):
+            self.calls.append(prov.get("model"))
+            return {"choices": [{"message": {"content": "The answer is 4, indeed."}}],
+                    "usage": {"prompt_tokens": 5, "completion_tokens": 5}}
+        lmm.call_provider = _call
+        lmm.call_provider_stream = None       # must not be used at all
+        with temp_state():
+            out = self.collect(lmm.hub_stream({}, "hi", self.targets(),
+                                              {"cascade": True, "cache": False}))
+        self.assertIn(b"The answer is 4", out)
+        self.assertTrue(out.endswith(lmm.SSE_DONE))
+
+    def test_no_targets_yields_an_error_frame_not_a_crash(self):
+        with temp_state():
+            out = self.collect(lmm.hub_stream({}, "hi", [], {"cache": False}))
+        self.assertIn(b"no provider available", out)
+        self.assertTrue(out.endswith(lmm.SSE_DONE))
+
+
+class TestBenchMetrics(unittest.TestCase):
+    """TTFT / TPOT / e2e per the standard serving decomposition."""
+
+    def tearDown(self):
+        if hasattr(self, "_real"):
+            lmm.call_provider_stream = self._real
+
+    def fake(self, n_words, delay=0.01, usage=True):
+        self._real = lmm.call_provider_stream
+
+        def _s(prov, prompt, temperature=0.7, extra=None):
+            time.sleep(delay)                     # prefill
+            for i in range(n_words):
+                if i:
+                    time.sleep(delay)             # decode, per token
+                yield None, {"choices": [{"delta": {"content": "x"}}]}
+            if usage:
+                yield None, {"choices": [], "usage": {"prompt_tokens": 3,
+                                                      "completion_tokens": n_words}}
+            yield None, None
+        lmm.call_provider_stream = _s
+
+    def test_identity_e2e_equals_ttft_plus_tpot_times_tokens_minus_one(self):
+        self.fake(5)
+        r = lmm.bench_once({"model": "m", "base_url": "x"}, "hi")
+        self.assertNotIn("error", r)
+        self.assertAlmostEqual(
+            r["e2e_ms"], r["ttft_ms"] + r["tpot_ms"] * (r["out_tokens"] - 1),
+            places=6)
+
+    def test_ttft_reflects_prefill_delay(self):
+        self.fake(4, delay=0.05)
+        r = lmm.bench_once({"model": "m", "base_url": "x"}, "hi")
+        self.assertGreater(r["ttft_ms"], 40)
+
+    def test_throughput_is_tokens_over_e2e(self):
+        self.fake(6)
+        r = lmm.bench_once({"model": "m", "base_url": "x"}, "hi")
+        self.assertAlmostEqual(r["tok_per_s"], r["out_tokens"] / (r["e2e_ms"] / 1000.0),
+                               places=6)
+
+    def test_single_token_response_has_no_tpot(self):
+        self.fake(1)
+        r = lmm.bench_once({"model": "m", "base_url": "x"}, "hi")
+        self.assertEqual(r["tpot_ms"], 0.0)
+
+    def test_estimated_flag_when_provider_omits_usage(self):
+        self.fake(4, usage=False)
+        r = lmm.bench_once({"model": "m", "base_url": "x"}, "hi")
+        self.assertTrue(r["estimated"])
+
+    def test_error_is_surfaced(self):
+        self._real = lmm.call_provider_stream
+
+        def _s(prov, prompt, temperature=0.7, extra=None):
+            yield None, {"error": "boom"}
+        lmm.call_provider_stream = _s
+        self.assertIn("error", lmm.bench_once({"model": "m"}, "hi"))
+
+    def test_median(self):
+        self.assertEqual(lmm.median([3, 1, 2]), 2)
+        self.assertEqual(lmm.median([4, 1, 2, 3]), 2.5)
+        self.assertEqual(lmm.median([]), 0.0)
+
+
 class temp_state(object):
     """Point lmm's usage log and cache at a throwaway directory."""
 

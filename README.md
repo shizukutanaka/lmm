@@ -46,6 +46,7 @@ lmm models          -> local models installed (Ollama)
 lmm cost [--days N] -> measured spend: Anthropic logs + lmm's own hub telemetry
 lmm route "task"    -> recommend local vs remote (--explain for the score)
 lmm fit [model]     -> does it fit in your GPU, and at what context length?
+lmm bench           -> measure TTFT / TPOT / throughput per provider
 lmm ask "prompt"    -> ask any backend: cached, routed, optionally cascaded
 lmm serve <model>   -> pull + expose a local model endpoint (Ollama)
 lmm serve --hub     -> OpenAI-compatible proxy over every configured provider
@@ -148,6 +149,63 @@ model actually fits in the free VRAM.
 
 GPU detection covers NVIDIA (`nvidia-smi`), AMD (`rocm-smi`) and Apple Silicon
 (unified memory, reported at a conservative 75% usable share).
+
+### Streaming
+
+The hub speaks SSE, so `stream: true` works with any OpenAI-compatible client.
+The three cost layers have genuinely different relationships with streaming, and
+the hub is explicit about each rather than silently breaking one:
+
+| Situation | What the client gets |
+|-----------|----------------------|
+| Plain request | **True pass-through** — the provider's frames are relayed byte-for-byte, so time-to-first-token is real |
+| Cache hit | The stored answer replayed as a synthetic stream — no network, $0 |
+| `lmm_cascade` on | Buffered, then replayed as a stream. The verifier has to see the whole answer before it can score it; that's the honest price of scoring |
+
+Details that matter for a proxy:
+
+- **Failover ends at the first byte.** Once output is on the wire a retry would
+  duplicate it, so a mid-stream upstream failure is reported in an error frame
+  rather than silently retried on another provider.
+- **A client that hangs up mid-stream is still metered**, flagged `partial`.
+  Those tokens were generated and billed whether or not anyone read them.
+  Partial answers are never cached.
+- **`stream_options.include_usage` is always requested upstream** so streamed
+  calls can be metered — but the resulting usage chunk is withheld from clients
+  that didn't ask for it. When a provider ignores the option, tokens are
+  estimated and the event is flagged `estimated`, so `lmm cost` never shows a
+  guess as a measurement.
+
+### `lmm bench` — the third axis
+
+Price is one axis and memory is another; latency is the third, and it doesn't
+follow from either. The standard decomposition from the LLM-serving literature
+([Orca](https://www.usenix.org/conference/osdi22/presentation/yu), OSDI 2022;
+[vLLM/PagedAttention](https://arxiv.org/abs/2309.06180), SOSP 2023):
+
+```
+TTFT   time to first token       — prefill, compute-bound
+TPOT   time per output token     — decode, memory-bandwidth-bound
+e2e    = TTFT + TPOT × (tokens − 1)
+tok/s  = tokens / e2e
+```
+
+TTFT and TPOT are reported separately because prefill and decode have different
+bottlenecks — [DistServe](https://arxiv.org/abs/2401.09670) goes as far as
+running the two phases on separate hardware for exactly this reason.
+
+```bash
+$ lmm bench --runs 3
+  provider                        TTFT      TPOT     tok/s       e2e
+  local-ollama                     92ms      21.3ms      46.1     2813ms
+  openai                          412ms       8.1ms     121.4     1447ms
+                             $0.01000 per 1k output tokens
+```
+
+The first call is a discarded warm-up: it pays for model load and connection
+setup, so including it would measure your machine's cold start rather than its
+steady-state serving speed. Results are medians over the measured runs, with
+the TTFT range shown so a single lucky sample can't masquerade as a result.
 
 ### The taskbar problem, solved
 

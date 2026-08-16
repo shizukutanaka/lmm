@@ -22,6 +22,7 @@
 #   cost [--days N]     measured spend: Anthropic session logs + lmm's own hub
 #   route "task ..."    recommend local vs remote for a task (--explain)
 #   fit [model]         does it fit in your GPU, and at what context length?
+#   bench               measure TTFT / TPOT / throughput per provider
 #   ask "prompt"        one question, routed across every backend (--cascade)
 #   serve <model>       pull + expose a local model endpoint (Ollama)
 #   serve --hub         OpenAI-compatible proxy over all configured providers
@@ -602,6 +603,65 @@ def http_post_json(url, payload, api_key, timeout=60):
         return {"error": str(e)}
 
 
+def http_stream_sse(url, payload, api_key, timeout=300):
+    """Open a streamed chat completion and yield (raw_line_bytes, parsed_or_None)
+    for each SSE data frame, ending with (None, None) on clean completion.
+
+    The raw bytes are yielded alongside the parse so the hub can relay a
+    provider's frames verbatim — re-serialising would quietly drop fields we
+    do not know about (logprobs, provider extensions) — while still reading the
+    deltas it needs for cache and metering.
+
+    Errors are yielded as ({"error": ...}) rather than raised, matching
+    http_post_json's contract so callers handle failure the same way.
+    """
+    import urllib.request
+    data = json.dumps(payload).encode("utf-8")
+    req = urllib.request.Request(
+        url, data=data,
+        headers={"Content-Type": "application/json",
+                 "Accept": "text/event-stream",
+                 "Authorization": f"Bearer {api_key}"})
+    try:
+        resp = urllib.request.urlopen(req, timeout=timeout)
+    except Exception as e:
+        yield None, {"error": str(e)}
+        return
+    try:
+        for raw in resp:                      # urllib responses iterate by line
+            line = raw.decode("utf-8", "ignore").strip()
+            if not line or line.startswith(":"):   # blank separator / comment
+                continue
+            if not line.startswith("data:"):
+                continue
+            body = line[5:].strip()
+            if body == "[DONE]":
+                break
+            try:
+                yield raw, json.loads(body)
+            except ValueError:
+                continue
+    except Exception as e:
+        yield None, {"error": str(e)}
+        return
+    finally:
+        try:
+            resp.close()
+        except Exception:
+            pass
+    yield None, None                          # clean end of stream
+
+
+def chunk_text(chunk):
+    """Extract the content delta from one streamed chunk, '' if it carries none."""
+    try:
+        d = (chunk.get("choices") or [{}])[0].get("delta") or {}
+    except (AttributeError, IndexError, TypeError):
+        return ""
+    c = d.get("content")
+    return c if isinstance(c, str) else ""
+
+
 # Request fields we hand straight to the backend. Anything else in an incoming
 # hub request is lmm's business, not the provider's.
 PASSTHROUGH_KEYS = ("temperature", "max_tokens", "max_completion_tokens", "top_p",
@@ -653,6 +713,84 @@ def call_provider(prov, prompt, temperature=0.7, extra=None):
             payload[k] = extra[k]
     payload.pop("stream", None)                 # we never stream upstream
     return http_post_json(url, payload, prov.get("api_key", ""))
+
+
+def call_provider_stream(prov, prompt, temperature=0.7, extra=None):
+    """Streamed counterpart of call_provider. Yields (raw_line, parsed) frames.
+
+    `stream_options.include_usage` is requested so the provider reports real
+    token counts in a final chunk; without it a streamed call would be
+    invisible to metering. Providers that ignore the option simply never send
+    that chunk, and the caller estimates instead.
+    """
+    if not prov.get("model"):
+        yield None, {"error": "provider has no model set"}
+        return
+    url = prov["base_url"].rstrip("/") + "/chat/completions"
+    payload = {"model": prov["model"], "messages": as_messages(prompt),
+               "temperature": temperature, "stream": True,
+               "stream_options": {"include_usage": True}}
+    for k in PASSTHROUGH_KEYS:
+        if extra and k in extra and extra[k] is not None:
+            payload[k] = extra[k]
+    for frame in http_stream_sse(url, payload, prov.get("api_key", "")):
+        yield frame
+
+
+def sse_frame(obj):
+    """One SSE data frame. The blank line after the payload terminates the
+    event — without it clients buffer forever."""
+    return ("data: " + json.dumps(obj, ensure_ascii=False) + "\n\n").encode("utf-8")
+
+
+SSE_DONE = b"data: [DONE]\n\n"
+
+
+def sse_relay(raw):
+    """Re-terminate an upstream SSE line for relaying.
+
+    http_stream_sse yields the `data:` line only — the blank line that ENDS the
+    event is consumed as a separator while parsing. Writing the line back out
+    on its own would run consecutive events together, and an SSE parser reads
+    that as one event with multi-line data. So the terminator is restored here.
+    """
+    return raw.rstrip(b"\r\n") + b"\n\n"
+
+
+def synth_stream(text, model, usage=None, chunk_chars=24):
+    """Turn a complete answer into SSE frames.
+
+    Used when the answer did not arrive as a stream — a cache hit, or a
+    cascade that had to see the whole text before it could score it. The client
+    gets the format it asked for either way.
+    """
+    base = {"id": "chatcmpl-lmm", "object": "chat.completion.chunk",
+            "created": int(time.time()), "model": model or "lmm"}
+    out = [sse_frame(dict(base, choices=[{"index": 0, "delta": {"role": "assistant"},
+                                          "finish_reason": None}]))]
+    for i in range(0, len(text), chunk_chars):
+        out.append(sse_frame(dict(base, choices=[
+            {"index": 0, "delta": {"content": text[i:i + chunk_chars]},
+             "finish_reason": None}])))
+    out.append(sse_frame(dict(base, choices=[{"index": 0, "delta": {},
+                                              "finish_reason": "stop"}])))
+    if usage:
+        out.append(sse_frame(dict(base, choices=[], usage=usage)))
+    out.append(SSE_DONE)
+    return out
+
+
+def estimate_tokens(text):
+    """Rough token count for providers that omit usage from a stream.
+
+    ~4 characters per token is the usual English rule of thumb; CJK runs closer
+    to 1. Anything derived from this is flagged estimated=True in the log so it
+    is never mistaken for a measurement.
+    """
+    if not text:
+        return 0
+    wide = sum(1 for ch in text if ord(ch) > 0x2E80)
+    return int(wide + (len(text) - wide) / 4) or 1
 
 
 def pick_provider_for_task(cfg, task, provs):
@@ -1442,6 +1580,23 @@ def cmd_serve_hub(cfg, host, port):
             self.end_headers()
             self.wfile.write(body)
 
+        def _stream(self, frames):
+            """Relay SSE frames. No Content-Length: the body length is unknown
+            when the headers go out, which is the whole point of streaming.
+            Each frame is flushed so the client sees tokens as they arrive
+            rather than in one buffered lump at the end."""
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream")
+            self.send_header("Cache-Control", "no-cache")
+            self.send_header("Connection", "close")
+            self.end_headers()
+            try:
+                for frame in frames:
+                    self.wfile.write(frame)
+                    self.wfile.flush()
+            except (BrokenPipeError, ConnectionResetError):
+                pass          # client hung up mid-stream; nothing to report
+
         def do_GET(self):
             if self.path.rstrip("/").endswith("/v1/models"):
                 self._send(200, {"object": "list", "data": [
@@ -1474,10 +1629,14 @@ def cmd_serve_hub(cfg, host, port):
             no_cache = (bool(req.get("lmm_no_cache"))
                         or self.headers.get("X-LMM-No-Cache") is not None)
             extra = {k: req[k] for k in PASSTHROUGH_KEYS if k in req}
-            res, _trace = hub_complete(cfg, msgs, targets,
-                                       {"cascade": bool(req.get("lmm_cascade")),
-                                        "cache": not no_cache,
-                                        "extra": extra, "source": "hub"})
+            hub_opts = {"cascade": bool(req.get("lmm_cascade")),
+                        "cache": not no_cache, "extra": extra, "source": "hub"}
+            if req.get("stream"):
+                hub_opts["client_usage"] = bool(
+                    (req.get("stream_options") or {}).get("include_usage"))
+                self._stream(hub_stream(cfg, msgs, targets, hub_opts))
+                return
+            res, _trace = hub_complete(cfg, msgs, targets, hub_opts)
             if isinstance(res, dict) and res.get("error"):
                 self._send(502, {"error": "all providers failed: %s" % res["error"]})
                 return
@@ -2274,7 +2433,9 @@ def hub_complete(cfg, messages, targets, opts=None):
     last_err = None
 
     for i, (name, prov) in enumerate(rungs):
+        t0 = time.time()
         res = call_provider(prov, messages, temperature=temp, extra=extra)
+        elapsed_ms = int((time.time() - t0) * 1000)
         if isinstance(res, dict) and res.get("error"):
             last_err = res["error"]
             trace.append(f"[{'cascade' if use_cascade else 'ask'}] "
@@ -2289,7 +2450,8 @@ def hub_complete(cfg, messages, targets, opts=None):
 
         if not use_cascade:
             usd = meter_call(name, prov, prov.get("model"), res, pricing,
-                             source=source, cache="miss", rung=i, accepted=True)
+                             source=source, cache="miss", rung=i, accepted=True,
+                             ms=elapsed_ms, stream=False)
             trace.append(f"[ask] {name} ({prov.get('model')}) ${usd:.4f}")
             if use_cache:
                 cache_store(cfg, messages, cache_model, res, usd, req_temp)
@@ -2299,7 +2461,8 @@ def hub_complete(cfg, messages, targets, opts=None):
         accept = score >= threshold or i == len(rungs) - 1
         usd = meter_call(name, prov, prov.get("model"), res, pricing,
                          source=source, cache="miss", rung=i,
-                         score=round(score, 3), accepted=bool(accept))
+                         score=round(score, 3), accepted=bool(accept),
+                         ms=elapsed_ms, stream=False)
         spent += usd
         verdict = "accept" if score >= threshold else "escalate"
         trace.append(f"[cascade] rung{i} {name} score={score:.2f} ${usd:.4f} "
@@ -2322,6 +2485,152 @@ def hub_complete(cfg, messages, targets, opts=None):
             cache_store(cfg, messages, cache_model, best[1], spent, req_temp)
         return best[1], trace
     return {"error": last_err or "all providers failed"}, trace
+
+
+def hub_stream(cfg, messages, targets, opts=None):
+    """Streaming counterpart of hub_complete. Yields raw SSE bytes to relay.
+
+    Three routes, because the cost features have different relationships with
+    streaming:
+
+      cache hit  -> synthesise a stream from the stored answer ($0, no network)
+      cascade on -> the verifier must see the WHOLE answer before it can score
+                    it, so the upstream call is buffered and replayed as SSE.
+                    The client still gets frames; it just does not get early
+                    tokens, which is the honest price of scoring.
+      otherwise  -> true pass-through: the provider's own frames are relayed
+                    byte-for-byte, so time-to-first-token is genuinely low.
+
+    Provider failover only exists until the first byte is written. After that
+    the response has begun and a mid-stream failure can only be reported, not
+    retried — so the decision is made on the first frame.
+    """
+    opts = opts or {}
+    pricing = merged_pricing(cfg)
+    casc = merged_cascade(cfg)
+    extra = dict(opts.get("extra") or {})
+    req_temp = extra.get("temperature")
+    temp = 0.7 if req_temp is None else req_temp
+    source = opts.get("source", "hub")
+    use_cache = opts.get("cache", True)
+    use_cascade = opts.get("cascade", casc.get("enabled", False))
+    want_usage = bool(opts.get("client_usage"))   # did the CLIENT ask for usage?
+
+    targets = order_targets(cfg, messages, targets)
+    if not targets:
+        yield sse_frame({"error": {"message": "no provider available"}})
+        yield SSE_DONE
+        return
+    cache_model = targets[0][1].get("model")
+
+    if use_cache:
+        entry, how, sim = cache_lookup(cfg, messages, cache_model)
+        if entry:
+            saved = float(entry.get("usd", 0.0) or 0.0)
+            try:
+                text = entry["result"]["choices"][0]["message"]["content"]
+            except (KeyError, IndexError, TypeError):
+                text = None
+            if text is not None:
+                log_usage({"provider": "cache", "model": cache_model,
+                           "kind": "local", "in": 0, "out": 0, "usd": 0.0,
+                           "cache": how, "similarity": round(sim, 4),
+                           "saved_usd": round(saved, 6), "source": source,
+                           "stream": True, "ms": 0, "ttft_ms": 0})
+                for frame in synth_stream(text, cache_model):
+                    yield frame
+                return
+
+    # Cascade needs the complete text to score it, so buffer and replay.
+    if use_cascade:
+        res, _trace = hub_complete(cfg, messages, targets,
+                                   dict(opts, cache=use_cache, cascade=True))
+        if isinstance(res, dict) and res.get("error"):
+            yield sse_frame({"error": {"message": res["error"]}})
+            yield SSE_DONE
+            return
+        try:
+            text = res["choices"][0]["message"]["content"]
+        except (KeyError, IndexError, TypeError):
+            yield sse_frame({"error": {"message": "unexpected response shape"}})
+            yield SSE_DONE
+            return
+        for frame in synth_stream(text, cache_model,
+                                  res.get("usage") if want_usage else None):
+            yield frame
+        return
+
+    # True pass-through.
+    last_err = None
+    for name, prov in targets:
+        t0 = time.time()
+        started = False        # any byte written -> failover is no longer possible
+        completed = False      # saw the end-of-stream sentinel
+        parts, usage, ttft_ms, failed = [], None, None, None
+        try:
+            for raw, chunk in call_provider_stream(prov, messages,
+                                                   temperature=temp, extra=extra):
+                if raw is None and chunk is None:      # clean end of stream
+                    completed = True
+                    break
+                if isinstance(chunk, dict) and chunk.get("error"):
+                    failed = chunk["error"]
+                    break
+                if isinstance(chunk, dict) and isinstance(chunk.get("usage"), dict):
+                    usage = chunk["usage"]
+                    if not want_usage:
+                        # We always ask upstream for include_usage so the call
+                        # can be metered, but a client that did not ask for it
+                        # must not receive a chunk it never requested — some
+                        # parsers reject the empty `choices` it carries.
+                        continue
+                piece = chunk_text(chunk) if isinstance(chunk, dict) else ""
+                if piece:
+                    if ttft_ms is None:
+                        ttft_ms = int((time.time() - t0) * 1000)
+                    parts.append(piece)
+                started = True
+                yield sse_relay(raw) if raw is not None else sse_frame(chunk)
+        finally:
+            # Also runs when the CLIENT hangs up mid-stream (GeneratorExit).
+            # Those tokens were generated and billed whether or not anyone read
+            # them, so failing to record them would understate real spend.
+            if started:
+                text = "".join(parts)
+                estimated = usage is None
+                if estimated:
+                    # Provider ignored stream_options.include_usage. Estimate,
+                    # and flag it, so `lmm cost` never shows a guess as a
+                    # measurement.
+                    usage = {"prompt_tokens": estimate_tokens(
+                        messages_text(as_messages(messages))),
+                        "completion_tokens": estimate_tokens(text)}
+                res = {"choices": [{"index": 0, "finish_reason": "stop",
+                                    "message": {"role": "assistant",
+                                                "content": text}}],
+                       "usage": usage}
+                usd = meter_call(name, prov, prov.get("model"), res, pricing,
+                                 source=source, cache="miss", rung=0,
+                                 accepted=bool(completed), stream=True,
+                                 estimated=estimated, partial=not completed,
+                                 ms=int((time.time() - t0) * 1000),
+                                 ttft_ms=ttft_ms)
+                # Never cache a truncated answer.
+                if completed and use_cache and text:
+                    cache_store(cfg, messages, cache_model, res, usd, req_temp)
+        if failed and not started:
+            last_err = failed                          # nothing written: fail over
+            continue
+        if failed:
+            # Bytes are already on the wire; the only honest move is to say so.
+            yield sse_frame({"error": {"message": "upstream failed mid-stream: "
+                                                  + str(failed)}})
+            yield SSE_DONE
+            return
+        yield SSE_DONE
+        return
+    yield sse_frame({"error": {"message": "all providers failed: %s" % last_err}})
+    yield SSE_DONE
 
 
 def cmd_ask(prompt, provider, cfg, cascade=False, no_cache=False, explain=False):
@@ -2354,6 +2663,129 @@ def cmd_ask(prompt, provider, cfg, cascade=False, no_cache=False, explain=False)
         print(res["choices"][0]["message"]["content"])
     except (KeyError, IndexError, TypeError):
         print("[ask] unexpected response shape from provider")
+
+
+# --------------------------- serving benchmarks -----------------------------
+# Money is one axis; latency is another, and they do not correlate — a cheap
+# local model can beat a paid API on time-to-first-token while losing badly on
+# throughput. The standard decomposition, as used by the LLM serving
+# literature (Orca, OSDI 2022; vLLM/PagedAttention, arXiv:2309.06180) and by
+# every serving benchmark since:
+#
+#   TTFT  time to first token          - dominated by PREFILL (compute-bound)
+#   TPOT  time per output token        - dominated by DECODE  (memory-bandwidth
+#         (a.k.a. inter-token latency)   bound), hence reported separately
+#   e2e   = TTFT + TPOT * (output_tokens - 1)
+#   tok/s = output_tokens / e2e
+#
+# Prefill and decode have different bottlenecks, which is why a single "latency"
+# number hides what you need to know; DistServe (arXiv:2401.09670) goes as far
+# as running the two phases on separate hardware for this reason.
+def bench_once(prov, prompt, max_tokens=128):
+    """One streamed request, measured. Returns a dict of metrics or an error."""
+    t0 = time.time()
+    ttft = None
+    parts = []
+    usage = None
+    err = None
+    for raw, chunk in call_provider_stream(prov, prompt, temperature=0.0,
+                                           extra={"max_tokens": max_tokens}):
+        if raw is None and chunk is None:
+            break
+        if isinstance(chunk, dict) and chunk.get("error"):
+            err = chunk["error"]
+            break
+        if isinstance(chunk, dict) and isinstance(chunk.get("usage"), dict):
+            usage = chunk["usage"]
+        piece = chunk_text(chunk) if isinstance(chunk, dict) else ""
+        if piece:
+            if ttft is None:
+                ttft = time.time() - t0
+            parts.append(piece)
+    if err:
+        return {"error": err}
+    e2e = time.time() - t0
+    text = "".join(parts)
+    out = (usage or {}).get("completion_tokens") or estimate_tokens(text)
+    if ttft is None or out < 1:
+        return {"error": "no tokens received"}
+    # TPOT excludes the first token, which TTFT already accounts for.
+    tpot = (e2e - ttft) / (out - 1) if out > 1 else 0.0
+    return {"ttft_ms": ttft * 1000, "tpot_ms": tpot * 1000, "e2e_ms": e2e * 1000,
+            "out_tokens": out, "tok_per_s": out / e2e if e2e > 0 else 0.0,
+            "estimated": usage is None}
+
+
+def median(xs):
+    xs = sorted(xs)
+    n = len(xs)
+    if not n:
+        return 0.0
+    return xs[n // 2] if n % 2 else (xs[n // 2 - 1] + xs[n // 2]) / 2.0
+
+
+def cmd_bench(cfg, provider=None, runs=3, prompt=None, max_tokens=128):
+    """Measure TTFT / TPOT / throughput per provider so the local-vs-cloud
+    decision has latency data, not just price."""
+    prompt = prompt or "Count from 1 to 40, separated by commas."
+    provs = merged_providers(cfg)
+    if provider:
+        targets = [(provider, provs[provider])] if provider in provs else []
+        if not targets:
+            lo = local_ollama_provider()
+            if lo and provider in ("local", "ollama", "local-ollama"):
+                targets = [("local-ollama(implicit)", lo)]
+    else:
+        targets = list(provs.items())
+        lo = local_ollama_provider()
+        if lo:
+            targets.append(("local-ollama(implicit)", lo))
+    if not targets:
+        print("[bench] no provider available. Start Ollama or add 'providers' "
+              "to lmm config (see `lmm examples`).")
+        return
+
+    print(f'prompt: "{prompt}"   runs: {runs} (+1 discarded warm-up)   '
+          f"max_tokens: {max_tokens}")
+    print("-" * 78)
+    print(f"  {'provider':<26} {'TTFT':>9} {'TPOT':>9} {'tok/s':>9} {'e2e':>9}")
+    print("-" * 78)
+    pricing = merged_pricing(cfg)
+    for name, prov in targets:
+        # The first call pays for model load, connection setup and any cold
+        # cache. Including it would measure the machine's startup, not its
+        # steady-state serving speed, so it is discarded.
+        warm = bench_once(prov, prompt, max_tokens)
+        if warm.get("error"):
+            print(f"  {name:<26} failed: {warm['error']}")
+            continue
+        samples = []
+        for _ in range(max(1, runs)):
+            r = bench_once(prov, prompt, max_tokens)
+            if not r.get("error"):
+                samples.append(r)
+        if not samples:
+            print(f"  {name:<26} warm-up ok but every measured run failed")
+            continue
+        ttft = median([s["ttft_ms"] for s in samples])
+        tpot = median([s["tpot_ms"] for s in samples])
+        tps = median([s["tok_per_s"] for s in samples])
+        e2e = median([s["e2e_ms"] for s in samples])
+        note = " (tokens estimated)" if samples[0]["estimated"] else ""
+        print(f"  {name:<26} {ttft:8.0f}ms {tpot:8.1f}ms {tps:9.1f} {e2e:8.0f}ms{note}")
+        if len(samples) > 1:
+            lo_t = min(s["ttft_ms"] for s in samples)
+            hi_t = max(s["ttft_ms"] for s in samples)
+            print(f"  {'':<26} TTFT range {lo_t:.0f}-{hi_t:.0f}ms over "
+                  f"{len(samples)} runs")
+        rate = price_for(prov, prov.get("model"), pricing)
+        if rate["out"]:
+            per_1k = rate["out"] / 1000.0
+            print(f"  {'':<26} ${per_1k:.5f} per 1k output tokens")
+    print("-" * 78)
+    print("TTFT = time to first token (prefill). TPOT = time per output token "
+          "after the first\n(decode). e2e = TTFT + TPOT x (tokens-1). Medians "
+          "over the measured runs.")
 
 
 def cmd_cache(clear=False):
@@ -2432,6 +2864,11 @@ def main():
     p.add_argument("--no-cache", action="store_true", help="bypass the prompt cache")
     p.add_argument("--explain", action="store_true",
                    help="show routing score, rung scores and per-call cost")
+    p = sub.add_parser("bench", help="measure TTFT / TPOT / throughput per provider")
+    p.add_argument("--provider", default=None, help="provider name from config")
+    p.add_argument("--runs", type=int, default=3, help="measured runs after the warm-up")
+    p.add_argument("--prompt", default=None)
+    p.add_argument("--max-tokens", type=int, default=128)
     p = sub.add_parser("fit", help="will this model fit in your GPU, and at what context?")
     p.add_argument("model", nargs="?", help="model tag; omit to check every installed one")
     p.add_argument("--ctx", type=int, default=None, help="context length in tokens")
@@ -2487,6 +2924,8 @@ def main():
                 cascade=getattr(args, "cascade", False),
                 no_cache=getattr(args, "no_cache", False),
                 explain=getattr(args, "explain", False))
+    elif cmd == "bench":
+        cmd_bench(cfg, args.provider, args.runs, args.prompt, args.max_tokens)
     elif cmd == "fit":
         cmd_fit(args.model, args.ctx, args.vram, args.kv, getattr(args, "json", False))
     elif cmd == "cache":
