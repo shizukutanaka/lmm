@@ -1554,6 +1554,21 @@ def launch_gui(cfg):
     # --- ask panel (real use: route by priority, show reply) ----------------
     askf = ttk.LabelFrame(root, text="Ask (routes by priority)", padding=6)
     askf.pack(fill="both", expand=True, padx=8, pady=4)
+
+    # backend selector (pin a backend, or leave "auto" to follow ask_order)
+    sel_row = ttk.Frame(askf)
+    sel_row.pack(fill="x", pady=(0, 4))
+    ttk.Label(sel_row, text="Backend:").pack(side="left")
+    prov_var = tk.StringVar(value="auto (priority order)")
+    prov_cb = ttk.Combobox(sel_row, textvariable=prov_var, width=30,
+                           state="readonly")
+    prov_cb.pack(side="left", padx=4)
+
+    def prov_reload():
+        running = [it["name"] for it in discover(cfg)
+                   if it["running"] and it["name"] != "-"]
+        prov_cb["values"] = ["auto (priority order)"] + running
+
     ask_in = ttk.Entry(askf)
     ask_in.pack(fill="x", pady=(0, 4))
 
@@ -1565,13 +1580,15 @@ def launch_gui(cfg):
         prompt = ask_in.get().strip()
         if not prompt:
             return
+        sel = prov_var.get()
+        explicit = None if sel.startswith("auto") else sel
         ask_out.config(state="normal")
         ask_out.insert("end", f"you> {prompt}\n")
         ask_out.config(state="disabled")
         ask_in.delete(0, "end")
 
         def worker():
-            reply = gui_ask(prompt, cfg)
+            reply = gui_ask(prompt, cfg, explicit=explicit)
             ask_out.config(state="normal")
             ask_out.insert("end", f"{reply}\n\n")
             ask_out.see("end")
@@ -1610,6 +1627,7 @@ def launch_gui(cfg):
         tree.tag_configure("on", foreground="#1b5e20")
         tree.tag_configure("off", foreground="#9e9e9e")
         prio_load()
+        prov_reload()
 
     refresh()
     # auto-refresh every 5s (visibility of system status, continuously)
@@ -1736,10 +1754,11 @@ def resolve_ask_targets(cfg, prompt, explicit):
     if explicit:
         if explicit in provs:
             return [(explicit, provs[explicit])]
-        if explicit in provs_norm:
-            k, v = provs_norm[explicit]
+        en = explicit.lower()
+        if en in provs_norm:
+            k, v = provs_norm[en]
             return [(k, v)]
-        if explicit in ("local", "ollama", "local-ollama") and lo:
+        if en in ("local", "ollama", "local-ollama") and lo:
             return [("local-ollama(implicit)", lo)]
         return []
     order = list(cfg.get("ask_order") or [])
@@ -1813,11 +1832,12 @@ def cmd_ask(prompt, provider, cfg):
     print(f"[ask] all providers failed. last error: {last_err}")
 
 
-def gui_ask(prompt, cfg):
+def gui_ask(prompt, cfg, explicit=None):
     """Non-streaming ask for the GUI: routes by ask_order (priority), returns
     the first successful reply text, or an error string. Never prints; the GUI
-    owns the display."""
-    targets = resolve_ask_targets(cfg, prompt, None)
+    owns the display. If `explicit` (a backend name) is given, that backend is
+    used directly (user pinned it in the GUI)."""
+    targets = resolve_ask_targets(cfg, prompt, explicit)
     if not targets:
         return "[ask] no provider available. Run `lmm discover --save` first."
     last_err = None
