@@ -2327,6 +2327,50 @@ def cmd_selftest(cfg):
     finally:
         globals()["call_provider"] = real_call
 
+    # 7) doctor + config validate + secrets commands are wired & run
+    try:
+        import io as _io
+        _buf = _io.StringIO()
+        import contextlib as _cl
+        with _cl.redirect_stdout(_buf):
+            cmd_doctor(cfg)
+        doc_out = _buf.getvalue()
+        chk("doctor command runs", "doctor: HEALTHY" in doc_out,
+            doc_out.strip().splitlines()[-1] if doc_out.strip() else "")
+    except SystemExit as e:
+        chk("doctor command runs", e.code in (0, None),
+            f"exit={e.code}")
+    except Exception as e:
+        chk("doctor command runs", False, str(e))
+
+    try:
+        _buf = _io.StringIO()
+        with _cl.redirect_stdout(_buf):
+            cmd_validate_config(cfg)
+        val_out = _buf.getvalue()
+        chk("config validate command runs", "config: VALID" in val_out,
+            val_out.strip().splitlines()[-1] if val_out.strip() else "")
+    except SystemExit as e:
+        chk("config validate command runs", e.code in (0, None),
+            f"exit={e.code}")
+    except Exception as e:
+        chk("config validate command runs", False, str(e))
+
+    try:
+        _buf = _io.StringIO()
+        with _cl.redirect_stdout(_buf):
+            cmd_secrets(cfg)
+        sec_out = _buf.getvalue()
+        # secrets must either be CLEAN or report a finding; never crash
+        chk("secrets command runs",
+            ("secrets: CLEAN" in sec_out) or ("FINDINGS" in sec_out),
+            sec_out.strip().splitlines()[0] if sec_out.strip() else "")
+    except SystemExit as e:
+        # secrets exits 2 on finding, 0 on clean — both are "ran"
+        chk("secrets command runs", e.code in (0, 2), f"exit={e.code}")
+    except Exception as e:
+        chk("secrets command runs", False, str(e))
+
     fails = sum(1 for _, ok, _ in checks if not ok)
     print("")
     if fails == 0:
@@ -2342,6 +2386,8 @@ def cmd_config(args, cfg):
     Lets the user freely control hub priority (ask_order) and providers
     without hand-editing JSON. Zero-dep, stdlib only."""
     act = getattr(args, "config_action", None)
+    if act == "validate":
+        return cmd_validate_config(cfg)
     if act == "init":
         if os.path.exists(os.path.join(HOME, ".lmm", "config.json")):
             print("[config] ~/.lmm/config.json already exists; not overwriting.")
@@ -2547,6 +2593,123 @@ def cmd_validate_config(cfg):
     print("config: VALID")
 
 
+def cmd_secrets(cfg):
+    """Scan the config for accidentally-stored secrets. lmm's hard rule: NO
+    secret is ever stored or copied — credentials are only CHECKED, never saved.
+    This never prints the secret value itself, only a redacted hint, and exits
+    non-zero if a real secret is found so it can gate a commit."""
+    findings = []
+
+    def redact(val):
+        s = str(val)
+        if len(s) <= 8:
+            return "***"
+        return f"{s[:3]}...{s[-4:]}"
+
+    def looks_secret(v):
+        s = str(v)
+        if not s:
+            return False
+        if any(s.startswith(p) for p in
+               ("sk-", "AKIA", "AIza", "ya29", "Bearer ")):
+            return True
+        # long high-entropy-ish strings are treated as credentials too
+        if len(s) > 20 and any(c.isdigit() for c in s) \
+                and any(c.isalpha() for c in s):
+            return True
+        return False
+
+    for name, v in (cfg.get("providers") or {}).items():
+        if not isinstance(v, dict):
+            continue
+        key = v.get("api_key", "")
+        if looks_secret(key):
+            findings.append(f"provider {name}: REAL SECRET DETECTED "
+                            f"(redacted: {redact(key)})")
+    for k, v in cfg.items():
+        if k.lower() in ("secret", "token", "password") and v:
+            findings.append(f"top-level {k}: SECRET DETECTED "
+                            f"(redacted: {redact(v)})")
+    if findings:
+        print("lmm secrets scan — FINDINGS:")
+        for f in findings:
+            print(f"  [WARN] {f}")
+        print("  move secrets to environment variables; lmm reads them at "
+              "call time, never stores them")
+        sys.exit(2)
+    print("secrets: CLEAN — no stored credentials detected")
+    sys.exit(0)
+
+
+def cmd_doctor(cfg):
+    """First-principles health check: don't trust that lmm works — MEASURE it.
+    Runs real probes (config loads, Ollama reachable, a backend is running,
+    ask_order resolves, hub.log writable) and exits non-zero if any FAILs."""
+    fails = []
+
+    def chk(name, ok, detail=""):
+        mark = "OK" if ok else "FAIL"
+        if not ok:
+            fails.append(name)
+        print(f"[{mark}] {name}" + (f" -- {detail}" if detail else ""))
+
+    # 1) config loads
+    try:
+        _ = cfg
+        ok_cfg = isinstance(cfg, dict)
+    except Exception as e:
+        ok_cfg = False
+        detail_cfg = str(e)
+    chk("config loads", ok_cfg, "" if ok_cfg else detail_cfg)
+
+    # 2) implicit Ollama reachable
+    lo = local_ollama_provider()
+    chk("implicit Ollama reachable",
+        bool(lo) and bool(lo.get("model")),
+        (lo.get("model") if lo else "ollama not running"))
+
+    # 3) at least one backend running
+    try:
+        disc = discover(cfg)
+        running = [d["name"] for d in disc if d.get("running")]
+        chk("at least one backend running",
+            len(running) > 0,
+            (", ".join(running) if running else "none running"))
+    except Exception as e:
+        chk("at least one backend running", False, str(e))
+
+    # 4) ask_order resolves
+    order = cfg.get("ask_order") or []
+    if not isinstance(order, list) or not order:
+        chk("ask_order resolves", False, "ask_order empty or not a list")
+    else:
+        known = set(n.lower() for n in merged_providers(cfg))
+        try:
+            run_names = [d["name"] for d in discover(cfg) if d.get("running")]
+        except Exception:
+            run_names = []
+        unresolved = [n for n in order
+                      if n.lower() not in known and n not in run_names]
+        chk("ask_order resolves",
+            len(unresolved) == 0,
+            ("unresolved: " + ", ".join(unresolved)) if unresolved else
+            f"{len(order)} entr(ies) OK")
+
+    # 5) hub.log writable
+    try:
+        log_hub({"event": "doctor", "provider": "(self)", "ok": True,
+                 "prompt": "doctor probe"})
+        chk("hub.log writable", True)
+    except Exception as e:
+        chk("hub.log writable", False, str(e))
+
+    print("")
+    if fails:
+        print(f"doctor: UNHEALTHY ({len(fails)} issue(s)): {', '.join(fails)}")
+        sys.exit(1)
+    print("doctor: HEALTHY")
+
+
 def main():
     ap = argparse.ArgumentParser(
         description="LMM - Local/remote Model Manager (cross-platform, zero-dep)")
@@ -2600,6 +2763,8 @@ def main():
     p.add_argument("--verify", action="store_true",
                    help="closed-loop: measure each reply, fallback if unfit (measure, don't trust)")
     sub.add_parser("examples")
+    sub.add_parser("doctor")
+    sub.add_parser("secrets")
     args = ap.parse_args()
     if args.version:
         print("lmm 1.0.0")
@@ -2662,6 +2827,10 @@ def main():
                 verify=getattr(args, "verify", False))
     elif cmd == "examples":
         cmd_examples()
+    elif cmd == "doctor":
+        cmd_doctor(cfg)
+    elif cmd == "secrets":
+        cmd_secrets(cfg)
 
 
 if __name__ == "__main__":
