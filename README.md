@@ -46,7 +46,7 @@ lmm status          -> runtimes + GPU + hub/cache/breaker summary
 lmm models          -> models on every running runtime
 lmm cost [--days N] -> measured spend: Anthropic logs + lmm's own hub telemetry
 lmm route "task"    -> recommend local vs remote (--explain for the score)
-lmm fit [model]     -> does it fit in your GPU, and at what context length?
+lmm fit [model|f.gguf] -> does it fit in your GPU, and at what context length?
 lmm bench           -> measure TTFT / TPOT / throughput per provider
 lmm ask "prompt"    -> ask any backend: cached, routed, optionally cascaded
 lmm serve <model>   -> pull + expose a local model endpoint (Ollama)
@@ -138,8 +138,8 @@ Two details the naive version of this gets wrong:
 
 - **`kv_heads` is the GQA count, not the query-head count.** Llama 3.1 8B has
   32 query heads but only 8 KV heads — using the query count overstates the KV
-  cache by 4×. Architecture metadata comes from Ollama's `/api/show`, so these
-  are the model's real numbers, not a guess from its name.
+  cache by 4×. Architecture metadata comes from the model itself, so these are
+  its real numbers, not a guess from its name.
 - **bits-per-weight is above the nominal bit count.** k-quants store scale
   factors and keep sensitive tensors wider, so Q4_K_M is ~4.85 bpw, not 4.0.
 
@@ -147,6 +147,33 @@ Two details the naive version of this gets wrong:
 which halve and quarter the KV cache respectively. `lmm route` now uses these
 numbers too: instead of "GPU is under 80% used", it reports which installed
 model actually fits in the free VRAM.
+
+#### Point it at a `.gguf` file
+
+`fit` reads Ollama's metadata when you give it a tag, but it also reads **GGUF
+files directly** — so it works for LM Studio, llama.cpp, KoboldCPP and Jan
+users, and with no runtime running at all:
+
+```bash
+$ lmm fit ~/models/llama-3-8b-q4_k_m.gguf --vram 24 --ctx 32768
+  [OK  ] llama-3-8b-q4_k_m.gguf         9.03 GiB @ 32,768 ctx
+         weights 4.53 (exact from file) + kv 4.00 + overhead 0.50
+         (8.03B params, 4.85 bpw ~q4_k_m, 32L, 8 kv-heads x 128)
+         fits up to 155,379 tokens of context
+```
+
+The file path is the *more accurate* input, not just a convenience. lmm sums
+the tensor table for an **exact parameter count** and takes the weights term
+from the **real file size**, so nothing is looked up in a bits-per-weight
+table — bits-per-weight is instead *measured* (real bytes ÷ real parameters)
+and reported as the nearest known quant with a `~`. On this path the only
+estimate left in the total is the 0.5 GiB overhead.
+
+Reading stops at the header: metadata and the tensor table, never the weights,
+so sizing a 40 GB model touches a few hundred KB. Malformed or hostile files
+are refused rather than trusted — the parser caps key counts, tensor counts,
+string lengths and array nesting, so a corrupt header can't make it allocate
+its way to an OOM. GGUF v1 (32-bit lengths) is rejected with a clear reason.
 
 GPU detection covers NVIDIA (`nvidia-smi`), AMD (`rocm-smi`) and Apple Silicon
 (unified memory, reported at a conservative 75% usable share).

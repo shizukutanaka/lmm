@@ -15,6 +15,8 @@ import os
 import sys
 import json
 import time
+import shutil
+import struct
 import tempfile
 import unittest
 
@@ -574,6 +576,189 @@ class TestVramFit(unittest.TestCase):
         self.assertAlmostEqual(lmm.params_from_name("qwen2.5-coder:7b"), 7.0e9)
         self.assertAlmostEqual(lmm.params_from_name("llama3.1:70b"), 70.0e9)
         self.assertEqual(lmm.params_from_name("mistral"), 0.0)
+
+
+def gguf_string(v):
+    b = v.encode("utf-8")
+    return struct.pack("<Q", len(b)) + b
+
+
+def gguf_kv_u32(key, val):
+    return gguf_string(key) + struct.pack("<II", lmm.GGUF_UINT32, val)
+
+
+def gguf_kv_str(key, val):
+    return gguf_string(key) + struct.pack("<I", lmm.GGUF_STRING) + gguf_string(val)
+
+
+def write_gguf(path, arch="llama", layers=32, heads=32, kv_heads=8,
+               embed=4096, ctx=131072, key_length=None, version=3,
+               endian="<", pad_to_bpw=4.85, tensor_dims=(4096, 1960000),
+               big_endian_magic=False, drop_kv=()):
+    """Write a minimal but spec-valid GGUF with one tensor, for offline tests.
+
+    Only the metadata `fit` reads is emitted. `tensor_dims` sets the parameter
+    count (product of dims), and the file is padded so size/params lands near
+    `pad_to_bpw`, simulating a realistic measured bits-per-weight.
+
+    Defaults reproduce Llama-3-8B: 8.03B parameters at ~4.85 bpw, i.e. a 4.5 GB
+    file. The padding is written by seeking rather than writing zeros, so the
+    file is SPARSE — the size is real (which is what read_gguf measures) but it
+    occupies almost no disk. lmm only ever reads the header, so it never
+    touches the hole.
+    """
+    e = endian
+    def s(v):
+        b = v.encode("utf-8")
+        return struct.pack(e + "Q", len(b)) + b
+    def kvu(k, v):
+        return s(k) + struct.pack(e + "II", lmm.GGUF_UINT32, v)
+    def kvs(k, v):
+        return s(k) + struct.pack(e + "I", lmm.GGUF_STRING) + s(v)
+
+    pairs = []
+    pairs.append(("arch", kvs("general.architecture", arch)))
+    pairs.append(("layers", kvu("%s.block_count" % arch, layers)))
+    pairs.append(("heads", kvu("%s.attention.head_count" % arch, heads)))
+    if kv_heads is not None:
+        pairs.append(("kv_heads",
+                      kvu("%s.attention.head_count_kv" % arch, kv_heads)))
+    pairs.append(("embed", kvu("%s.embedding_length" % arch, embed)))
+    pairs.append(("ctx", kvu("%s.context_length" % arch, ctx)))
+    if key_length is not None:
+        pairs.append(("key_length",
+                      kvu("%s.attention.key_length" % arch, key_length)))
+    meta = b"".join(body for name, body in pairs if name not in drop_kv)
+    n_kv = sum(1 for name, _ in pairs if name not in drop_kv)
+
+    dims = tensor_dims
+    tensor = (s("token_embd.weight") + struct.pack(e + "I", len(dims))
+              + b"".join(struct.pack(e + "Q", d) for d in dims)
+              + struct.pack(e + "I", 12) + struct.pack(e + "Q", 0))
+    magic = lmm.GGUF_MAGIC[::-1] if big_endian_magic else lmm.GGUF_MAGIC
+    header = magic + struct.pack(e + "IQQ", version, 1, n_kv)
+    blob = header + meta + tensor
+    params = 1
+    for d in dims:
+        params *= d
+    target = int(params * pad_to_bpw / 8) if pad_to_bpw else len(blob)
+    with open(path, "wb") as fh:
+        fh.write(blob)
+        if target > len(blob):
+            fh.seek(target - 1)      # sparse: real size, no disk
+            fh.write(b"\0")
+    return path
+
+
+class TestGguf(unittest.TestCase):
+    """Reading the model geometry straight from a .gguf file — the path that
+    lets LM Studio / llama.cpp / KoboldCPP users run `fit` with no runtime.
+    """
+
+    def setUp(self):
+        self.dir = tempfile.mkdtemp(prefix="lmm-gguf-")
+
+    def tearDown(self):
+        shutil.rmtree(self.dir, ignore_errors=True)
+
+    def path(self, name="m.gguf", **kw):
+        return write_gguf(os.path.join(self.dir, name), **kw)
+
+    def test_reads_the_attention_geometry(self):
+        got = lmm.read_gguf(self.path())
+        self.assertNotIn("error", got)
+        self.assertEqual(got["layers"], 32)
+        self.assertEqual(got["kv_heads"], 8)
+        self.assertEqual(got["head_dim"], 128)
+        self.assertEqual(got["ctx_max"], 131072)
+        self.assertEqual(got["arch"], "llama")
+        self.assertEqual(got["source"], "gguf")
+
+    def test_parameter_count_is_summed_from_the_tensor_table(self):
+        # Exact, not parsed from a name like "7b" — that is the whole point of
+        # reading the file rather than guessing from a tag.
+        got = lmm.read_gguf(self.path())
+        self.assertEqual(got["params"], 4096 * 1960000)     # 8.03B, exact
+        got = lmm.read_gguf(self.path(name="b.gguf", tensor_dims=(1024, 64, 2)))
+        self.assertEqual(got["params"], 1024 * 64 * 2)      # 3-D tensor
+
+    def test_kv_heads_fall_back_to_head_count_without_gqa(self):
+        # A pre-GQA model omits head_count_kv; it must default to head_count,
+        # not to zero (which would make the KV cache vanish).
+        got = lmm.read_gguf(self.path(kv_heads=None))
+        self.assertEqual(got["kv_heads"], got["head_dim"] and 32)
+
+    def test_head_dim_prefers_key_length_over_embed_div_heads(self):
+        got = lmm.read_gguf(self.path(key_length=96, embed=4096, heads=32))
+        self.assertEqual(got["head_dim"], 96)      # not 4096/32 == 128
+
+    def test_measured_bits_per_weight_matches_the_padding(self):
+        got = lmm.read_gguf(self.path(pad_to_bpw=4.85))
+        self.assertAlmostEqual(got["measured_bpw"], 4.85, delta=0.05)
+        self.assertEqual(got["quant"], "~q4_k_m")
+
+    def test_weights_are_exact_from_the_file(self):
+        p = self.path(pad_to_bpw=5.5)
+        got = lmm.read_gguf(p)
+        self.assertAlmostEqual(got["weights_gib"],
+                               os.path.getsize(p) / lmm.GIB, places=6)
+        est = lmm.estimate_vram(got, 0)
+        self.assertAlmostEqual(est["weights_gib"], got["weights_gib"], places=6)
+
+    def test_quant_whatif_ignores_the_measured_weights(self):
+        # Asking "what if this were q8_0" must recompute from params x bpw, not
+        # reuse the file's actual size.
+        got = lmm.read_gguf(self.path(pad_to_bpw=4.85))
+        as_is = lmm.estimate_vram(got, 0)["weights_gib"]
+        whatif = lmm.estimate_vram(got, 0, quant="q8_0")["weights_gib"]
+        self.assertGreater(whatif, as_is)
+
+    def test_published_kv_figure_holds_for_a_gguf_source(self):
+        # The whole KV formula is pinned to Llama-3-8B @32K fp16 = 4.0 GiB;
+        # reading the spec from a file must not change that.
+        got = lmm.read_gguf(self.path())
+        self.assertAlmostEqual(lmm.estimate_vram(got, 32768)["kv_gib"], 4.0,
+                               places=3)
+
+    def test_big_endian_magic_is_accepted(self):
+        got = lmm.read_gguf(self.path(endian=">", big_endian_magic=True))
+        self.assertNotIn("error", got)
+        self.assertEqual(got["layers"], 32)
+
+    def test_bad_magic_is_an_error_not_an_exception(self):
+        p = os.path.join(self.dir, "x.gguf")
+        with open(p, "wb") as fh:
+            fh.write(b"XXXX" + b"\0" * 64)
+        self.assertIn("error", lmm.read_gguf(p))
+
+    def test_truncated_file_is_an_error(self):
+        p = os.path.join(self.dir, "t.gguf")
+        with open(p, "wb") as fh:
+            fh.write(lmm.GGUF_MAGIC + struct.pack("<I", 3)[:2])
+        self.assertIn("error", lmm.read_gguf(p))
+
+    def test_missing_file_is_an_error(self):
+        self.assertIn("error", lmm.read_gguf(os.path.join(self.dir, "nope.gguf")))
+
+    def test_gguf_v1_is_rejected_with_a_clear_reason(self):
+        got = lmm.read_gguf(self.path(version=1))
+        self.assertIn("error", got)
+        self.assertIn("v1", got["error"])
+
+    def test_missing_geometry_is_an_error(self):
+        got = lmm.read_gguf(self.path(drop_kv=("layers",)))
+        self.assertIn("error", got)
+
+    def test_looks_like_gguf_does_not_catch_ollama_tags(self):
+        self.assertFalse(lmm.looks_like_gguf("llama3.1:8b"))
+        self.assertFalse(lmm.looks_like_gguf("qwen2.5-coder:7b"))
+        self.assertTrue(lmm.looks_like_gguf("model.gguf"))
+        self.assertTrue(lmm.looks_like_gguf("/models/x.GGUF"))
+
+    def test_quant_label_from_bpw(self):
+        self.assertEqual(lmm.quant_label_from_bpw(4.85), "~q4_k_m")
+        self.assertEqual(lmm.quant_label_from_bpw(16.0), "~f16")
+        self.assertEqual(lmm.quant_label_from_bpw(0), "")
 
 
 class TestSSEFraming(unittest.TestCase):

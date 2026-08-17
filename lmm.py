@@ -24,7 +24,7 @@
 #   models              models on every running runtime
 #   cost [--days N]     measured spend: Anthropic session logs + lmm's own hub
 #   route "task ..."    recommend local vs remote for a task (--explain)
-#   fit [model]         does it fit in your GPU, and at what context length?
+#   fit [model|*.gguf]  does it fit in your GPU, and at what context length?
 #   bench               measure TTFT / TPOT / throughput per provider
 #   ask "prompt"        one question, routed across every backend (--cascade)
 #   serve <model>       pull + expose a local model endpoint (Ollama)
@@ -60,6 +60,7 @@ import json
 import time
 import math
 import hashlib
+import struct
 import argparse
 import subprocess
 import datetime
@@ -569,6 +570,186 @@ def ollama_model_info(model):
             "arch": arch, "source": "ollama"}
 
 
+# --- GGUF header reader ----------------------------------------------------
+# `fit` could only size models registered with Ollama, which left every
+# LM Studio / llama.cpp / KoboldCPP user — the people with .gguf files sitting on
+# disk — unable to use it at all. GGUF carries the architecture in its own
+# metadata, so the file answers the question with no runtime involved.
+#
+# Format (ggml GGUF spec, v2/v3):
+#   magic  "GGUF" (4 bytes)     version uint32
+#   tensor_count uint64         metadata_kv_count uint64
+#   then metadata_kv_count pairs of: key:string, value_type:uint32, value
+#   then tensor_count entries of: name:string, n_dims:uint32,
+#                                 dims:uint64[n_dims], ggml_type:uint32,
+#                                 offset:uint64
+#   strings are uint64 length + raw bytes (v1 used uint32 and is not supported)
+GGUF_MAGIC = b"GGUF"
+(GGUF_UINT8, GGUF_INT8, GGUF_UINT16, GGUF_INT16, GGUF_UINT32, GGUF_INT32,
+ GGUF_FLOAT32, GGUF_BOOL, GGUF_STRING, GGUF_ARRAY, GGUF_UINT64, GGUF_INT64,
+ GGUF_FLOAT64) = range(13)
+
+# value_type -> (struct code, byte width) for the fixed-width scalars
+GGUF_SCALARS = {
+    GGUF_UINT8: ("B", 1), GGUF_INT8: ("b", 1),
+    GGUF_UINT16: ("H", 2), GGUF_INT16: ("h", 2),
+    GGUF_UINT32: ("I", 4), GGUF_INT32: ("i", 4),
+    GGUF_FLOAT32: ("f", 4), GGUF_BOOL: ("?", 1),
+    GGUF_UINT64: ("Q", 8), GGUF_INT64: ("q", 8), GGUF_FLOAT64: ("d", 8),
+}
+
+# Sanity ceilings. A truncated or hostile file otherwise asks us to allocate an
+# arbitrary amount; reading a header should never be able to exhaust memory.
+GGUF_MAX_KV = 4096
+GGUF_MAX_TENSORS = 100_000
+GGUF_MAX_STRING = 1 << 20
+
+
+class _GgufReader(object):
+    def __init__(self, fh, endian="<"):
+        self.fh = fh
+        self.e = endian
+
+    def raw(self, n):
+        b = self.fh.read(n)
+        if len(b) != n:
+            raise ValueError("truncated GGUF")
+        return b
+
+    def scalar(self, code, width):
+        return struct.unpack(self.e + code, self.raw(width))[0]
+
+    def u32(self):
+        return self.scalar("I", 4)
+
+    def u64(self):
+        return self.scalar("Q", 8)
+
+    def string(self):
+        n = self.u64()
+        if n > GGUF_MAX_STRING:
+            raise ValueError("implausible GGUF string length")
+        return self.raw(n).decode("utf-8", "ignore")
+
+    def value(self, vtype, depth=0):
+        if vtype in GGUF_SCALARS:
+            return self.scalar(*GGUF_SCALARS[vtype])
+        if vtype == GGUF_STRING:
+            return self.string()
+        if vtype == GGUF_ARRAY:
+            if depth > 4:
+                raise ValueError("GGUF array nested too deeply")
+            etype = self.u32()
+            n = self.u64()
+            if etype in GGUF_SCALARS and n > GGUF_MAX_STRING:
+                # long token/score arrays are normal; skip rather than build
+                self.raw(GGUF_SCALARS[etype][1] * n)
+                return []
+            out = []
+            for _ in range(n):
+                out.append(self.value(etype, depth + 1))
+            return out
+        raise ValueError("unknown GGUF value type %r" % (vtype,))
+
+
+def looks_like_gguf(name):
+    """True for something that should be read as a file rather than looked up
+    as an Ollama tag. Ollama tags never end in .gguf and never contain a path
+    separator, so the two namespaces do not collide."""
+    n = str(name or "")
+    return n.lower().endswith(".gguf") or (os.sep in n and os.path.isfile(n))
+
+
+def read_gguf(path):
+    """Architecture spec straight from a .gguf file, or {'error': why}.
+
+    Unlike the Ollama path this yields an EXACT weights figure: the parameter
+    count is summed from the tensor table and the on-disk size is the real byte
+    count, so no bits-per-weight estimate is involved at all.
+    """
+    try:
+        size = os.path.getsize(path)
+        with open(path, "rb") as fh:
+            magic = fh.read(4)
+            if magic == GGUF_MAGIC:
+                endian = "<"
+            elif magic == GGUF_MAGIC[::-1]:
+                endian = ">"          # big-endian writer
+            else:
+                return {"error": "not a GGUF file (bad magic)"}
+            r = _GgufReader(fh, endian)
+            version = r.u32()
+            if version < 2:
+                return {"error": "GGUF v%d is not supported (v1 used 32-bit "
+                                 "lengths); re-export with a current tool"
+                                 % version}
+            n_tensors = r.u64()
+            n_kv = r.u64()
+            if n_tensors > GGUF_MAX_TENSORS or n_kv > GGUF_MAX_KV:
+                return {"error": "implausible GGUF header counts"}
+
+            meta = {}
+            for _ in range(n_kv):
+                key = r.string()
+                vtype = r.u32()
+                meta[key] = r.value(vtype)
+
+            params = 0
+            for _ in range(n_tensors):
+                r.string()                       # tensor name
+                nd = r.u32()
+                if nd > 8:
+                    return {"error": "implausible tensor rank"}
+                n = 1
+                for _ in range(nd):
+                    n *= r.u64()
+                r.u32()                          # ggml_type
+                r.u64()                          # offset
+                params += n
+    except (OSError, ValueError, struct.error) as e:
+        return {"error": "could not read GGUF: %s" % e}
+
+    arch = meta.get("general.architecture") or ""
+
+    def g(*suffixes):
+        for suf in suffixes:
+            for key in ("%s.%s" % (arch, suf), suf):
+                v = meta.get(key)
+                if isinstance(v, (int, float)) and not isinstance(v, bool):
+                    return v
+        return None
+
+    layers = g("block_count")
+    heads = g("attention.head_count")
+    kv_heads = g("attention.head_count_kv") or heads
+    embed = g("embedding_length")
+    head_dim = g("attention.key_length")
+    if not head_dim and embed and heads:
+        head_dim = embed / heads
+    if not (layers and kv_heads and head_dim):
+        return {"error": "GGUF metadata lacks block_count / head counts"}
+
+    # Weights come from the file itself. Deriving bits-per-weight from it (real
+    # bytes over real parameters) is strictly better than looking a nominal
+    # quant name up in a table.
+    bpw = (size * 8.0 / params) if params else 0.0
+    return {"params": float(params), "layers": int(layers),
+            "kv_heads": int(kv_heads), "head_dim": int(head_dim),
+            "ctx_max": int(g("context_length") or 0),
+            "quant": quant_label_from_bpw(bpw), "measured_bpw": bpw,
+            "weights_gib": size / GIB, "file_bytes": size,
+            "arch": arch, "source": "gguf"}
+
+
+def quant_label_from_bpw(bpw):
+    """Nearest known quant name for a measured bits-per-weight. Reported with a
+    '~' because it is inferred from file size, not read from an enum."""
+    if not bpw:
+        return ""
+    name = min(QUANT_BPW, key=lambda k: abs(QUANT_BPW[k] - bpw))
+    return "~%s" % name
+
+
 def quant_bpw(quant):
     q = (quant or "").strip().lower()
     if q in QUANT_BPW:
@@ -586,9 +767,18 @@ def kv_bytes_per_token(spec, kv_type="f16"):
 
 
 def estimate_vram(spec, ctx, quant=None, kv_type="f16"):
-    """Total GiB to run `spec` at `ctx` tokens: weights + KV cache + overhead."""
+    """Total GiB to run `spec` at `ctx` tokens: weights + KV cache + overhead.
+
+    A GGUF source carries `weights_gib` measured from the file itself, which
+    beats params x bits-per-weight; the estimate is only used when the real
+    number is unavailable, or when `quant` asks a what-if question.
+    """
     bpw = quant_bpw(quant or spec.get("quant"))
-    weights = spec.get("params", 0.0) * bpw / 8.0 / GIB
+    if quant is None and spec.get("weights_gib"):
+        weights = float(spec["weights_gib"])
+        bpw = spec.get("measured_bpw") or bpw
+    else:
+        weights = spec.get("params", 0.0) * bpw / 8.0 / GIB
     kv = kv_bytes_per_token(spec, kv_type) * max(ctx, 0) / GIB
     return {"weights_gib": weights, "kv_gib": kv,
             "overhead_gib": VRAM_OVERHEAD_GIB,
@@ -2090,18 +2280,29 @@ def cmd_fit(model=None, ctx=None, vram=None, kv="f16", as_json=False):
 
     models = [model] if model else (detect_ollama().get("models") or [])
     if not models:
-        print("[fit] no model given and no Ollama models installed. "
-              "Try: lmm fit llama3.1:8b --vram 24")
+        print("[fit] no model given and no Ollama models installed. Try: "
+              "lmm fit llama3.1:8b --vram 24, or point it at a file: "
+              "lmm fit ./model.gguf")
         return
 
     rows = []
     for name in models:
-        spec = ollama_model_info(name)
+        # A path to a .gguf is sized from the file itself — no runtime needed,
+        # which is what makes `fit` usable for LM Studio / llama.cpp / KoboldCPP
+        # users who have weights on disk but nothing registered with Ollama.
+        if looks_like_gguf(name):
+            got = read_gguf(name)
+            if got.get("error"):
+                rows.append({"model": name, "error": got["error"]})
+                continue
+            spec = got
+        else:
+            spec = ollama_model_info(name)
         if not spec:
             params = params_from_name(name)
             rows.append({"model": name, "error": (
-                "no metadata (start Ollama so `lmm fit` can read the real layer "
-                "and KV-head counts)"),
+                "no metadata — start Ollama so `lmm fit` can read the real "
+                "layer and KV-head counts, or pass a .gguf path"),
                 "weights_only_gib": (params * quant_bpw(None) / 8.0 / GIB
                                      if params else None)})
             continue
@@ -2129,12 +2330,19 @@ def cmd_fit(model=None, ctx=None, vram=None, kv="f16", as_json=False):
             continue
         e, s = r["est"], r["spec"]
         mark = "OK  " if r["fits"] else "OVER"
-        print(f"  [{mark}] {r['model']:<28} {e['total_gib']:6.2f} GiB "
+        label = os.path.basename(r["model"]) if s.get("source") == "gguf" \
+            else r["model"]
+        print(f"  [{mark}] {label:<28} {e['total_gib']:6.2f} GiB "
               f"@ {r['ctx']:,} ctx")
-        print(f"         weights {e['weights_gib']:.2f} + kv {e['kv_gib']:.2f} "
-              f"+ overhead {e['overhead_gib']:.2f}   "
-              f"({s['params']/1e9:.1f}B params, {e['bpw']:.2f} bpw, "
-              f"{s['layers']}L, {s['kv_heads']} kv-heads x {s['head_dim']})")
+        # Say where the numbers came from: a GGUF gives exact weights and an
+        # exact parameter count, Ollama metadata gives an estimated weights term.
+        origin = ("exact from file" if s.get("source") == "gguf"
+                  else "estimated from quant table")
+        print(f"         weights {e['weights_gib']:.2f} ({origin}) + "
+              f"kv {e['kv_gib']:.2f} + overhead {e['overhead_gib']:.2f}   "
+              f"({s['params']/1e9:.2f}B params, {e['bpw']:.2f} bpw"
+              + (f" {s['quant']}" if s.get("quant") else "")
+              + f", {s['layers']}L, {s['kv_heads']} kv-heads x {s['head_dim']})")
         if r["max_ctx"]:
             print(f"         fits up to {r['max_ctx']:,} tokens of context")
         else:
@@ -2145,9 +2353,14 @@ def cmd_fit(model=None, ctx=None, vram=None, kv="f16", as_json=False):
                 print(f"         -> fits at {alt['total_gib']:.2f} GiB with "
                       f"--kv q8_0 (llama.cpp --cache-type-k/v q8_0)")
     print("-" * 72)
-    print("Estimates. bits-per-weight are llama.cpp measurements on LLaMA-family "
-          "models;\noverhead is a 0.5 GiB middle estimate for context and scratch "
-          "buffers.")
+    if any(r.get("spec", {}).get("source") == "gguf" for r in rows):
+        print("GGUF rows read weights and parameter count from the file, so only "
+              "the\n0.5 GiB overhead is an estimate. KV cache is exact for the "
+              "given context.")
+    else:
+        print("Estimates. bits-per-weight are llama.cpp measurements on "
+              "LLaMA-family models;\noverhead is a 0.5 GiB middle estimate for "
+              "context and scratch buffers.")
 
 
 def cmd_serve(model):
