@@ -2286,6 +2286,47 @@ def cmd_selftest(cfg):
     chk("observability (hub.log writable)", after,
         ("created" if not before else "appended"))
 
+    # 6) closed-loop verify routing — the hub must PROVE its own core claim
+    #    ("measure the answer, don't just trust the pick"). Two deterministic
+    #    checks that need NO live backend:
+    #    6a) verify_reply rejects a hallucinated token
+    bad_ok, bad_reason = verify_reply(
+        "explain quantum mechanics",
+        "The wavefunction propagレーション describes everything.")
+    chk("verify_reply detects hallucination", (not bad_ok), bad_reason)
+    #    6b) route_and_verify falls through a bad backend to a good one.
+    #        We monkey-patch call_provider with two mock backends so the test
+    #        is deterministic and offline (measure, don't trust — even the test).
+    real_call = call_provider
+    try:
+        def _mock(prov, prompt, stream=False):
+            if "bad" in prov.get("model", ""):
+                return {"choices": [{"message": {
+                    "content": "wavefunction is propagレーション thing."}}]}
+            return {"choices": [{"message": {
+                "content": "The Schrodinger equation iħ∂ψ/∂t=Hψ governs "
+                           "quantum state evolution via the Hamiltonian H. "
+                           "It describes how the quantum state of a physical "
+                           "system changes with time and underlies all of "
+                           "quantum mechanics including superposition."}}]}
+        globals()["call_provider"] = _mock
+        _cfg = dict(cfg)
+        _cfg["providers"] = {
+            "bad":  {"api_key": "x", "base_url": "http://127.0.0.1:9/v1",
+                     "model": "bad-model", "kind": "local"},
+            "good": {"api_key": "x", "base_url": "http://127.0.0.1:8/v1",
+                     "model": "good-model", "kind": "local"}}
+        _cfg["ask_order"] = ["bad", "good"]
+        _name, _reason, _reply = route_and_verify(
+            "explain quantum mechanics", _cfg, _cfg["ask_order"])
+        chk("route_and_verify falls back bad->good",
+            _name == "good" and _reply is not None,
+            (_reason if _reason else str(_name)))
+    except Exception as e:
+        chk("route_and_verify falls back bad->good", False, str(e))
+    finally:
+        globals()["call_provider"] = real_call
+
     fails = sum(1 for _, ok, _ in checks if not ok)
     print("")
     if fails == 0:
