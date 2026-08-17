@@ -496,6 +496,105 @@ def score_and_route(task, cfg, ask_order=None):
                          f"{'/code' if code else ''}{'/private' if is_private else ''}"
 
 
+def verify_reply(task, reply):
+    """First-principles QUALITY GATE: don't trust that a backend answered well
+    — MEASURE it. Returns (ok, reason). This closes the routing loop: a backend
+    is only 'good' if its reply actually satisfies the task, measured by
+    proxy signals (we cannot grade meaning, but we can detect failure modes).
+
+    Proxy failure modes (all MEASURED, not assumed):
+      - empty / error / refusal
+      - hallucinated tokens (mojibake / non-word ASCII-Japanese mixes)
+      - task-specific under-delivery (code task with no code block, etc.)
+    """
+    if not reply or not reply.strip():
+        return False, "empty reply"
+    t = (task or "").lower()
+    r = reply.strip()
+    # hallucination / mojibake proxy: latin letter immediately fused to a
+    # Japanese kana/kanji with no separator, e.g. 'propagレーション'
+    import re
+    if re.search(r"[A-Za-z][\u3040-\u30ff\u4e00-\u9fff]|[\u3040-\u30ff\u4e00-\u9fff][A-Za-z]", r):
+        return False, "hallucinated token (latin+script fused)"
+    # code task must contain a code block or def/class
+    if any(k in t for k in ["code", "function", "実装", "クラス", "関数",
+                             "def ", "write a", "```"]):
+        if "```" not in r and "def " not in r and "class " not in r and "function" not in r:
+            return False, "code task but no code block produced"
+    # heavy reasoning task: a one-liner is under-delivery
+    if any(k in t for k in ["explain", "derive", "proof", "説明", "導出",
+                             "証明", "理由", "why"]):
+        if len(r) < 120:
+            return False, f"reasoning task but reply too short ({len(r)} chars)"
+    return True, "ok"
+
+
+def route_and_verify(task, cfg, ask_order=None, max_tries=3):
+    """Closed-loop routing (measure -> run -> verify -> fallback if bad).
+    Picks backends by score_and_route ordering, tries each, and if verify_reply
+    says the answer is unfit, FALLS BACK to the next — recording the measured
+    reason. This is 'measure, don't trust' made operational."""
+    t = (task or "").lower()
+    cat = backend_catalog(cfg)
+    cat = [c for c in cat if c["base_url"]]
+    if not cat:
+        return None, "no reachable backend", None
+    # build an ordered candidate list by reusing score_and_route's score fn
+    # (score each catalog entry the same way, sort descending)
+    heavy = any(k in t for k in
+                ["explain", "derive", "proof", "quantum", "analyze", "design",
+                 "architecture", "research", "compare", "why", "理由", "説明",
+                 "設計", "解析", "比較", "導出", "証明", "考察"])
+    code = any(k in t for k in
+               ["code", "function", "bug", "refactor", "クラス", "関数",
+                "コード", "実装", "デバッグ", "write a", "def ", "```"])
+    is_private = any(k in t for k in
+                    merged_route(cfg).get("private", []) + ["secret", "社内"])
+    rank = []
+    for c in cat:
+        s = 0.0
+        size = c["size_b"]
+        if size is None:
+            size = 8.0 if c["kind"] == "remote" else 3.0
+        s += min(size, 70) / 7.0 if heavy else 1.0
+        if code and "coder" in (c["model"] or "").lower():
+            s += 2.0
+        if is_private and c["kind"] == "local":
+            s += 3.0
+        if c["kind"] == "local" and not c["paid"]:
+            s += 0.5
+        if ask_order:
+            try:
+                idx = ask_order.index(c["name"])
+                s += max(0, (len(ask_order) - idx)) * 0.1
+            except ValueError:
+                pass
+        rank.append((s, c))
+    rank.sort(key=lambda x: -x[0])
+    order = [c["name"] for _, c in rank]
+    targets = resolve_ask_targets(cfg, task, None)
+    ordered = [t_ for t_ in targets if t_[0] in order]
+    ordered += [t_ for t_ in targets if t_[0] not in order]
+    tried = []
+    for name, prov in ordered[:max_tries]:
+        r = call_provider(prov, task, stream=False)
+        if isinstance(r, dict) and r.get("error"):
+            tried.append(f"{name} error: {r['error']}")
+            continue
+        try:
+            reply = r["choices"][0]["message"]["content"]
+        except (KeyError, IndexError, TypeError):
+            tried.append(f"{name} bad response")
+            continue
+        ok, vreason = verify_reply(task, reply)
+        if ok:
+            return name, f"verified ok ({vreason})", reply
+        tried.append(f"{name} failed verify: {vreason}")
+        log_hub({"event": "verify", "provider": name, "ok": False,
+                 "reason": vreason, "prompt": task})
+    return None, f"all tried failed: {'; '.join(tried)}", None
+
+
 # ----------------------------- detectors -----------------------------------
 def detect_ollama():
     r = run("ollama list")
@@ -1887,12 +1986,13 @@ def resolve_ask_targets(cfg, prompt, explicit):
 
 
 
-def cmd_ask(prompt, provider, cfg, auto=False):
+def cmd_ask(prompt, provider, cfg, auto=False, verify=False):
     """Unified inference with auto-routing + fallback: tries providers in order
     (explicit > auto-score > private/local > configured > implicit running Ollama)
     and falls through to the next on error. This is the hub's intelligence.
     With auto=True, the FIRST target is chosen by MEASURED task-vs-backend fit
-    (first-principles routing), not the static ask_order alone.
+    (first-principles routing). With verify=True, each candidate's reply is
+    MEASURED by verify_reply and fallen back if unfit (closed loop).
     Responses stream token-by-token."""
     effective = provider
     if auto and not provider:
@@ -1902,6 +2002,17 @@ def cmd_ask(prompt, provider, cfg, auto=False):
             effective = best
         else:
             print(f"[ask] auto-routing skipped: {reason}")
+    if verify and not provider:
+        name, vreason, reply = route_and_verify(
+            prompt, cfg, cfg.get("ask_order"))
+        if name and reply is not None:
+            print(f"[ask] verified-route: {name} -> {vreason}")
+            print(reply)
+            return
+        else:
+            print(f"[ask] verified-route: no backend passed the quality gate "
+                  f"({vreason})")
+            return
     targets = resolve_ask_targets(cfg, prompt, effective)
     if not targets:
         print("[ask] no provider available. Start Ollama (`lmm serve <model>`) "
@@ -2294,6 +2405,8 @@ def main():
     p.add_argument("--provider", default=None, help="provider name from config")
     p.add_argument("--auto", action="store_true",
                    help="route by measured task fit (first-principles), not static ask_order")
+    p.add_argument("--verify", action="store_true",
+                   help="closed-loop: measure each reply, fallback if unfit (measure, don't trust)")
     sub.add_parser("examples")
     args = ap.parse_args()
     if args.version:
@@ -2348,7 +2461,8 @@ def main():
         cmd_autostart()
     elif cmd == "ask":
         cmd_ask(" ".join(getattr(args, "prompt", [])), getattr(args, "provider", None),
-                cfg, auto=getattr(args, "auto", False))
+                cfg, auto=getattr(args, "auto", False),
+                verify=getattr(args, "verify", False))
     elif cmd == "examples":
         cmd_examples()
 
