@@ -2,10 +2,11 @@
 # lmm.py - Local/remote Model Manager
 # ---------------------------------------------------------------------------
 # One-file, zero-dependency manager for every LLM runtime on your machine.
-# Cross-platform (Windows / macOS / Linux). Detects local (Ollama, LM Studio,
-# llama.cpp) and remote (Claude Code, your own agents) runtimes, shows live
-# status + GPU usage, estimates Anthropic cost from real session logs, and
-# recommends local-vs-remote routing for a task.
+# Cross-platform (Windows / macOS / Linux). Auto-detects 16 runtimes — local
+# (Ollama, LM Studio, Jan, GPT4All, AnythingLLM, Chatbox, Msty, KoboldCPP,
+# Open WebUI, vLLM, llama.cpp) and remote/desktop (Claude, ChatGPT, Cursor,
+# Perplexity, Devin/Cua) — shows live status + GPU, measures real spend, and
+# routes each request to the cheapest model that can handle it.
 #
 #   No secrets are ever stored. Existing credentials are only *checked*, never
 #   copied or saved. All paths are derived from your home directory.
@@ -15,10 +16,12 @@
 #   chmod +x ~/.local/bin/lmm
 #   # or just:  python lmm.py <command>
 #
-# Commands:
+# Commands (no subcommand -> the live GUI dashboard):
+#   gui                 live GUI dashboard (tkinter; the default command)
 #   discover [--json]   list every detected runtime
-#   status              live status + GPU
-#   models              local models installed
+#   cli                 same as discover (explicit CLI mode)
+#   status              runtimes + GPU + hub/cache/breaker summary
+#   models              models on every running runtime
 #   cost [--days N]     measured spend: Anthropic session logs + lmm's own hub
 #   route "task ..."    recommend local vs remote for a task (--explain)
 #   fit [model]         does it fit in your GPU, and at what context length?
@@ -29,6 +32,8 @@
 #   cache               prompt-cache stats (--clear)
 #   stop  <runtime>     stop a running runtime
 #   hide  <runtime>     strip a runtime's taskbar button (Windows)
+#   watch               daemon: auto-hide new LLM windows (Windows)
+#   autostart           register `watch` at login (Windows)
 #   dash                generate + open a self-contained HTML dashboard
 #   examples            show a sample config file you can copy
 #
@@ -61,6 +66,8 @@ import datetime
 import html
 import webbrowser
 import ctypes
+
+VERSION = "1.1.0"
 
 HOME = os.path.expanduser("~")
 
@@ -1341,8 +1348,14 @@ def detect_extra(cfg):
             if r and r.returncode == 0:
                 models = [l for l in r.stdout.strip().splitlines() if l.strip()]
         out.append({
-            "name": e["name"], "type": e.get("type", "local"),
-            "paid": e.get("paid", False), "running": running, "procs": procs,
+            # Same shape as detect_runtime: consumers iterate discover() and
+            # must not need to know which detector produced an item. `serving`
+            # for a user runtime is its process being up — there is no
+            # documented port to probe.
+            "name": e["name"], "key": e["name"].lower().replace(" ", "-"),
+            "type": e.get("type", "local"),
+            "paid": e.get("paid", False), "running": running,
+            "serving": procs > 0, "procs": procs,
             "models": models, "endpoint": e.get("endpoint", "-"),
             "installed": installed,
         })
@@ -1619,6 +1632,84 @@ def cost_report(cfg, days=30):
     return "\n".join(out + hub_cost_block(cfg, pricing, days, grand))
 
 
+def hub_cost_stats(days=None, events=None):
+    """Aggregate ~/.lmm/usage.jsonl into one structure.
+
+    Extracted so the text report, the HTML dashboard and `lmm status` all read
+    the same numbers. It used to live inside the text formatter, which meant any
+    other surface had to either re-derive it or scrape formatted prose — and the
+    GUI did exactly that, displaying whatever the report's last line happened to
+    be.
+    """
+    events = read_usage(days) if events is None else events
+    st = {"providers": {}, "hits": {"exact": 0, "semantic": 0}, "saved_cache": 0.0,
+          "local_calls": 0, "local_tokens": 0, "est_usd": 0.0, "partial_usd": 0.0,
+          "partial_calls": 0, "ttfts": [], "measured": 0.0, "calls": 0}
+    for ev in events or []:
+        hit = ev.get("cache")
+        if hit in st["hits"]:
+            st["hits"][hit] += 1
+            st["saved_cache"] += float(ev.get("saved_usd", 0.0) or 0.0)
+            continue
+        if hit == "near-miss":
+            continue                         # a probe, not a call — see `lmm cache`
+        name = ev.get("provider", "?")
+        a = st["providers"].setdefault(name, {"calls": 0, "in": 0, "out": 0,
+                                              "usd": 0.0,
+                                              "kind": ev.get("kind", "remote")})
+        usd = float(ev.get("usd", 0.0) or 0.0)
+        a["calls"] += 1
+        a["in"] += ev.get("in", 0) or 0
+        a["out"] += ev.get("out", 0) or 0
+        a["usd"] += usd
+        st["measured"] += usd
+        st["calls"] += 1
+        if ev.get("estimated"):
+            st["est_usd"] += usd
+        if ev.get("partial"):
+            st["partial_usd"] += usd
+            st["partial_calls"] += 1
+        # TTFT only means something where tokens arrived incrementally; a
+        # buffered cascade has a first-byte time but not a first-TOKEN one.
+        if ev.get("stream") and not ev.get("buffered") and ev.get("ttft_ms"):
+            st["ttfts"].append(float(ev["ttft_ms"]))
+        if ev.get("kind") == "local":
+            st["local_calls"] += 1
+            st["local_tokens"] += (ev.get("in", 0) or 0) + (ev.get("out", 0) or 0)
+    return st
+
+
+def cost_summary(cfg, days=None):
+    """One honest line about spend, for the GUI header and the dashboard.
+
+    The GUI used to show `cost_report(...).splitlines()[-1]`, which was correct
+    only while the report ended with a total. Once the telemetry block was
+    appended, that last line became whichever of these fired last: an ALL-IN
+    total, an *illustrative* cross-provider estimate, or a whole sentence
+    explaining there was no telemetry yet. So a hypothetical number could sit
+    next to the GPU readout looking like real spend.
+    """
+    pricing = merged_pricing(cfg)
+    st = hub_cost_stats(days)
+    claude = 0.0
+    data = measured_tokens(days)
+    for fam, a in (data or {}).get("by_family", {}).items():
+        p = pricing.get(fam, pricing["default"])
+        claude += (a["in"] / 1e6 * p["in"] + a["out"] / 1e6 * p["out"]
+                   + a["cw"] / 1e6 * p["cw"] + a["cr"] / 1e6 * p["cr"])
+    parts = []
+    if claude:
+        parts.append(f"Claude ${claude:,.2f}")
+    if st["calls"]:
+        parts.append(f"hub ${st['measured']:,.4f} ({st['calls']} calls)")
+    hits = st["hits"]["exact"] + st["hits"]["semantic"]
+    if hits:
+        parts.append(f"cache saved ${st['saved_cache']:,.4f} ({hits} hits)")
+    if not parts:
+        return "no measured spend yet — run `lmm ask` or `lmm serve --hub`"
+    return "  ·  ".join(parts)
+
+
 def hub_cost_block(cfg, pricing, days=None, claude_total=0.0):
     """Everything lmm measured itself: real hub spend, what the cache and the
     local runtimes saved, plus any hand-entered cfg['usage']."""
@@ -1627,41 +1718,14 @@ def hub_cost_block(cfg, pricing, days=None, claude_total=0.0):
     window = f"last {days}d" if days else "all-time"
     measured = 0.0
 
-    if events:
-        by_prov = {}
-        hits = {"exact": 0, "semantic": 0}
-        saved_cache = 0.0
-        local_calls, local_tokens = 0, 0
-        est_usd, partial_usd, partial_calls = 0.0, 0.0, 0
-        ttfts = []
-        for ev in events:
-            hit = ev.get("cache")
-            if hit in hits:
-                hits[hit] += 1
-                saved_cache += float(ev.get("saved_usd", 0.0) or 0.0)
-                continue
-            if hit == "near-miss":
-                continue                     # not a call; accounted in `lmm cache`
-            name = ev.get("provider", "?")
-            a = by_prov.setdefault(name, {"calls": 0, "in": 0, "out": 0, "usd": 0.0,
-                                          "kind": ev.get("kind", "remote")})
-            usd = float(ev.get("usd", 0.0) or 0.0)
-            a["calls"] += 1
-            a["in"] += ev.get("in", 0) or 0
-            a["out"] += ev.get("out", 0) or 0
-            a["usd"] += usd
-            if ev.get("estimated"):
-                est_usd += usd
-            if ev.get("partial"):
-                partial_usd += usd
-                partial_calls += 1
-            # TTFT only means something where tokens arrived incrementally; a
-            # buffered cascade has a first-byte time but not a first-TOKEN one.
-            if ev.get("stream") and not ev.get("buffered") and ev.get("ttft_ms"):
-                ttfts.append(float(ev["ttft_ms"]))
-            if ev.get("kind") == "local":
-                local_calls += 1
-                local_tokens += (ev.get("in", 0) or 0) + (ev.get("out", 0) or 0)
+    st = hub_cost_stats(days, events)
+    by_prov = st["providers"]
+    hits = st["hits"]
+    saved_cache = st["saved_cache"]
+    local_calls, local_tokens = st["local_calls"], st["local_tokens"]
+    est_usd = st["est_usd"]
+    partial_usd, partial_calls = st["partial_usd"], st["partial_calls"]
+    ttfts = st["ttfts"]
     if events and (by_prov or hits["exact"] or hits["semantic"]):
         out.append("")
         out.append("=" * 64)
@@ -1765,6 +1829,11 @@ def cmd_route(cfg, task, explain=False):
               + ", ".join(n for n, _ in order_targets(cfg, task, targets)))
     else:
         print("=> no providers configured; add 'providers' or start Ollama")
+    fit = best_local_fit()
+    if fit:
+        print(f"   largest installed model that fits: {fit['model']} "
+              f"({fit['gib']:.1f} of {fit['budget_gib']:.1f} GiB free "
+              f"at {fit['ctx']:,} ctx)")
 
 
 def best_local_fit(ctx=4096, limit=6):
@@ -1794,73 +1863,149 @@ def best_local_fit(ctx=4096, limit=6):
 
 
 def route_task(cfg, task):
-    t = (task or "").lower()
-    rt = merged_route(cfg)
-    gpu = gpu_info()
-    local_ok = detect_ollama()["running"]
-    if any(k in t for k in rt["private"]):
-        if local_ok:
-            rec = "Ollama (local, free, private)"
-        else:
-            rec = "start a local runtime first: lmm serve <model>"
-    elif any(k in t for k in rt["heavy"]):
-        rec = "Claude Code (remote, paid) — best for coding/design"
+    """Where `task` will actually go, decided by the SAME engine `lmm ask` uses.
+
+    This was an independent keyword+GPU heuristic wired straight to Ollama, and
+    it knew nothing about `providers`, `ask_order` or `route_threshold`. So with
+    an ask_order set and no Ollama running, `lmm route` recommended one thing on
+    its first line and reported the real decision on its last — two lines of the
+    same output flatly contradicting each other. It now reports the head of the
+    order that order_targets produces, so they cannot disagree.
+    """
+    targets = resolve_ask_targets(cfg, task, None)
+    if not targets:
+        if is_private(cfg, task):
+            return ("start a local runtime first — this task matches a private "
+                    "keyword: lmm serve <model>")
+        return ("no provider available — start Ollama (`lmm serve <model>`) or "
+                "add 'providers' to your config (see `lmm examples`)")
+
+    name, prov = order_targets(cfg, task, targets)[0]
+    why = []
+    if cfg.get("ask_order"):
+        why.append("your ask_order")
+    elif is_private(cfg, task):
+        why.append("private keyword — local pinned")
     else:
-        fit = best_local_fit() if local_ok else None
-        if fit:
-            rec = (f"Ollama {fit['model']} (local, free) — fits in "
-                   f"{fit['gib']:.1f} of {fit['budget_gib']:.1f} GiB free "
-                   f"at {fit['ctx']:,} ctx")
-        elif gpu and local_ok:
-            rec = ("Claude Code (remote, paid) — no installed local model fits "
-                   f"in {(gpu['total'] - gpu['used']) / 1024.0:.1f} GiB free "
-                   "(see `lmm fit`)")
+        thr = cfg.get("route_threshold", DEFAULT_ROUTE_THRESHOLD)
+        if thr is None:
+            why.append("auto-routing disabled")
         else:
-            rec = "Claude Code (remote, paid)"
-    return rec
+            score, _ = prompt_strength(cfg, task)
+            why.append("strength %.2f %s threshold %.2f"
+                       % (score, ">=" if score >= thr else "<", thr))
+
+    if prov.get("kind") == "local":
+        why.append("local, free")
+        # Size the model we are actually routing to, not the largest installed
+        # one — a recommendation is only useful if it names something loadable.
+        gpu = gpu_info()
+        spec = ollama_model_info(prov.get("model")) if prov.get("model") else None
+        if spec and gpu:
+            budget = (gpu["total"] - gpu["used"]) / 1024.0
+            est = estimate_vram(spec, 4096)
+            why.append("%s in %.1f of %.1f GiB free at 4,096 ctx"
+                       % ("fits" if est["total_gib"] <= budget else "does NOT fit",
+                          est["total_gib"], budget))
+    else:
+        why.append("remote, paid")
+    return "%s (%s)" % (name, "; ".join(why))
 
 
 # ------------------------------ dashboard -----------------------------------
 def build_dash(cfg):
     items = discover(cfg)
     gpu = gpu_info()
-    cost = cost_report(cfg)
     now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     rows = ""
     for it in items:
         cls = "on" if it["running"] else "off"
         paid = "PAID" if it.get("paid") else "free"
         models = ", ".join(it.get("models", [])) or "-"
+        # `running` means "a window OR a port" — a GUI app with no API and a
+        # headless server look identical under it. `serving` (the port answers)
+        # is the signal that actually decides whether lmm can route to it.
+        serving = "YES" if it.get("serving") else "-"
         rows += (f'<tr class="{cls}"><td>{html.escape(it["name"])}</td>'
                  f'<td>{it["type"]}</td><td>{paid}</td>'
                  f'<td>{"YES" if it["running"] else "no"}</td>'
+                 f'<td>{serving}</td>'
                  f'<td>{it.get("procs", 0)}</td><td>{html.escape(models)}</td>'
                  f'<td>{html.escape(str(it.get("endpoint", "-")))}</td></tr>')
-    cost_html = html.escape(cost).replace("\n", "<br>")
     gpu_html = (f'{gpu["name"]} {gpu["used"]}/{gpu["total"]} MiB ({gpu["pct"]}%)'
                 if gpu else "n/a")
+
+    # Telemetry as structured cards, sharing hub_cost_stats with the text
+    # report. The previous dashboard pasted cost_report()'s entire formatted
+    # text into one <div> — a metered hub deserves numbers, not prose.
+    card_html = ""
+    for label, value, note in dash_cards(cfg):
+        card_html += (f'<div class="card"><div class="clabel">{html.escape(label)}</div>'
+                      f'<div class="cval">{html.escape(value)}</div>'
+                      f'<div class="cnote">{html.escape(note)}</div></div>')
+    summary = html.escape(cost_summary(cfg))
     return f"""<!doctype html><html><head><meta charset="utf-8">
 <title>LMM Dashboard</title><style>
 body{{font-family:system-ui,Segoe UI,Arial;margin:0;background:#0d1117;color:#e6edf3}}
 h1{{padding:16px 20px;margin:0;font-size:18px;background:#161b22;border-bottom:1px solid #30363d}}
 .meta{{padding:8px 20px;color:#8b949e;font-size:13px}}
 .gpu{{padding:8px 20px;color:#7ee787;font-size:13px}}
+.summary{{padding:4px 20px 8px;font-size:13px}}
+.cards{{display:flex;flex-wrap:wrap;gap:12px;margin:12px 2%}}
+.card{{flex:1 1 170px;background:#161b22;border:1px solid #30363d;border-radius:8px;padding:12px 14px}}
+.clabel{{color:#8b949e;font-size:12px}}
+.cval{{color:#7ee787;font-size:20px;font-weight:600;margin:4px 0}}
+.cnote{{color:#8b949e;font-size:11px}}
 table{{border-collapse:collapse;width:96%;margin:12px 2%}}
 th,td{{border:1px solid #30363d;padding:8px 10px;font-size:13px;text-align:left}}
 th{{background:#161b22}}
 tr.on td:first-child{{color:#7ee787}} tr.off{{opacity:.55}}
-.cost{{margin:12px 2%;padding:12px;background:#161b22;border:1px solid #30363d;
-border-radius:6px;font-family:ui-monospace,Consolas,monospace;font-size:12px;
-white-space:pre-wrap}}
 </style></head><body>
 <h1>🧠 LMM — Local/remote Model Manager</h1>
 <div class="meta">generated {now}</div>
 <div class="gpu">GPU: {gpu_html}</div>
+<div class="summary">{summary}</div>
+<div class="cards">{card_html}</div>
 <table><tr><th>Runtime</th><th>Type</th><th>Cost</th><th>Running</th>
-<th>Procs</th><th>Models</th><th>Endpoint</th></tr>
+<th>Serving</th><th>Procs</th><th>Models</th><th>Endpoint</th></tr>
 {rows}</table>
-<div class="cost">{cost_html}</div>
 </body></html>"""
+
+
+def dash_cards(cfg):
+    """Telemetry cards as (label, value, note) rows, from the same
+    hub_cost_stats the text report reads — one aggregation, two renderers."""
+    st = hub_cost_stats()
+    cards = [("Hub spend",
+              f"${st['measured']:,.4f}" if st["calls"] else "$0",
+              f"{st['calls']} metered call(s)" if st["calls"] else "no calls yet")]
+    hits = st["hits"]["exact"] + st["hits"]["semantic"]
+    if hits:
+        cards.append(("Cache savings", f"${st['saved_cache']:,.4f}",
+                      f"{hits} hit(s): {st['hits']['exact']} exact / "
+                      f"{st['hits']['semantic']} semantic"))
+    if st["ttfts"]:
+        cards.append(("Stream TTFT", f"{median(st['ttfts']):.0f} ms p50",
+                      f"p90 {percentile(st['ttfts'], 90):.0f} ms over "
+                      f"{len(st['ttfts'])} stream(s)"))
+    if st["local_calls"]:
+        cards.append(("Local (free)", f"{st['local_calls']} call(s)",
+                      f"{st['local_tokens']:,} tokens run at $0"))
+    if st["est_usd"] or st["partial_usd"]:
+        note = []
+        if st["est_usd"]:
+            note.append(f"${st['est_usd']:,.4f} estimated")
+        if st["partial_usd"]:
+            note.append(f"${st['partial_usd']:,.4f} partial")
+        # kept apart on purpose: a card labelled measured must not hide guesses
+        cards.append(("Not clean measurements", " · ".join(note),
+                      "usage inferred, or stream abandoned mid-flight"))
+    tripped = [n for n in list(HUB_BREAKER._open_until)
+               if HUB_BREAKER.state(n) != "closed"]
+    if tripped:
+        cards.append(("Circuit breaker", f"{len(tripped)} open",
+                      ", ".join(sorted(tripped))))
+    return cards
 
 
 # ------------------------------ commands -----------------------------------
@@ -1887,19 +2032,46 @@ def cmd_status(cfg):
     print("GPU:", gpu["name"] if gpu else "n/a",
           f"({gpu['used']}/{gpu['total']} MiB, {gpu['pct']}%)" if gpu else "")
     print("-" * 64)
-    for it in discover(cfg):
+    # with_models=False: status does not display model lists, so probing every
+    # serving runtime's /v1/models just to discard the result was pure latency.
+    for it in discover(cfg, with_models=False):
         print(f"{it['name']:<32} running={it['running']!s:<5} "
+              f"serving={it.get('serving', False)!s:<5} "
               f"procs={it.get('procs', 0)}")
+    # For a tool whose headline feature is a metered hub, `status` should show
+    # the hub's state, not only the runtimes'.
+    print("-" * 64)
+    print("hub:", cost_summary(cfg))
+    conf = merged_cache(cfg)
+    entries = cache_entries(conf)
+    print(f"cache: {len(entries)} live entries"
+          + (" (semantic on)" if conf.get("semantic") else ""))
+    tripped = [n for n in list(HUB_BREAKER._open_until)
+               if HUB_BREAKER.state(n) != "closed"]
+    if tripped:
+        print("breaker: open ->", ", ".join(sorted(tripped)))
 
 
-def cmd_models():
-    ms = detect_ollama()["models"]
-    if ms:
-        print("Ollama local models:")
+def cmd_models(cfg=None):
+    """Models across EVERY detected runtime, not only Ollama.
+
+    discover() already harvests model lists from any OpenAI-compatible /models
+    endpoint (LM Studio, Jan, KoboldCPP, vLLM, ...), so `lmm discover` showing
+    LM Studio's models while `lmm models` said "no ollama models" was the same
+    tool disagreeing with itself.
+    """
+    found = False
+    for it in discover(cfg or {}, with_models=True):
+        ms = it.get("models") or []
+        if not ms:
+            continue
+        found = True
+        print(f"{it['name']}:")
         for m in ms:
             print("  -", m)
-    else:
-        print("no ollama models (or ollama not running)")
+    if not found:
+        print("no models found on any running runtime "
+              "(start one, e.g. `lmm serve <model>`)")
 
 
 def cmd_fit(model=None, ctx=None, vram=None, kv="f16", as_json=False):
@@ -2163,6 +2335,15 @@ def cmd_dash(cfg):
         pass
 
 
+def prune_seen(seen, live, tick, grace=2):
+    """Forget window handles absent for `grace` ticks. Because Windows recycles
+    HWNDs, a handle we never forget will eventually match a new window that
+    reused it and wrongly skip hiding it. Mutates and returns `seen`."""
+    for hwnd in [h for h, t in seen.items() if h not in live and tick - t > grace]:
+        del seen[hwnd]
+    return seen
+
+
 def cmd_watch(cfg, interval=3.0):
     """Background daemon: automatically strip the taskbar button from any
     newly-spawned LLM-runtime window. This is the root-cause fix (not a
@@ -2173,24 +2354,51 @@ def cmd_watch(cfg, interval=3.0):
         print("watch is currently Windows-only (taskbar is a Windows concept).")
         return
     print(f"[lmm watch] auto-hiding new LLM windows every {interval}s. Ctrl-C to stop.")
-    seen = set()
+    # One sweep per tick, not one per registry entry: sixteen full EnumWindows
+    # passes every few seconds is fifteen too many, and entries with no titles
+    # were enumerating the whole desktop just to match nothing. cfg-defined
+    # extra_runtimes participate too — cmd_stop already treats them as first
+    # class, and the daemon should agree.
+    watchlist = []                       # (runtime name, lowercase keyword)
+    for rt, entry in RUNTIME_REGISTRY.items():
+        for kw in entry.get("titles", []):
+            watchlist.append((rt, kw.lower()))
+    for e in (cfg or {}).get("extra_runtimes", []):
+        for kw in e.get("titles", []) or [e.get("name", "")]:
+            if kw:
+                watchlist.append((e.get("name", "?"), kw.lower()))
+    all_keywords = [kw for _, kw in watchlist]
+    # HWND -> last tick seen. Windows RECYCLES window handles, so a plain
+    # ever-growing "seen" set eventually swallows a brand-new window that
+    # happens to reuse an old handle — the daemon silently stops working in
+    # exactly the always-on scenario `lmm autostart` sets up. Entries that
+    # vanish from the enumeration are dropped so a recycled handle counts as
+    # new again.
+    seen = {}
+    tick = 0
     try:
         while True:
-            for rt, entry in RUNTIME_REGISTRY.items():
-                for hwnd, title in _enum_windows_by_title(entry.get("titles", [])):
-                    if hwnd in seen:
-                        continue
-                    seen.add(hwnd)
-                    try:
-                        user32 = ctypes.windll.user32
-                        ex = user32.GetWindowLongW(hwnd, GWL_EXSTYLE)
-                        new_ex = (ex | WS_EX_TOOLWINDOW) & ~WS_EX_APPWINDOW
-                        if new_ex != ex:
-                            user32.SetWindowLongW(hwnd, GWL_EXSTYLE, new_ex)
-                            print(f"  auto-hidden '{rt}' window: {title!r}")
-                    except Exception:
-                        pass
-            import time
+            tick += 1
+            current = _enum_windows_by_title(all_keywords)
+            live = set()
+            for hwnd, title in current:
+                live.add(hwnd)
+                if hwnd in seen:
+                    seen[hwnd] = tick
+                    continue
+                seen[hwnd] = tick
+                low = title.lower()
+                rt = next((r for r, kw in watchlist if kw in low), "?")
+                try:
+                    user32 = ctypes.windll.user32
+                    ex = user32.GetWindowLongW(hwnd, GWL_EXSTYLE)
+                    new_ex = (ex | WS_EX_TOOLWINDOW) & ~WS_EX_APPWINDOW
+                    if new_ex != ex:
+                        user32.SetWindowLongW(hwnd, GWL_EXSTYLE, new_ex)
+                        print(f"  auto-hidden '{rt}' window: {title!r}")
+                except Exception:
+                    pass
+            prune_seen(seen, live, tick)
             time.sleep(interval)
     except KeyboardInterrupt:
         print("\n[lmm watch] stopped.")
@@ -2205,6 +2413,13 @@ def cmd_autostart():
       Linux-> systemd --user
     Falls back to Task Scheduler only on Windows if the Startup shortcut fails.
     """
+    if os.name != "nt":
+        # `watch` exits immediately off-Windows, but launchd KeepAlive and
+        # systemd Restart=always would restart it forever — registering a
+        # service whose only behaviour is a restart loop. Refuse instead.
+        print("autostart registers `lmm watch`, which is Windows-only "
+              "(the taskbar is a Windows concept). Nothing to register here.")
+        return
     me = os.path.abspath(__file__)
     python_exe = sys.executable
     if os.name == "nt":
@@ -2239,47 +2454,6 @@ def cmd_autostart():
             print("autostart registration failed. Manual option: copy this to your "
                   "Startup folder as a shortcut:\n"
                   f'  {python_exe} "{me}" watch')
-    elif sys.platform == "darwin":
-        plist = os.path.join(HOME, "Library", "LaunchAgents",
-                             "com.lmm.watch.plist")
-        content = f"""<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0"><dict>
-  <key>Label</key><string>com.lmm.watch</string>
-  <key>ProgramArguments</key><array>
-    <string>{python_exe}</string><string>{me}</string><string>watch</string>
-  </array>
-  <key>RunAtLoad</key><true/>
-  <key>KeepAlive</key><true/>
-</dict></plist>"""
-        try:
-            os.makedirs(os.path.dirname(plist), exist_ok=True)
-            with open(plist, "w") as f:
-                f.write(content)
-            run(f"launchctl load {plist}")
-            print(f"registered lmm watch with launchd: {plist}")
-        except Exception as e:
-            print("launchd registration failed:", e)
-    else:
-        # Linux systemd --user
-        unit = os.path.join(HOME, ".config", "systemd", "user", "lmm-watch.service")
-        content = f"""[Unit]
-Description=lmm watch - auto-hide LLM taskbar windows
-[Service]
-ExecStart={python_exe} {me} watch
-Restart=always
-[Install]
-WantedBy=default.target
-"""
-        try:
-            os.makedirs(os.path.dirname(unit), exist_ok=True)
-            with open(unit, "w") as f:
-                f.write(content)
-            run("systemctl --user daemon-reload")
-            run("systemctl --user enable --now lmm-watch.service")
-            print(f"registered lmm watch with systemd --user: {unit}")
-        except Exception as e:
-            print("systemd registration failed:", e)
 
 
 def launch_gui(cfg):
@@ -2319,9 +2493,10 @@ def launch_gui(cfg):
     cost_label.pack(side="right", padx=12)
 
     # --- runtime table ---------------------------------------------------
-    cols = ("Runtime", "Type", "Cost", "Running", "Procs", "Models", "Endpoint")
+    cols = ("Runtime", "Type", "Cost", "Running", "Serving", "Procs", "Models",
+            "Endpoint")
     tree = ttk.Treeview(root, columns=cols, show="headings", height=12)
-    widths = (170, 70, 60, 70, 60, 220, 200)
+    widths = (170, 70, 60, 70, 66, 60, 200, 190)
     for c, w in zip(cols, widths):
         tree.heading(c, text=c)
         tree.column(c, width=w, anchor="w")
@@ -2337,9 +2512,9 @@ def launch_gui(cfg):
     rt_cb.pack(side="left", padx=4)
     ttk.Label(bar, text="Model:").pack(side="left")
     mdl_var = tk.StringVar()
-    mdl_cb = ttk.Combobox(bar, textvariable=mdl_var, width=22,
-                          values=["qwen2.5-coder:7b", "qwen2.5-coder:14b",
-                                  "llama3.1:8b", "mistral:7b"])
+    # Populated from discover() on each refresh — the list used to be four
+    # hardcoded Ollama tags, stale the day they were written.
+    mdl_cb = ttk.Combobox(bar, textvariable=mdl_var, width=22, values=[])
     mdl_cb.pack(side="left", padx=4)
 
     def act(fn_name):
@@ -2378,7 +2553,7 @@ def launch_gui(cfg):
         the window for the duration of every refresh."""
         gpu = gpu_info()
         try:
-            cost_line = cost_report(cfg).splitlines()[-1]
+            cost_line = cost_summary(cfg)
         except Exception:
             cost_line = ""
         return gpu, cost_line, discover(cfg)
@@ -2396,16 +2571,22 @@ def launch_gui(cfg):
             cost_label.config(text=cost_line)
         for row in tree.get_children():
             tree.delete(row)
+        all_models = []
         for it in items:
             tag = "on" if it["running"] else "off"
             tree.insert("", "end", values=(
                 it["name"], it["type"],
                 "PAID" if it.get("paid") else "free",
                 "YES" if it["running"] else "no",
+                "YES" if it.get("serving") else "-",
                 it.get("procs", 0),
                 ", ".join(it.get("models", [])) or "-",
                 str(it.get("endpoint", "-")),
             ), tags=(tag,))
+            all_models.extend(it.get("models") or [])
+        # keep the user's typed value; only refresh the dropdown choices
+        if all_models:
+            mdl_cb.configure(values=sorted(set(all_models)))
         tree.tag_configure("on", foreground="#1b5e20")
         tree.tag_configure("off", foreground="#9e9e9e")
 
@@ -3383,10 +3564,17 @@ def cmd_bench(cfg, provider=None, runs=3, prompt=None, max_tokens=128):
           "over the measured runs.")
 
 
-def cmd_cache(clear=False):
+def cmd_cache(cfg=None, clear=False):
     """Inspect or drop the prompt cache. The near-miss similarities are the
     evidence for tuning cache.similarity — vCache (arXiv:2502.03771) makes the
-    case that a static threshold picked blind is not safe."""
+    case that a static threshold picked blind is not safe.
+
+    It reads the EFFECTIVE config, not the defaults: showing `threshold 0.95` to
+    someone who set 0.85 gave them the wrong evidence for the one decision this
+    command exists to support, and expiry was judged against the default TTL
+    rather than theirs.
+    """
+    conf = merged_cache(cfg or {})
     if clear:
         try:
             if os.path.isfile(CACHE_LOG):
@@ -3395,8 +3583,13 @@ def cmd_cache(clear=False):
         except OSError as e:
             print(f"[cache] could not clear: {e}")
         return
-    entries = cache_entries(DEFAULT_CACHE)
+    entries = cache_entries(conf)
     print(f"[cache] {CACHE_LOG}")
+    print(f"[cache] enabled={conf.get('enabled')} semantic={conf.get('semantic')} "
+          f"similarity={conf.get('similarity')} ttl_hours={conf.get('ttl_hours')} "
+          f"max_entries={conf.get('max_entries')}")
+    if conf.get("semantic"):
+        print(f"[cache] embed model: {conf.get('embed_model')} (local Ollama)")
     print(f"[cache] {len(entries)} live entries, "
           f"{sum(1 for e in entries if e.get('emb'))} with embeddings")
     if entries:
@@ -3417,7 +3610,7 @@ def cmd_cache(clear=False):
     if sims:
         print(f"[cache] near-miss similarity: max={max(sims):.3f} "
               f"avg={sum(sims) / len(sims):.3f} "
-              f"(threshold {DEFAULT_CACHE['similarity']})")
+              f"(threshold {conf.get('similarity')})")
 
 
 
@@ -3477,7 +3670,7 @@ def main():
     sub.add_parser("examples")
     args = ap.parse_args()
     if args.version:
-        print("lmm 1.0.0")
+        print(f"lmm {VERSION}")
         return
     cfg = load_config()
     # No subcommand -> launch the live GUI dashboard. Visibility of system
@@ -3491,7 +3684,7 @@ def main():
     elif cmd == "status":
         cmd_status(cfg)
     elif cmd == "models":
-        cmd_models()
+        cmd_models(cfg)
     elif cmd == "cost":
         print(cost_report(cfg, args.days or None))
     elif cmd == "route":
@@ -3524,7 +3717,7 @@ def main():
     elif cmd == "fit":
         cmd_fit(args.model, args.ctx, args.vram, args.kv, getattr(args, "json", False))
     elif cmd == "cache":
-        cmd_cache(getattr(args, "clear", False))
+        cmd_cache(cfg, getattr(args, "clear", False))
     elif cmd == "examples":
         cmd_examples()
 

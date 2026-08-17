@@ -1,5 +1,6 @@
 # lmm — Local/remote Model Manager
 
+
 > One file. Zero dependencies. Every LLM app on your machine, in one place —
 > and it never clutters your taskbar.
 
@@ -41,8 +42,8 @@ Requires only Python 3.8+ (tkinter optional, for the GUI). No `pip install`.
 lmm                 -> open the live GUI dashboard (default)
 lmm discover        -> list every detected runtime (CLI)
 lmm cli             -> same as discover (explicit CLI mode)
-lmm status          -> live status + GPU memory
-lmm models          -> local models installed (Ollama)
+lmm status          -> runtimes + GPU + hub/cache/breaker summary
+lmm models          -> models on every running runtime
 lmm cost [--days N] -> measured spend: Anthropic logs + lmm's own hub telemetry
 lmm route "task"    -> recommend local vs remote (--explain for the score)
 lmm fit [model]     -> does it fit in your GPU, and at what context length?
@@ -365,7 +366,7 @@ Two append-only JSONL files under `~/.lmm/`, both plain text you can `cat`:
 Still no secrets: API keys live in your config, are used, and are never copied
 into either file.
 
-## Tests
+## Tests & CI
 
 ```bash
 python3 -m unittest discover -s tests -v
@@ -374,6 +375,22 @@ python3 -m unittest discover -s tests -v
 Stdlib `unittest`, no network, no fixtures to install — the same
 zero-dependency rule the tool follows. `lmm.py` stays a single distributable
 file; the tests live outside it.
+
+A GitHub Actions workflow is provided at **`ci/github-actions-ci.yml`**. To
+enable it, move it into place (it has to live under `.github/workflows/` to
+run):
+
+```bash
+mkdir -p .github/workflows
+git mv ci/github-actions-ci.yml .github/workflows/ci.yml
+git commit -m "ci: enable GitHub Actions" && git push
+```
+
+It runs the full suite on Python 3.8 through 3.13 (3.8 being the floor this
+README promises), a zero-config smoke test of every command, a check that
+`config.example.json` matches `lmm examples` output, and a mechanical
+assertion that every import in `lmm.py` resolves to the standard library — so
+the zero-dependency claim is enforced, not just stated.
 
 ## How it works
 

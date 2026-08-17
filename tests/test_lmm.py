@@ -1503,19 +1503,218 @@ class TestBreakerInHub(unittest.TestCase):
         self.assertTrue(cb.available("good", now=time.time()))
 
 
+class TestHubCostStats(unittest.TestCase):
+    """The one aggregation the text report, dashboard and status all share."""
+
+    def seed(self):
+        lmm.log_usage({"provider": "p", "kind": "remote", "in": 100, "out": 200,
+                       "usd": 1.0, "cache": "miss", "stream": True, "ttft_ms": 80})
+        lmm.log_usage({"provider": "p", "kind": "remote", "in": 100, "out": 200,
+                       "usd": 2.0, "cache": "miss", "estimated": True})
+        lmm.log_usage({"provider": "loc", "kind": "local", "in": 50, "out": 50,
+                       "usd": 0.0, "cache": "miss"})
+        lmm.log_usage({"provider": "cache", "kind": "local", "in": 0, "out": 0,
+                       "usd": 0.0, "cache": "exact", "saved_usd": 1.5})
+        lmm.log_usage({"provider": "cache", "kind": "local", "in": 0, "out": 0,
+                       "usd": 0.0, "cache": "near-miss", "similarity": 0.9})
+
+    def test_aggregation(self):
+        with temp_state():
+            self.seed()
+            st = lmm.hub_cost_stats()
+        self.assertEqual(st["calls"], 3)             # near-miss/hit are not calls
+        self.assertAlmostEqual(st["measured"], 3.0)
+        self.assertAlmostEqual(st["est_usd"], 2.0)
+        self.assertEqual(st["hits"]["exact"], 1)
+        self.assertAlmostEqual(st["saved_cache"], 1.5)
+        self.assertEqual(st["local_calls"], 1)
+        self.assertEqual(st["ttfts"], [80.0])
+
+    def test_empty_log_yields_zeroes(self):
+        with temp_state():
+            st = lmm.hub_cost_stats()
+        self.assertEqual(st["calls"], 0)
+        self.assertEqual(st["measured"], 0.0)
+
+    def test_cost_summary_is_one_line_and_honest(self):
+        # The GUI shows this verbatim; it must never be a paragraph, and it
+        # must not surface the illustrative cross-provider estimates.
+        with temp_state():
+            self.seed()
+            line = lmm.cost_summary({})
+        self.assertNotIn("\n", line)
+        self.assertIn("hub $", line)
+        self.assertIn("cache saved", line)
+        self.assertNotIn("~$", line)                 # no illustrative estimates
+
+    def test_cost_summary_with_no_data_is_a_short_hint(self):
+        with temp_state():
+            line = lmm.cost_summary({})
+        self.assertNotIn("\n", line)
+        self.assertIn("no measured spend", line)
+
+    def test_dash_cards_render_from_the_same_stats(self):
+        with temp_state():
+            self.seed()
+            cards = lmm.dash_cards({})
+        labels = [c[0] for c in cards]
+        self.assertIn("Hub spend", labels)
+        self.assertIn("Cache savings", labels)
+        self.assertIn("Stream TTFT", labels)
+        self.assertIn("Not clean measurements", labels)
+        for label, value, note in cards:
+            self.assertIsInstance(value, str)
+            self.assertIsInstance(note, str)
+
+    def test_build_dash_produces_html_with_serving_column(self):
+        saved = lmm.discover
+        lmm.discover = lambda cfg, with_models=True: [
+            {"name": "X", "key": "x", "type": "local", "paid": False,
+             "running": True, "serving": True, "procs": 1,
+             "models": ["m1"], "endpoint": "http://localhost:1/v1",
+             "installed": True}]
+        try:
+            with temp_state():
+                h = lmm.build_dash({})
+        finally:
+            lmm.discover = saved
+        self.assertTrue(h.startswith("<!doctype"))
+        self.assertIn("<th>Serving</th>", h)
+        self.assertIn("m1", h)
+
+
+class TestRouteUnified(unittest.TestCase):
+    """`lmm route` must give ONE answer — the head of the order the ask engine
+    actually uses — not an independent heuristic that can contradict it."""
+
+    def setUp(self):
+        self._ollama = lmm.local_ollama_provider
+        lmm.local_ollama_provider = lambda: None     # no implicit Ollama
+
+    def tearDown(self):
+        lmm.local_ollama_provider = self._ollama
+
+    def cfg(self):
+        return {"ask_order": ["openai"],
+                "providers": {"openai": {"api_key": "k", "model": "gpt-4o",
+                                         "kind": "remote"}}}
+
+    def test_recommendation_is_the_head_of_the_real_order(self):
+        cfg = lmm.load_config() if False else self.cfg()
+        rec = lmm.route_task(cfg, "summarize this document")
+        targets = lmm.resolve_ask_targets(cfg, "summarize this document", None)
+        head = lmm.order_targets(cfg, "summarize this document", targets)[0][0]
+        self.assertTrue(rec.startswith(head), rec)   # cannot contradict
+
+    def test_ask_order_is_named_as_the_reason(self):
+        rec = lmm.route_task(self.cfg(), "hello")
+        self.assertIn("ask_order", rec)
+
+    def test_no_providers_says_so(self):
+        rec = lmm.route_task({}, "hello")
+        self.assertIn("no provider available", rec)
+
+    def test_private_with_no_local_says_start_one(self):
+        rec = lmm.route_task({}, "summarize this secret memo")
+        self.assertIn("private", rec)
+        self.assertIn("lmm serve", rec)
+
+
+class TestPruneSeen(unittest.TestCase):
+    """Windows recycles HWNDs; an ever-growing 'seen' set eventually swallows
+    brand-new windows that reuse an old handle."""
+
+    def test_absent_handles_are_forgotten_after_the_grace(self):
+        seen = {100: 1, 200: 1}
+        lmm.prune_seen(seen, live={200}, tick=4, grace=2)
+        self.assertNotIn(100, seen)                  # gone 3 ticks: forgotten
+        self.assertIn(200, seen)
+
+    def test_recently_absent_handles_survive_the_grace(self):
+        seen = {100: 3}
+        lmm.prune_seen(seen, live=set(), tick=4, grace=2)
+        self.assertIn(100, seen)                     # only 1 tick gone
+
+    def test_live_handles_are_never_pruned(self):
+        seen = {100: 0}
+        lmm.prune_seen(seen, live={100}, tick=99, grace=2)
+        self.assertIn(100, seen)
+
+
+class TestPresentationSurfaces(unittest.TestCase):
+    def test_extra_runtimes_share_the_detect_runtime_shape(self):
+        # Consumers iterate discover() and must not care which detector made
+        # an item; extra runtimes lacked `key` and `serving`.
+        saved = lmm.proc_count
+        lmm.proc_count = lambda names: 1
+        try:
+            got = lmm.detect_extra({"extra_runtimes": [
+                {"name": "My Agent", "procs": ["x"], "installed_paths": []}]})
+        finally:
+            lmm.proc_count = saved
+        self.assertEqual(got[0]["key"], "my-agent")
+        self.assertTrue(got[0]["serving"])
+        for field in ("name", "key", "type", "paid", "running", "serving",
+                      "procs", "models", "endpoint", "installed"):
+            self.assertIn(field, got[0])
+
+    def test_cmd_cache_reports_the_effective_config(self):
+        import io
+        import contextlib
+        cfg = {"cache": {"similarity": 0.8, "ttl_hours": 1}}
+        buf = io.StringIO()
+        with temp_state():
+            with contextlib.redirect_stdout(buf):
+                lmm.cmd_cache(cfg)
+        out = buf.getvalue()
+        self.assertIn("similarity=0.8", out)
+        self.assertIn("ttl_hours=1", out)
+        self.assertNotIn("0.95", out)                # not the default
+
+    def test_cmd_models_lists_every_runtime_with_models(self):
+        import io
+        import contextlib
+        saved = lmm.discover
+        lmm.discover = lambda cfg, with_models=True: [
+            {"name": "LM Studio", "models": ["phi-4"]},
+            {"name": "Ollama", "models": []},
+            {"name": "Jan", "models": ["jan-nano"]}]
+        buf = io.StringIO()
+        try:
+            with contextlib.redirect_stdout(buf):
+                lmm.cmd_models({})
+        finally:
+            lmm.discover = saved
+        out = buf.getvalue()
+        self.assertIn("LM Studio", out)
+        self.assertIn("phi-4", out)
+        self.assertIn("jan-nano", out)
+        self.assertNotIn("Ollama:", out)             # nothing to list there
+
+    def test_version_constant_is_wired(self):
+        self.assertRegex(lmm.VERSION, r"^\d+\.\d+\.\d+$")
+        self.assertNotEqual(lmm.VERSION, "1.0.0")
+
+
 class temp_state(object):
     """Point lmm's usage log and cache at a throwaway directory."""
 
     def __enter__(self):
         self.dir = tempfile.mkdtemp(prefix="lmm-test-")
-        self.saved = (lmm.LMM_DIR, lmm.USAGE_LOG, lmm.CACHE_LOG)
+        self.saved = (lmm.LMM_DIR, lmm.USAGE_LOG, lmm.CACHE_LOG,
+                      lmm.CLAUDE_PROJECTS)
         lmm.LMM_DIR = self.dir
         lmm.USAGE_LOG = os.path.join(self.dir, "usage.jsonl")
         lmm.CACHE_LOG = os.path.join(self.dir, "cache.jsonl")
+        # Also point the Anthropic session-log reader at the sandbox: without
+        # this, cost assertions pick up whatever ~/.claude happens to contain
+        # on the machine running the tests.
+        lmm.CLAUDE_PROJECTS = os.path.join(self.dir, "claude-projects")
         return self
 
     def __exit__(self, *exc):
-        lmm.LMM_DIR, lmm.USAGE_LOG, lmm.CACHE_LOG = self.saved
+        (lmm.LMM_DIR, lmm.USAGE_LOG, lmm.CACHE_LOG,
+         lmm.CLAUDE_PROJECTS) = self.saved
         for name in ("usage.jsonl", "cache.jsonl"):
             try:
                 os.remove(os.path.join(self.dir, name))

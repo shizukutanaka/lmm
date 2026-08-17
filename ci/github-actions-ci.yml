@@ -1,0 +1,93 @@
+name: ci
+
+# Move this file to .github/workflows/ci.yml to enable it — GitHub only runs
+# workflows from that directory. See the "Tests & CI" section of the README.
+#
+# lmm is a single zero-dependency file, so CI needs no install step and no
+# cache — it exists to enforce two claims the README makes: the test suite
+# passes, and the tool really does run on Python 3.8+.
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # 3.8 is the floor the README promises; the newest entry catches
+        # deprecations before they become breakage.
+        python-version: ["3.8", "3.9", "3.10", "3.11", "3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Byte-compile
+        run: python -m py_compile lmm.py
+
+      - name: Unit tests
+        run: python -m unittest discover -s tests -v
+
+      - name: Zero-config smoke test
+        # Every command must exit 0 with no config file present. This is the
+        # promise that `lmm` works before you have configured anything, and it
+        # is the regression that a unit test cannot catch.
+        env:
+          HOME: ${{ runner.temp }}/lmm-empty
+        run: |
+          mkdir -p "$HOME"
+          set -e
+          for cmd in "--version" "discover" "discover --json" "cli" "status" \
+                     "models" "cost" "cost --days 7" "route hi" \
+                     "route --explain hi" "fit --vram 8" "bench" "cache" \
+                     "examples"; do
+            echo "--- lmm $cmd"
+            python lmm.py $cmd > /dev/null
+          done
+
+      - name: Config example is in sync with `lmm examples`
+        # cmd_examples() is the source of truth; config.example.json is
+        # generated from it. They drifted once already.
+        env:
+          HOME: ${{ runner.temp }}/lmm-empty
+        run: |
+          python lmm.py examples > /tmp/generated.json
+          python -c "import json; json.load(open('/tmp/generated.json'))"
+          diff -u config.example.json /tmp/generated.json
+
+  no-dependencies:
+    # The headline claim is "zero dependencies". Assert it mechanically rather
+    # than trusting the README.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Every import resolves to the standard library
+        run: |
+          python - <<'PY'
+          import ast, sys, pathlib
+          src = pathlib.Path("lmm.py").read_text(encoding="utf-8")
+          names = set()
+          for node in ast.walk(ast.parse(src)):
+              if isinstance(node, ast.Import):
+                  names.update(a.name.split(".")[0] for a in node.names)
+              elif isinstance(node, ast.ImportFrom) and node.level == 0 and node.module:
+                  names.add(node.module.split(".")[0])
+          stdlib = getattr(sys, "stdlib_module_names", None)
+          assert stdlib, "needs Python 3.10+ to introspect the stdlib list"
+          extra = sorted(n for n in names if n not in stdlib and n != "lmm")
+          print("imports:", ", ".join(sorted(names)))
+          if extra:
+              sys.exit("non-stdlib imports found: %s" % extra)
+          print("all imports are stdlib")
+          PY
