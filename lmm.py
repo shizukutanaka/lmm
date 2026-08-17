@@ -416,6 +416,86 @@ def pick_provider_for_task(cfg, task, provs):
     return next(iter(provs), None)
 
 
+def _model_size_b(name):
+    """Extract approximate model size in billions from a model id, else None."""
+    import re
+    m = re.search(r"(\d+(?:\.\d+)?)\s*b", (name or "").lower())
+    return float(m.group(1)) if m else None
+
+
+def backend_catalog(cfg):
+    """Build a catalog of every routable backend WITH measured capability
+    signals (size in B params, local/remote, paid). This is the first-principles
+    view: we route on *measured ability*, not on a static priority list."""
+    targets = resolve_ask_targets(cfg, "", None)
+    cat = []
+    for name, prov in targets:
+        size = _model_size_b(prov.get("model"))
+        cat.append({
+            "name": name,
+            "model": prov.get("model"),
+            "size_b": size,
+            "kind": prov.get("kind", "remote"),
+            "paid": (prov.get("kind") == "remote"),
+            "base_url": prov.get("base_url"),
+        })
+    return cat
+
+
+def score_and_route(task, cfg, ask_order=None):
+    """First-principles routing: MEASURE the task, match to MEASURED backend
+    ability. ask_order is a *tie-breaker weight*, not a blind master.
+
+    Returns (backend_name, reason) or (None, reason)."""
+    t = (task or "").lower()
+    cat = backend_catalog(cfg)
+    cat = [c for c in cat if c["base_url"]]  # only reachable backends
+    if not cat:
+        return None, "no reachable backend"
+    # task signals
+    words = len(t.split())
+    heavy = any(k in t for k in
+                ["explain", "derive", "proof", "quantum", "analyze", "design",
+                 "architecture", "research", "compare", "why", "理由", "説明",
+                 "設計", "解析", "比較", "導出", "証明", "考察"])
+    code = any(k in t for k in
+               ["code", "function", "bug", "refactor", "クラス", "関数",
+                "コード", "実装", "デバッグ", "write a", "def ", "```"])
+    is_private = any(k in t for k in
+                    merged_route(cfg).get("private", []) + ["secret", "社内"])
+    # score each backend
+    scored = []
+    for c in cat:
+        s = 0.0
+        size = c["size_b"]
+        if size is None:
+            size = 8.0 if c["kind"] == "remote" else 3.0  # cloud=big, unknown local=mid
+        # ability vs task difficulty
+        if heavy:
+            s += min(size, 70) / 7.0          # bigger model -> much better at hard tasks
+        else:
+            s += 1.0                          # light task: any model fine
+        if code and "coder" in (c["model"] or "").lower():
+            s += 2.0                          # code-tuned model bonus
+        if is_private and c["kind"] == "local":
+            s += 3.0                          # privacy prefers local
+        if c["kind"] == "local" and not c["paid"]:
+            s += 0.5                          # free is nice
+        # ask_order as a tie-breaker weight (priority respected, not obeyed)
+        if ask_order:
+            try:
+                idx = ask_order.index(c["name"])
+                s += max(0, (len(ask_order) - idx)) * 0.1
+            except ValueError:
+                pass
+        scored.append((s, c))
+    scored.sort(key=lambda x: -x[0])
+    best = scored[0][1]
+    return best["name"], f"score={scored[0][0]:.1f} size={best['size_b']}b " \
+                         f"task={'heavy' if heavy else 'light'}" \
+                         f"{'/code' if code else ''}{'/private' if is_private else ''}"
+
+
 # ----------------------------- detectors -----------------------------------
 def detect_ollama():
     r = run("ollama list")
@@ -1579,6 +1659,11 @@ def launch_gui(cfg):
                    if it["running"] and it["name"] != "-"]
         prov_cb["values"] = ["auto (priority order)"] + running
 
+    auto_var = tk.BooleanVar(value=True)
+    auto_chk = ttk.Checkbutton(sel_row, text="auto-route (measure task)",
+                               variable=auto_var)
+    auto_chk.pack(side="left", padx=8)
+
     ask_in = ttk.Entry(askf)
     ask_in.pack(fill="x", pady=(0, 4))
 
@@ -1592,13 +1677,14 @@ def launch_gui(cfg):
             return
         sel = prov_var.get()
         explicit = None if sel.startswith("auto") else sel
+        use_auto = auto_var.get() and sel.startswith("auto")
         ask_out.config(state="normal")
         ask_out.insert("end", f"you> {prompt}\n")
         ask_out.config(state="disabled")
         ask_in.delete(0, "end")
 
         def worker():
-            reply = gui_ask(prompt, cfg, explicit=explicit)
+            reply = gui_ask(prompt, cfg, explicit=explicit, auto=use_auto)
             ask_out.config(state="normal")
             ask_out.insert("end", f"{reply}\n\n")
             ask_out.see("end")
@@ -1801,11 +1887,22 @@ def resolve_ask_targets(cfg, prompt, explicit):
 
 
 
-def cmd_ask(prompt, provider, cfg):
+def cmd_ask(prompt, provider, cfg, auto=False):
     """Unified inference with auto-routing + fallback: tries providers in order
-    (explicit > private/local > configured > implicit running Ollama) and
-    falls through to the next on error. This is the hub's intelligence. Priority is set by cfg['ask_order']. Responses stream token-by-token."""
-    targets = resolve_ask_targets(cfg, prompt, provider)
+    (explicit > auto-score > private/local > configured > implicit running Ollama)
+    and falls through to the next on error. This is the hub's intelligence.
+    With auto=True, the FIRST target is chosen by MEASURED task-vs-backend fit
+    (first-principles routing), not the static ask_order alone.
+    Responses stream token-by-token."""
+    effective = provider
+    if auto and not provider:
+        best, reason = score_and_route(prompt, cfg, cfg.get("ask_order"))
+        if best:
+            print(f"[ask] auto-routed: {reason}")
+            effective = best
+        else:
+            print(f"[ask] auto-routing skipped: {reason}")
+    targets = resolve_ask_targets(cfg, prompt, effective)
     if not targets:
         print("[ask] no provider available. Start Ollama (`lmm serve <model>`) "
               "or add 'providers' to lmm config (see `lmm examples`).")
@@ -1842,12 +1939,19 @@ def cmd_ask(prompt, provider, cfg):
     print(f"[ask] all providers failed. last error: {last_err}")
 
 
-def gui_ask(prompt, cfg, explicit=None):
+def gui_ask(prompt, cfg, explicit=None, auto=False):
     """Non-streaming ask for the GUI: routes by ask_order (priority), returns
     the first successful reply text, or an error string. Never prints; the GUI
     owns the display. If `explicit` (a backend name) is given, that backend is
-    used directly (user pinned it in the GUI)."""
-    targets = resolve_ask_targets(cfg, prompt, explicit)
+    used directly (user pinned it in the GUI). If `auto` is True and no
+    explicit backend is pinned, the backend is chosen by measured task fit."""
+    effective = explicit
+    if auto and not explicit:
+        best, reason = score_and_route(prompt, cfg, cfg.get("ask_order"))
+        if best:
+            effective = best
+            prompt = f"[auto: {reason}]\n{prompt}"
+    targets = resolve_ask_targets(cfg, prompt, effective)
     if not targets:
         return "[ask] no provider available. Run `lmm discover --save` first."
     last_err = None
@@ -2188,6 +2292,8 @@ def main():
     p = sub.add_parser("ask")
     p.add_argument("prompt", nargs="*")
     p.add_argument("--provider", default=None, help="provider name from config")
+    p.add_argument("--auto", action="store_true",
+                   help="route by measured task fit (first-principles), not static ask_order")
     sub.add_parser("examples")
     args = ap.parse_args()
     if args.version:
@@ -2241,7 +2347,8 @@ def main():
     elif cmd == "autostart":
         cmd_autostart()
     elif cmd == "ask":
-        cmd_ask(" ".join(getattr(args, "prompt", [])), getattr(args, "provider", None), cfg)
+        cmd_ask(" ".join(getattr(args, "prompt", [])), getattr(args, "provider", None),
+                cfg, auto=getattr(args, "auto", False))
     elif cmd == "examples":
         cmd_examples()
 
