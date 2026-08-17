@@ -2408,6 +2408,145 @@ def cmd_config(args, cfg):
 
 
 
+def cmd_validate_config(cfg):
+    """Validate ~/.lmm/config.json against the schema lmm actually relies on.
+
+    Prints one `[OK]/[FAIL] <check> -- <detail>` line per check and exits 1 if
+    any check failed, so it is usable as a CI / pre-flight gate. Zero-dep.
+    """
+    errors = []
+
+    def ok(check, detail=""):
+        print(f"[OK] {check} -- {detail}")
+
+    def fail(check, detail=""):
+        print(f"[FAIL] {check} -- {detail}")
+        errors.append(check)
+
+    def is_num(v):
+        return isinstance(v, (int, float)) and not isinstance(v, bool)
+
+    # 1. config is a dict ----------------------------------------------------
+    if not isinstance(cfg, dict):
+        fail("config.type", f"expected dict, got {type(cfg).__name__}")
+        print("config: INVALID (1 error(s))")
+        sys.exit(1)
+    ok("config.type", f"dict with {len(cfg)} top-level key(s)")
+
+    # 2. pricing -------------------------------------------------------------
+    if "pricing" in cfg:
+        pricing = cfg.get("pricing")
+        if not isinstance(pricing, dict):
+            fail("pricing", f"expected dict, got {type(pricing).__name__}")
+        else:
+            bad = []
+            for fam, v in pricing.items():
+                if not isinstance(v, dict):
+                    bad.append(f"{fam}: not a dict")
+                    continue
+                for req in ("in", "out"):
+                    if req not in v:
+                        bad.append(f"{fam}.{req}: missing")
+                    elif not is_num(v[req]):
+                        bad.append(f"{fam}.{req}: not numeric ({v[req]!r})")
+                for opt in ("cw", "cr"):
+                    if opt in v and not is_num(v[opt]):
+                        bad.append(f"{opt}: not numeric ({v[opt]!r})")
+            if bad:
+                fail("pricing", "; ".join(bad))
+            else:
+                ok("pricing", f"{len(pricing)} entry(ies) have numeric in/out")
+    else:
+        ok("pricing", "absent (defaults apply)")
+
+    # 3. providers -----------------------------------------------------------
+    if "providers" in cfg:
+        provs = cfg.get("providers")
+        if not isinstance(provs, dict):
+            fail("providers", f"expected dict, got {type(provs).__name__}")
+        else:
+            bad = []
+            for name, v in provs.items():
+                if not isinstance(v, dict):
+                    bad.append(f"{name}: not a dict")
+                    continue
+                bu = v.get("base_url")
+                if not isinstance(bu, str) or not bu.strip():
+                    bad.append(f"{name}.base_url: missing/not a string")
+                elif not (bu.startswith("http://") or bu.startswith("https://")):
+                    bad.append(f"{name}.base_url: not a url ({bu!r})")
+                mdl = v.get("model")
+                if not isinstance(mdl, str) or not mdl.strip():
+                    bad.append(f"{name}.model: missing/empty")
+                kind = v.get("kind", "remote")
+                if kind not in ("local", "remote"):
+                    bad.append(f"{name}.kind: must be local|remote ({kind!r})")
+            if bad:
+                fail("providers", "; ".join(bad))
+            else:
+                ok("providers", f"{len(provs)} provider(s) well-formed")
+    else:
+        ok("providers", "absent")
+
+    # 4. ask_order -----------------------------------------------------------
+    if "ask_order" in cfg:
+        order = cfg.get("ask_order")
+        if not isinstance(order, list):
+            fail("ask_order", f"expected list, got {type(order).__name__}")
+        else:
+            known = set()
+            for k in merged_providers(cfg):
+                known.add(k.lower())
+            running = []
+            try:
+                for it in discover(cfg):
+                    nm = (it.get("name") or "")
+                    if it.get("running"):
+                        running.append(nm)
+                        known.add(nm.lower())
+            except Exception as e:
+                print(f"[..] ask_order -- discover() failed: {e}")
+            # (implicit local bases surface via discover() running=True)
+            unresolved = [n for n in order
+                          if not (isinstance(n, str) and n.lower() in known)]
+            if unresolved:
+                fail("ask_order",
+                     f"UNRESOLVED: {unresolved} (known providers="
+                     f"{sorted(merged_providers(cfg))}, running={running})")
+            else:
+                ok("ask_order",
+                   f"{len(order)} entry(ies) all resolve (running={running})")
+    else:
+        ok("ask_order", "absent (default order applies)")
+
+    # 5. route ---------------------------------------------------------------
+    if "route" in cfg:
+        route = cfg.get("route")
+        if not isinstance(route, dict):
+            fail("route", f"expected dict, got {type(route).__name__}")
+        else:
+            bad = []
+            for key in ("private", "heavy"):
+                if key not in route:
+                    continue
+                v = route[key]
+                if not isinstance(v, list):
+                    bad.append(f"{key}: expected list, got {type(v).__name__}")
+                elif not all(isinstance(x, str) for x in v):
+                    bad.append(f"{key}: non-string element(s)")
+            if bad:
+                fail("route", "; ".join(bad))
+            else:
+                ok("route", "private/heavy are lists of strings")
+    else:
+        ok("route", "absent (defaults apply)")
+
+    if errors:
+        print(f"config: INVALID ({len(errors)} error(s))")
+        sys.exit(1)
+    print("config: VALID")
+
+
 def main():
     ap = argparse.ArgumentParser(
         description="LMM - Local/remote Model Manager (cross-platform, zero-dep)")
