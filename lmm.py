@@ -1510,6 +1510,77 @@ def launch_gui(cfg):
     ttk.Button(bar, text="⊟ Hide from taskbar", command=lambda: act("hide")).pack(side="left", padx=2)
     ttk.Button(bar, text="⟳ Refresh", command=lambda: refresh()).pack(side="right", padx=2)
 
+    # --- priority panel (manage routing priority: discover -> set -> use) ----
+    prio = ttk.LabelFrame(root, text="Routing priority (ask_order)", padding=6)
+    prio.pack(fill="x", padx=8, pady=4)
+    prio_list = tk.Listbox(prio, height=4, selectmode="single")
+    prio_list.pack(side="left", fill="x", expand=True, padx=(0, 6))
+
+    def prio_load():
+        prio_list.delete(0, "end")
+        for n in (cfg.get("ask_order") or []):
+            prio_list.insert("end", n)
+        if prio_list.size() == 0:
+            prio_list.insert("end", "(empty — run `discover --save`)")
+
+    def prio_move(delta):
+        idx = prio_list.curselection()
+        if not idx:
+            return
+        i = idx[0]
+        j = i + delta
+        if j < 0 or j >= prio_list.size():
+            return
+        items = list(prio_list.get(0, "end"))
+        items[i], items[j] = items[j], items[i]
+        prio_list.delete(0, "end")
+        for n in items:
+            prio_list.insert("end", n)
+
+    def prio_save():
+        items = [prio_list.get(i) for i in range(prio_list.size())
+                 if prio_list.get(i) != "(empty — run `discover --save`)"]
+        cfg["ask_order"] = items
+        save_config(cfg)
+        messagebox.showinfo("LMM", f"saved {len(items)} backend(s) to ask_order")
+        refresh()
+
+    pbtn = ttk.Frame(prio)
+    pbtn.pack(side="right", fill="y")
+    ttk.Button(pbtn, text="▲ Up", width=8, command=lambda: prio_move(-1)).pack(pady=1)
+    ttk.Button(pbtn, text="▼ Down", width=8, command=lambda: prio_move(1)).pack(pady=1)
+    ttk.Button(pbtn, text="💾 Save", width=8, command=prio_save).pack(pady=1)
+
+    # --- ask panel (real use: route by priority, show reply) ----------------
+    askf = ttk.LabelFrame(root, text="Ask (routes by priority)", padding=6)
+    askf.pack(fill="both", expand=True, padx=8, pady=4)
+    ask_in = ttk.Entry(askf)
+    ask_in.pack(fill="x", pady=(0, 4))
+
+    ask_out = tk.Text(askf, height=6, wrap="word", state="disabled",
+                      font=("Consolas", 10))
+    ask_out.pack(fill="both", expand=True)
+
+    def ask_run():
+        prompt = ask_in.get().strip()
+        if not prompt:
+            return
+        ask_out.config(state="normal")
+        ask_out.insert("end", f"you> {prompt}\n")
+        ask_out.config(state="disabled")
+        ask_in.delete(0, "end")
+
+        def worker():
+            reply = gui_ask(prompt, cfg)
+            ask_out.config(state="normal")
+            ask_out.insert("end", f"{reply}\n\n")
+            ask_out.see("end")
+            ask_out.config(state="disabled")
+        threading.Thread(target=worker, daemon=True).start()
+
+    ttk.Button(askf, text="➤ Send", command=ask_run).pack(anchor="e", pady=(2, 0))
+    ask_in.bind("<Return>", lambda e: ask_run())
+
     # --- live refresh ----------------------------------------------------
     def refresh():
         # GPU + cost
@@ -1538,6 +1609,7 @@ def launch_gui(cfg):
             ), tags=(tag,))
         tree.tag_configure("on", foreground="#1b5e20")
         tree.tag_configure("off", foreground="#9e9e9e")
+        prio_load()
 
     refresh()
     # auto-refresh every 5s (visibility of system status, continuously)
@@ -1739,6 +1811,34 @@ def cmd_ask(prompt, provider, cfg):
     log_hub({"event": "ask", "provider": "(all)", "ok": False,
              "error": last_err, "prompt": prompt})
     print(f"[ask] all providers failed. last error: {last_err}")
+
+
+def gui_ask(prompt, cfg):
+    """Non-streaming ask for the GUI: routes by ask_order (priority), returns
+    the first successful reply text, or an error string. Never prints; the GUI
+    owns the display."""
+    targets = resolve_ask_targets(cfg, prompt, None)
+    if not targets:
+        return "[ask] no provider available. Run `lmm discover --save` first."
+    last_err = None
+    for name, prov in targets:
+        r = call_provider(prov, prompt, stream=False)
+        if isinstance(r, dict) and r.get("error"):
+            last_err = r["error"]
+            log_hub({"event": "ask", "provider": name, "ok": False,
+                     "error": last_err, "prompt": prompt, "via": "gui"})
+            continue
+        try:
+            reply = r["choices"][0]["message"]["content"]
+            log_hub({"event": "ask", "provider": name, "ok": True,
+                     "prompt": prompt, "reply": reply[:200], "via": "gui"})
+            return f"[{name}] {reply}"
+        except (KeyError, IndexError, TypeError) as e:
+            last_err = f"bad response: {e}"
+            log_hub({"event": "ask", "provider": name, "ok": False,
+                     "error": last_err, "prompt": prompt, "via": "gui"})
+            continue
+    return f"[ask] all providers failed. last error: {last_err}"
 
 
 def cmd_chat(provider, cfg):
