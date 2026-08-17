@@ -1510,6 +1510,16 @@ def launch_gui(cfg):
     ttk.Button(bar, text="⊟ Hide from taskbar", command=lambda: act("hide")).pack(side="left", padx=2)
     ttk.Button(bar, text="⟳ Refresh", command=lambda: refresh()).pack(side="right", padx=2)
 
+    # --- first-run onboarding: auto-detect priority if none is set ---------
+    # (so a fresh user lands in a working "managed software" without knowing
+    #  the CLI. Visibility of system status + zero-config entry point.)
+    if not cfg.get("ask_order"):
+        _running = [it["name"] for it in discover(cfg)
+                    if it["running"] and it["name"] != "-"]
+        if _running:
+            cfg["ask_order"] = _running
+            save_config(cfg)
+
     # --- priority panel (manage routing priority: discover -> set -> use) ----
     prio = ttk.LabelFrame(root, text="Routing priority (ask_order)", padding=6)
     prio.pack(fill="x", padx=8, pady=4)
