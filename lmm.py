@@ -117,6 +117,15 @@ DEFAULT_CASCADE = {
     "judge":     None,    # provider name for an LLM-as-judge second opinion
 }
 
+# The hub proxies to every configured provider using YOUR api keys. Anyone who
+# can reach it can spend your budget without ever seeing a key, so reachability
+# is the whole security boundary: loopback needs nothing, anything wider needs
+# a shared token.
+DEFAULT_HUB = {
+    "token": None,          # require `Authorization: Bearer <token>` when set
+    "allow_remote": False,  # explicit opt-in to bind beyond loopback tokenless
+}
+
 DEFAULT_CACHE = {
     "enabled":     True,   # tier 1 (exact hash) is safe enough to default on
     "semantic":    False,  # tier 2 needs local embeddings AND accepts fuzzy hits
@@ -282,9 +291,6 @@ RUNTIME_REGISTRY = {
         "appdirs": [], "data": None,
     },
 }
-
-# runtime name -> window-title keywords for hide (derived; editable)
-HIDE_KEYWORDS = {k: v.get("titles", []) for k, v in RUNTIME_REGISTRY.items()}
 
 # Default local API ports, taken from each project's own documentation. These
 # are what turn "the app is installed" into "the app is actually serving" —
@@ -567,19 +573,33 @@ def max_context_for(spec, budget_gib, quant=None, kv_type="f16"):
 
 
 # ------------------------------- config ------------------------------------
+# Where the active config came from, and whether it is the user's own.
+# Deliberately module state rather than a key inside the config: a config file
+# must not be able to declare itself trusted.
+CONFIG_PATH = None
+CONFIG_TRUSTED = True
+
+
 def load_config():
+    """Load the first config found. Home locations are the user's own; a
+    `lmm.config.json` in the working directory is whatever happens to be in
+    the directory you cd'd into, so it is loaded but marked untrusted."""
+    global CONFIG_PATH, CONFIG_TRUSTED
     cands = [
-        os.path.join(HOME, ".lmm", "config.json"),
-        os.path.join(HOME, ".config", "lmm", "config.json"),
-        "lmm.config.json",
+        (os.path.join(HOME, ".lmm", "config.json"), True),
+        (os.path.join(HOME, ".config", "lmm", "config.json"), True),
+        ("lmm.config.json", False),
     ]
-    for c in cands:
+    for c, trusted in cands:
         if os.path.exists(c):
             try:
                 with open(c, encoding="utf-8") as f:
-                    return json.load(f)
+                    cfg = json.load(f)
+                CONFIG_PATH, CONFIG_TRUSTED = c, trusted
+                return cfg
             except Exception:
                 pass
+    CONFIG_PATH, CONFIG_TRUSTED = None, True
     return {}
 
 
@@ -607,6 +627,50 @@ def merged_cache(cfg):
     c = dict(DEFAULT_CACHE)
     c.update(cfg.get("cache") or {})
     return c
+
+
+def merged_hub(cfg):
+    h = dict(DEFAULT_HUB)
+    h.update(cfg.get("hub") or {})
+    return h
+
+
+LOOPBACK_HOSTS = ("127.0.0.1", "localhost", "::1", "")
+
+
+def is_loopback(host):
+    h = (host or "").strip().lower()
+    return h in LOOPBACK_HOSTS or h.startswith("127.")
+
+
+def hub_bind_check(host, hub, make_token=None):
+    """Decide whether the hub may bind `host`. Returns (allowed, lines).
+
+    Reachability is the entire security boundary: the hub holds the user's API
+    keys and will call the providers for whoever asks, so binding beyond
+    loopback without a shared token publishes their budget.
+    """
+    token = hub.get("token") or None
+    if is_loopback(host):
+        if token:
+            return True, ["[hub] token set: clients must send "
+                          "Authorization: Bearer <token>"]
+        return True, []
+    if token:
+        return True, [f"[hub] token required for all requests on {host}"]
+    if hub.get("allow_remote"):
+        return True, [f"[hub] WARNING: bound to {host} with no token "
+                      "(allow_remote). Anyone who can reach this port can "
+                      "spend your API budget."]
+    suggested = make_token() if make_token else "<random-string>"
+    return False, [
+        f"[hub] refusing to bind {host} without a token.",
+        "[hub] The hub calls your providers with your API keys, so anyone",
+        "[hub] who can reach this port can spend your money.",
+        "[hub] Add one of these to your lmm config:",
+        '[hub]   "hub": {"token": "%s"}' % suggested,
+        '[hub]   "hub": {"allow_remote": true}   (only on a network you trust)',
+    ]
 
 
 def merged_providers(cfg):
@@ -884,30 +948,6 @@ def detect_ollama():
     }
 
 
-def detect_lmstudio():
-    ad = app_data()
-    paths = [os.path.join(ad, "LM Studio"), os.path.join(ad, "lmstudio"),
-             os.path.join(HOME, ".lmstudio")]
-    installed = any(os.path.isdir(p) for p in paths)
-    procs = proc_count(["LM Studio.exe", "lmstudio", "lmstudio.exe"])
-    running = procs > 0
-    return {
-        "name": "LM Studio", "type": "local", "paid": False,
-        "running": running, "procs": procs, "models": [],
-        "endpoint": "http://localhost:1234/v1" if running else "-",
-        "installed": installed,
-    }
-
-
-def detect_llamacpp():
-    procs = proc_count(["llama-server.exe", "llama-server", "server.exe", "./server"])
-    return {
-        "name": "llama.cpp server", "type": "local", "paid": False,
-        "running": procs > 0, "procs": procs, "models": [], "endpoint": "-",
-        "installed": False,
-    }
-
-
 def detect_claude():
     procs = proc_count(["claude.exe", "claude"])
     creds = os.path.exists(CLAUDE_CREDS)
@@ -1100,7 +1140,16 @@ def detect_extra(cfg):
         running = procs > 0 or installed
         models = []
         mc = e.get("models_cmd")
-        if mc:
+        if mc and not CONFIG_TRUSTED:
+            # `models_cmd` is a shell command, and lmm looks for a config in
+            # the WORKING DIRECTORY. Honouring it from there means any repo
+            # shipping an lmm.config.json runs arbitrary code the moment you
+            # type `lmm` inside it. Only the user's own config may do this.
+            sys.stderr.write(
+                "[lmm] ignoring models_cmd for '%s': it comes from %s, not your "
+                "own config. Move the entry to ~/.lmm/config.json to allow it.\n"
+                % (e.get("name", "?"), CONFIG_PATH))
+        elif mc:
             r = run(mc)
             if r and r.returncode == 0:
                 models = [l for l in r.stdout.strip().splitlines() if l.strip()]
@@ -1251,14 +1300,6 @@ def meter_call(prov_name, prov, model, res, pricing, **extra):
     ev.update(extra)
     log_usage(ev)
     return usd
-
-
-def model_family(s):
-    s = (s or "").lower()
-    for fam in ("opus", "sonnet", "haiku"):
-        if fam in s:
-            return fam
-    return "default"
 
 
 def measured_tokens(days=None):
@@ -1764,12 +1805,21 @@ def cmd_serve_hub(cfg, host, port):
     """Start an OpenAI-compatible proxy that fans out to every configured
     provider (cloud + local). Apps point at this one endpoint; `lmm` routes
     each request. This is the hub: one endpoint, many backends."""
-    import http.server, socketserver, threading
+    import http.server, socketserver, threading, hmac, secrets
     provs = merged_providers(cfg)
     if not provs and not local_ollama_provider():
         print("[hub] no providers configured and no local Ollama running. "
               "Start Ollama (`lmm serve <model>`) or add 'providers' to lmm "
               "config (see `lmm examples`). Nothing to proxy.")
+        return
+
+    hub = merged_hub(cfg)
+    token = hub.get("token") or None
+    allowed, lines = hub_bind_check(host, hub,
+                                   lambda: secrets.token_urlsafe(24))
+    for line in lines:
+        print(line)
+    if not allowed:
         return
 
     class Handler(http.server.BaseHTTPRequestHandler):
@@ -1806,7 +1856,27 @@ def cmd_serve_hub(cfg, host, port):
                 if close:
                     close()
 
+        def _authed(self):
+            """Constant-time token check. A plain `==` on a secret leaks its
+            length and prefix through timing, and this endpoint is reachable by
+            whoever the bind allows."""
+            if not token:
+                return True
+            got = self.headers.get("Authorization", "") or ""
+            if got.startswith("Bearer "):
+                got = got[7:]
+            return hmac.compare_digest(got.strip(), token)
+
+        def _deny(self):
+            # 401 with no hint about the expected value.
+            self._send(401, {"error": {"message": "missing or invalid bearer "
+                                                  "token for the lmm hub",
+                                       "type": "invalid_request_error"}})
+
         def do_GET(self):
+            if not self._authed():
+                self._deny()
+                return
             if self.path.rstrip("/").endswith("/v1/models"):
                 self._send(200, {"object": "list", "data": [
                     {"id": n, "object": "model", "owned_by": p["kind"]}
@@ -1815,6 +1885,9 @@ def cmd_serve_hub(cfg, host, port):
                 self._send(404, {"error": "not found"})
 
         def do_POST(self):
+            if not self._authed():
+                self._deny()
+                return
             if not self.path.rstrip("/").endswith("/v1/chat/completions"):
                 self._send(404, {"error": "only /v1/chat/completions supported"})
                 return
@@ -1870,7 +1943,12 @@ def cmd_serve_hub(cfg, host, port):
 
 
 def cmd_stop(runtime, cfg):
-    table = dict(STOP_TABLE)
+    # Every runtime the registry can detect should also be stoppable —
+    # `lmm stop cursor` used to answer "unknown runtime" about an app
+    # `lmm discover` had just listed. STOP_TABLE stays for its aliases
+    # (e.g. "llama-server", which is not a registry key).
+    table = {k: list(v.get("procs", [])) for k, v in RUNTIME_REGISTRY.items()}
+    table.update(STOP_TABLE)
     for e in cfg.get("extra_runtimes", []):
         table[e["name"].lower()] = e.get("procs", [])
     names = table.get((runtime or "").lower())
@@ -2189,6 +2267,11 @@ def cmd_examples():
             "my-local": {"api_key": "ollama", "base_url": "http://localhost:11434/v1",
                          "model": "qwen2.5-coder:7b", "kind": "local"}
         },
+        # Hub security. The hub calls your providers with the keys above, so
+        # anyone who can reach it can spend your budget. Loopback is open;
+        # binding wider is refused unless you set a token (recommended) or
+        # explicitly opt into an unauthenticated bind.
+        "hub": {"token": None, "allow_remote": False},
         # Provider priority. Set it and lmm follows your order exactly;
         # leave it out and route_threshold below decides.
         "ask_order": ["my-local", "openai"],

@@ -293,6 +293,32 @@ keywords, or configure the hub. See `lmm examples` for the full shape —
 | `cache` | `{enabled, semantic, similarity, ttl_hours, max_entries, embed_model, max_temp}` |
 | `pricing` / `route` / `usage` / `extra_runtimes` | As before |
 
+## Hub security
+
+The hub proxies to your providers using **your** API keys, so whoever can reach
+the port can spend your budget without ever seeing a key. Reachability is
+therefore the whole security boundary:
+
+- **Loopback (`127.0.0.1`, the default) is open** — only you can reach it.
+- **Binding wider (`--host 0.0.0.0`) is refused** unless you either set
+  `hub.token` (the hub then requires `Authorization: Bearer <token>` on every
+  request, checked in constant time) or explicitly set `hub.allow_remote: true`
+  to accept an unauthenticated bind on a network you trust. The refusal prints a
+  ready-to-paste token so the secure path is the easy one.
+
+A 401 from the hub reveals nothing about the expected token, and no error
+response ever echoes a provider key.
+
+### A note on working-directory config
+
+`lmm` looks for `lmm.config.json` in the current directory, which is convenient
+for per-project settings but means the file can come from any repo you happen to
+be inside. Because `extra_runtimes[].models_cmd` is a shell command, honouring
+that field from an untrusted directory would be remote code execution on `cd`.
+So **`models_cmd` runs only from your own config** (`~/.lmm/config.json` or
+`~/.config/lmm/config.json`); from a working-directory file it is ignored with a
+warning. Everything else in a local config still applies.
+
 ## What lmm stores
 
 Two append-only JSONL files under `~/.lmm/`, both plain text you can `cat`:

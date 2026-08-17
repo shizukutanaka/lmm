@@ -1232,6 +1232,72 @@ class TestMeasuredTokens(unittest.TestCase):
         self.assertEqual(fam["out"], 20)
 
 
+class TestHubSecurity(unittest.TestCase):
+    """The hub holds the user's API keys; reachability is the entire boundary."""
+
+    def test_loopback_needs_nothing(self):
+        for host in ("127.0.0.1", "localhost", "::1", "127.1.2.3"):
+            allowed, lines = lmm.hub_bind_check(host, lmm.merged_hub({}))
+            self.assertTrue(allowed, host)
+            self.assertEqual(lines, [])
+
+    def test_non_loopback_without_token_is_refused(self):
+        allowed, lines = lmm.hub_bind_check("0.0.0.0", lmm.merged_hub({}),
+                                            lambda: "SUGGESTED")
+        self.assertFalse(allowed)
+        text = "\n".join(lines)
+        self.assertIn("refusing", text)
+        self.assertIn("SUGGESTED", text)      # tells the user exactly what to do
+
+    def test_non_loopback_with_token_is_allowed(self):
+        hub = lmm.merged_hub({"hub": {"token": "t"}})
+        allowed, lines = lmm.hub_bind_check("0.0.0.0", hub)
+        self.assertTrue(allowed)
+        self.assertIn("token required", "\n".join(lines))
+
+    def test_allow_remote_is_allowed_but_warned(self):
+        hub = lmm.merged_hub({"hub": {"allow_remote": True}})
+        allowed, lines = lmm.hub_bind_check("0.0.0.0", hub)
+        self.assertTrue(allowed)
+        self.assertIn("WARNING", "\n".join(lines))
+
+    def test_loopback_with_token_reminds_clients(self):
+        hub = lmm.merged_hub({"hub": {"token": "t"}})
+        allowed, lines = lmm.hub_bind_check("127.0.0.1", hub)
+        self.assertTrue(allowed)
+        self.assertIn("Authorization: Bearer", "\n".join(lines))
+
+
+class TestUntrustedConfig(unittest.TestCase):
+    """A config in the working directory is whatever repo you cd'd into, so it
+    must not be able to run shell commands (`extra_runtimes[].models_cmd`)."""
+
+    def setUp(self):
+        self._path, self._trusted = lmm.CONFIG_PATH, lmm.CONFIG_TRUSTED
+        self._ran = []
+        self._run = lmm.run
+        lmm.run = lambda cmd: self._ran.append(cmd)
+
+    def tearDown(self):
+        lmm.CONFIG_PATH, lmm.CONFIG_TRUSTED = self._path, self._trusted
+        lmm.run = self._run
+
+    def cfg(self):
+        return {"extra_runtimes": [{"name": "X", "procs": [],
+                                    "installed_paths": [],
+                                    "models_cmd": "echo pwned"}]}
+
+    def test_untrusted_config_does_not_run_models_cmd(self):
+        lmm.CONFIG_PATH, lmm.CONFIG_TRUSTED = "lmm.config.json", False
+        lmm.detect_extra(self.cfg())
+        self.assertNotIn("echo pwned", self._ran)    # models_cmd never ran
+
+    def test_trusted_config_runs_models_cmd(self):
+        lmm.CONFIG_PATH, lmm.CONFIG_TRUSTED = "/home/u/.lmm/config.json", True
+        lmm.detect_extra(self.cfg())
+        self.assertIn("echo pwned", self._ran)
+
+
 class temp_state(object):
     """Point lmm's usage log and cache at a throwaway directory."""
 

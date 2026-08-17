@@ -42,6 +42,10 @@
       "kind": "local"
     }
   },
+  "hub": {
+    "token": null,
+    "allow_remote": false
+  },
   "ask_order": [
     "my-local",
     "openai"
