@@ -1020,12 +1020,117 @@ def cmd_discover(cfg, as_json, save=False):
         print(f"[{flag}] {it['name']:<30} {paid:<5}{extra}")
 
 
-def cmd_priority(cfg, show=False):
+def measure_performance():
+    """Scan hub.log for ask_attempt events and return {provider: {ok, fail,
+    avg_ms}}. Reuses the same JSONL source cmd_stats reads — measure, don't
+    trust: this is the REAL observed routing outcome, not a guess."""
+    import os as _os
+    import json as _json
+    from collections import defaultdict
+    p = _os.path.join(HOME, ".lmm", "hub.log")
+    stat = defaultdict(lambda: {"ok": 0, "fail": 0, "lat": []})
+    if not _os.path.exists(p):
+        return stat
+    with open(p, encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                e = _json.loads(line)
+            except Exception:
+                continue
+            if e.get("event") != "ask_attempt":
+                continue
+            n = e.get("provider", "?")
+            if e.get("ok"):
+                stat[n]["ok"] += 1
+            else:
+                stat[n]["fail"] += 1
+            if isinstance(e.get("latency_ms"), int):
+                stat[n]["lat"].append(e["latency_ms"])
+    for v in stat.values():
+        v["avg_ms"] = int(sum(v["lat"]) / len(v["lat"])) if v["lat"] else 0
+    return stat
+
+
+def optimize_ask_order(cfg):
+    """First-principles closed loop: don't trust the static ask_order — MEASURE
+    it. Re-rank ask_order by observed success rate and latency, so a backend
+    that keeps failing or timing out drops in priority. Unmeasured backends are
+    kept but moved to the tail (we have no evidence they're good). The user's
+    explicit entries are preserved in identity, only reordered by evidence.
+
+    NOTE: ask_order holds DISPLAY names (e.g. "Ollama") but the hub log records
+    PROVIDER keys (e.g. "local-ollama(implicit)"). We normalize via NAME_TO_KEY
+    before matching, else every backend looks "unmeasured" (measure, don't trust).
+    """
+    stat = measure_performance()
+    order = list(cfg.get("ask_order") or [])
+    if not order:
+        return order, stat
+    # display-name -> provider-key normalizer (mirrors resolve_ask_targets)
+    NAME_TO_KEY = {
+        "ollama": "local-ollama(implicit)",
+        "lm studio": "local-lmstudio(implicit)",
+        "claude code (anthropic)": "claude-code",
+        "claude": "claude-code",
+    }
+    def norm(n):
+        if n in stat:
+            return n
+        return NAME_TO_KEY.get(n.lower(), n)
+    scored = []
+    for name in order:
+        key = norm(name)
+        s = stat.get(key, {})
+        ok, fail = s.get("ok", 0), s.get("fail", 0)
+        total = ok + fail
+        if total == 0:
+            score = -1.0          # unmeasured: tail, but keep
+        else:
+            succ = ok / total
+            avg = s.get("avg_ms", 0) or 1
+            # success dominates; latency is a tie-breaker (faster = better)
+            score = succ * 10.0 + min(100000 / avg, 5.0)
+        scored.append((score, name))
+    # stable sort: highest score first; unmeasured (-1) sink to the tail
+    scored.sort(key=lambda x: -x[0])
+    return [n for _, n in scored], stat
+
+
+def cmd_priority(cfg, show=False, optimize=False):
     """Management UI: inspect / reorder the routing priority (ask_order).
 
     Flow the user asked for: discover -> set priority -> real use (ask/chat).
     `lmm priority` interactively reorders; `lmm priority --show` just prints.
+    `lmm priority --optimize` re-ranks by MEASURED performance (closed loop).
     """
+    if optimize:
+        new_order, stat = optimize_ask_order(cfg)
+        # display-name -> provider-key normalizer (mirrors optimize_ask_order)
+        NAME_TO_KEY = {
+            "ollama": "local-ollama(implicit)",
+            "lm studio": "local-lmstudio(implicit)",
+            "claude code (anthropic)": "claude-code",
+            "claude": "claude-code",
+        }
+        def _norm(n):
+            return n if n in stat else NAME_TO_KEY.get(n.lower(), n)
+        cfg = dict(cfg)
+        cfg["ask_order"] = new_order
+        save_config(cfg)
+        print("[priority] optimized ask_order by measured performance:")
+        for i, n in enumerate(new_order, 1):
+            s = stat.get(_norm(n), {})
+            if s.get("ok", 0) + s.get("fail", 0) == 0:
+                ev = "unmeasured"
+            else:
+                tot = s["ok"] + s["fail"]
+                ev = f"{s['ok']}/{tot} ok, {s.get('avg_ms', 0)}ms"
+            print(f"  {i}. {n}  [{ev}]")
+        print("[priority] now use `lmm ask` — it routes by this evidence-ranked order.")
+        return
     if show:
         order = cfg.get("ask_order") or []
         if not order:
@@ -2400,6 +2505,19 @@ def cmd_selftest(cfg):
     except Exception as e:
         chk("stats command runs", False, str(e))
 
+    # 9) priority --optimize runs (closed-loop: measurement -> re-prioritize)
+    try:
+        _buf = _io.StringIO()
+        with _cl.redirect_stdout(_buf):
+            cmd_priority(cfg, optimize=True)
+        po_out = _buf.getvalue()
+        chk("priority --optimize runs", "optimized ask_order" in po_out,
+            po_out.strip().splitlines()[0] if po_out.strip() else "")
+    except SystemExit as e:
+        chk("priority --optimize runs", e.code in (0, None), f"exit={e.code}")
+    except Exception as e:
+        chk("priority --optimize runs", False, str(e))
+
     fails = sum(1 for _, ok, _ in checks if not ok)
     print("")
     if fails == 0:
@@ -2808,6 +2926,8 @@ def main():
                    help="save detected backends to ask_order (initial priority)")
     p = sub.add_parser("priority", help="manage routing priority (discover -> set -> use)")
     p.add_argument("--show", action="store_true", help="show current ask_order only")
+    p.add_argument("--optimize", action="store_true",
+                   help="re-rank ask_order by MEASURED performance (closed loop)")
     sub.add_parser("status")
     sub.add_parser("models")
     p = sub.add_parser("pull", help="pull a model into local Ollama (unified model store)")
@@ -2866,7 +2986,8 @@ def main():
         cmd_discover(cfg, getattr(args, "json", False),
                      getattr(args, "save", False))
     elif cmd == "priority":
-        cmd_priority(cfg, getattr(args, "show", False))
+        cmd_priority(cfg, getattr(args, "show", False),
+                    getattr(args, "optimize", False))
     elif cmd == "cli":
         cmd_discover(cfg, False)
     elif cmd == "status":
