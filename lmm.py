@@ -1064,8 +1064,14 @@ def optimize_ask_order(cfg):
     NOTE: ask_order holds DISPLAY names (e.g. "Ollama") but the hub log records
     PROVIDER keys (e.g. "local-ollama(implicit)"). We normalize via NAME_TO_KEY
     before matching, else every backend looks "unmeasured" (measure, don't trust).
+
+    Cost-aware (FrugalGPT / RouteLLM lesson): a backend that is free AND works is
+    infinitely cost-efficient; a paid one must EARN its place via higher success
+    or quality. We fold $/1M tokens into the score so local models win when they
+    are sufficient, paid models only win when they materially outperform.
     """
     stat = measure_performance()
+    pricing = merged_pricing(cfg)
     order = list(cfg.get("ask_order") or [])
     if not order:
         return order, stat
@@ -1080,6 +1086,13 @@ def optimize_ask_order(cfg):
         if n in stat:
             return n
         return NAME_TO_KEY.get(n.lower(), n)
+    def cost_per_1m(key):
+        # local backends are free; cloud keys resolve via merged_pricing
+        if "local-" in key or key.endswith("(implicit)"):
+            return 0.0
+        fam = key.split(":")[0].lower()
+        p = pricing.get(fam, pricing.get("default", {"out": 15.0}))
+        return float(p.get("out", 15.0))
     scored = []
     for name in order:
         key = norm(name)
@@ -1091,8 +1104,11 @@ def optimize_ask_order(cfg):
         else:
             succ = ok / total
             avg = s.get("avg_ms", 0) or 1
-            # success dominates; latency is a tie-breaker (faster = better)
-            score = succ * 10.0 + min(100000 / avg, 5.0)
+            cost = cost_per_1m(key)
+            # cost-efficiency: success per dollar (free => 1/cost -> large bonus)
+            eff = succ / (cost / 1000.0 + 0.01)
+            # success dominates; latency + cost-efficiency are tie-breakers
+            score = succ * 10.0 + min(100000 / avg, 5.0) + min(eff / 50.0, 5.0)
         scored.append((score, name))
     # stable sort: highest score first; unmeasured (-1) sink to the tail
     scored.sort(key=lambda x: -x[0])
@@ -1117,17 +1133,26 @@ def cmd_priority(cfg, show=False, optimize=False):
         }
         def _norm(n):
             return n if n in stat else NAME_TO_KEY.get(n.lower(), n)
+        pricing = merged_pricing(cfg)
+        def _cost(key):
+            if "local-" in key or key.endswith("(implicit)"):
+                return 0.0
+            fam = key.split(":")[0].lower()
+            p = pricing.get(fam, pricing.get("default", {"out": 15.0}))
+            return float(p.get("out", 15.0))
         cfg = dict(cfg)
         cfg["ask_order"] = new_order
         save_config(cfg)
-        print("[priority] optimized ask_order by measured performance:")
+        print("[priority] optimized ask_order by cost-aware measured performance:")
         for i, n in enumerate(new_order, 1):
             s = stat.get(_norm(n), {})
+            c = _cost(_norm(n))
+            cost_s = f"${c:g}/1M" if c > 0 else "free"
             if s.get("ok", 0) + s.get("fail", 0) == 0:
-                ev = "unmeasured"
+                ev = f"unmeasured, {cost_s}"
             else:
                 tot = s["ok"] + s["fail"]
-                ev = f"{s['ok']}/{tot} ok, {s.get('avg_ms', 0)}ms"
+                ev = f"{s['ok']}/{tot} ok, {s.get('avg_ms', 0)}ms, {cost_s}"
             print(f"  {i}. {n}  [{ev}]")
         print("[priority] now use `lmm ask` — it routes by this evidence-ranked order.")
         return
@@ -3005,6 +3030,17 @@ def main():
         print(f"=> keyword recommend: {rec}")
         print(f"=> measured best-fit : {best}")
         print(f"   reason: {reason}")
+        # cost-awareness: show what the chosen backend costs vs local (free)
+        pricing = merged_pricing(cfg)
+        def _cost(key):
+            if "local-" in key or key.endswith("(implicit)"):
+                return 0.0
+            fam = key.split(":")[0].lower()
+            p = pricing.get(fam, pricing.get("default", {"out": 15.0}))
+            return float(p.get("out", 15.0))
+        c = _cost(best)
+        print(f"   cost: {'free (local)' if c == 0 else f'${c:g}/1M out tokens'}"
+              f"  -- FrugalGPT lesson: keep it local unless quality demands cloud")
     elif cmd == "serve":
         if getattr(args, "hub", False):
             cmd_serve_hub(cfg, args.host, args.port)
