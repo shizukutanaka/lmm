@@ -804,10 +804,25 @@ white-space:pre-wrap}}
 
 
 # ------------------------------ commands -----------------------------------
-def cmd_discover(cfg, as_json):
+def cmd_discover(cfg, as_json, save=False):
     items = discover(cfg)
     if as_json:
         print(json.dumps(items, indent=2, ensure_ascii=False))
+        return
+    if save:
+        # Save detected backends as the initial priority order (running first).
+        running = [it["name"] for it in items
+                   if it["running"] and it["name"] != "-"]
+        if not running:
+            print("[discover] no running backends detected — nothing to save.")
+            return
+        cfg = dict(cfg)
+        cfg["ask_order"] = running
+        path = save_config(cfg)
+        print(f"[discover] saved {len(running)} backend(s) to ask_order:")
+        for i, n in enumerate(running, 1):
+            print(f"  {i}. {n}")
+        print(f"[discover] config written: {path}")
         return
     for it in items:
         flag = "ON " if it["running"] else "off"
@@ -820,6 +835,72 @@ def cmd_discover(cfg, as_json):
         if it.get("endpoint") and it["endpoint"] != "-":
             extra += f" @ {it['endpoint']}"
         print(f"[{flag}] {it['name']:<30} {paid:<5}{extra}")
+
+
+def cmd_priority(cfg, show=False):
+    """Management UI: inspect / reorder the routing priority (ask_order).
+
+    Flow the user asked for: discover -> set priority -> real use (ask/chat).
+    `lmm priority` interactively reorders; `lmm priority --show` just prints.
+    """
+    if show:
+        order = cfg.get("ask_order") or []
+        if not order:
+            print("[priority] ask_order is empty — using auto-routing.")
+            print("[priority] run `lmm discover --save` to seed from detected backends.")
+        else:
+            print("[priority] current routing order (highest first):")
+            for i, n in enumerate(order, 1):
+                print(f"  {i}. {n}")
+        return
+    items = discover(cfg)
+    running = [it["name"] for it in items
+               if it["running"] and it["name"] != "-"]
+    if not running:
+        print("[priority] no running backends detected.")
+        print("[priority] start Ollama (`lmm serve <model>`) or a cloud provider first.")
+        return
+    cur = list(cfg.get("ask_order") or [])
+    # seed with running backends not already present, keep current order first
+    ordered = [n for n in cur if n in running]
+    for n in running:
+        if n not in ordered:
+            ordered.append(n)
+    print("[priority] detected backends (set priority by typing order):")
+    for i, n in enumerate(running, 1):
+        mark = ">" if n in cur else " "
+        print(f"  {mark} {i}. {n}")
+    print("")
+    print("[priority] enter priority order as space/comma separated numbers,")
+    print("           e.g. '3 1 2'  ->  backend#3 first, then #1, then #2")
+    print("           or 'auto' to keep current order, or 'q' to cancel.")
+    try:
+        inp = input("[priority] > ").strip()
+    except (EOFError, KeyboardInterrupt):
+        print("\n[priority] cancelled.")
+        return
+    if inp.lower() in ("q", "quit", "cancel"):
+        print("[priority] cancelled.")
+        return
+    if inp.lower() == "auto":
+        new_order = ordered
+    else:
+        try:
+            picks = [int(x) for x in inp.replace(",", " ").split() if x.strip()]
+            new_order = [running[i - 1] for i in picks if 1 <= i <= len(running)]
+            if not new_order:
+                raise ValueError
+        except Exception:
+            print("[priority] invalid input — keeping current order.")
+            new_order = ordered
+    cfg = dict(cfg)
+    cfg["ask_order"] = new_order
+    path = save_config(cfg)
+    print(f"[priority] saved {len(new_order)} backend(s) to ask_order:")
+    for i, n in enumerate(new_order, 1):
+        print(f"  {i}. {n}")
+    print(f"[priority] config written: {path}")
+    print("[priority] now use `lmm ask` / `lmm chat` — they route by this order.")
 
 
 def cmd_status(cfg):
@@ -1545,7 +1626,17 @@ def resolve_ask_targets(cfg, prompt, explicit):
     Order:  explicit  >  cfg['ask_order']  >  (keyword-matched)  >  implicit
     running Ollama as final safety net. With no ask_order set, the old default
     (keyword match, then all configured, then implicit Ollama) applies.
+
+    NOTE: ask_order entries may be either provider keys (from config 'providers')
+    or human-readable discover names (e.g. "Ollama"). We normalize both forms.
     """
+    # Map discover display names -> provider keys / implicit keys.
+    NAME_TO_KEY = {
+        "ollama": "local-ollama(implicit)",
+        "lm studio": "local-lmstudio(implicit)",
+        "claude code (anthropic)": "claude-code",  # if configured as a provider
+        "claude": "claude-code",
+    }
     provs = merged_providers(cfg)
     # fold in the implicit running-Ollama safety net so explicit references
     # to it (e.g. a model id resolved back to "local-ollama(implicit)")
@@ -1560,17 +1651,38 @@ def resolve_ask_targets(cfg, prompt, explicit):
     if ls and "local-lmstudio(implicit)" not in provs:
         provs = dict(provs)
         provs["local-lmstudio(implicit)"] = ls
+    # also allow a configured provider named 'claude-code' (Anthropic) to be
+    # targeted by its discover name.
+    provs_norm = {}
+    for k, v in provs.items():
+        provs_norm[k.lower()] = (k, v)
+        provs_norm[NAME_TO_KEY.get(k.lower(), k.lower())] = (k, v)
+    # additionally register discover names as keys pointing at their provider
+    for discover_name, key in NAME_TO_KEY.items():
+        if key in provs and discover_name not in provs_norm:
+            provs_norm[discover_name] = (key, provs[key])
     if explicit:
         if explicit in provs:
             return [(explicit, provs[explicit])]
+        if explicit in provs_norm:
+            k, v = provs_norm[explicit]
+            return [(k, v)]
         if explicit in ("local", "ollama", "local-ollama") and lo:
             return [("local-ollama(implicit)", lo)]
         return []
     order = list(cfg.get("ask_order") or [])
     out, seen = [], set()
     for n in order:                      # user-defined priority, in full
-        if n in provs and n not in seen:
-            out.append((n, provs[n])); seen.add(n)
+        nk = n.lower()
+        # accept either the provider key or the discover display name
+        if n in provs:
+            k, v = n, provs[n]
+        elif nk in provs_norm:
+            k, v = provs_norm[nk]
+        else:
+            continue
+        if k not in seen:
+            out.append((k, v)); seen.add(k)
     if not order:                       # no ask_order: sensible default
         pk = pick_provider_for_task(cfg, prompt, provs)
         if pk and pk not in seen:
@@ -1903,7 +2015,12 @@ def main():
         description="LMM - Local/remote Model Manager (cross-platform, zero-dep)")
     ap.add_argument("-v", "--version", action="store_true", help="show version")
     sub = ap.add_subparsers(dest="cmd")
-    sub.add_parser("discover").add_argument("--json", action="store_true")
+    p = sub.add_parser("discover")
+    p.add_argument("--json", action="store_true")
+    p.add_argument("--save", action="store_true",
+                   help="save detected backends to ask_order (initial priority)")
+    p = sub.add_parser("priority", help="manage routing priority (discover -> set -> use)")
+    p.add_argument("--show", action="store_true", help="show current ask_order only")
     sub.add_parser("status")
     sub.add_parser("models")
     p = sub.add_parser("pull", help="pull a model into local Ollama (unified model store)")
@@ -1952,7 +2069,10 @@ def main():
     # the visual dashboard, not a text dump. Use `lmm discover` for CLI output.
     cmd = args.cmd or "gui"
     if cmd == "discover":
-        cmd_discover(cfg, getattr(args, "json", False))
+        cmd_discover(cfg, getattr(args, "json", False),
+                     getattr(args, "save", False))
+    elif cmd == "priority":
+        cmd_priority(cfg, getattr(args, "show", False))
     elif cmd == "cli":
         cmd_discover(cfg, False)
     elif cmd == "status":
