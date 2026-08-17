@@ -38,6 +38,7 @@ import datetime
 import html
 import webbrowser
 import ctypes
+import time
 
 HOME = os.path.expanduser("~")
 
@@ -2033,9 +2034,14 @@ def cmd_ask(prompt, provider, cfg, auto=False, verify=False):
     last_err = None
     for name, prov in targets:
         print(f"[ask] -> trying {name} ({prov['model'] or 'no model set'})")
+        t0 = time.time()
         gen = call_provider(prov, prompt, stream=True)
         if isinstance(gen, dict) and gen.get("error"):
             last_err = gen["error"]
+            log_hub({"event": "ask_attempt", "provider": name, "ok": False,
+                     "latency_ms": int((time.time() - t0) * 1000),
+                     "prompt": prompt, "error": last_err,
+                     "reason": "pre-check error"})
             log_hub({"event": "ask", "provider": name, "ok": False,
                      "error": last_err, "prompt": prompt})
             print(f"[ask]    {name} failed: {last_err} -- fallback")
@@ -2048,11 +2054,21 @@ def cmd_ask(prompt, provider, cfg, auto=False, verify=False):
                 full.append(piece)
                 print(piece, end="", flush=True)
             print("")
+            latency = int((time.time() - t0) * 1000)
+            reply_text = "".join(full)
+            tokens = len(reply_text) // 4  # rough token estimate
+            log_hub({"event": "ask_attempt", "provider": name, "ok": True,
+                     "latency_ms": latency, "prompt": prompt,
+                     "reply_tokens": tokens, "reason": "success"})
             log_hub({"event": "ask", "provider": name, "ok": True,
-                     "prompt": prompt, "reply": "".join(full)[:200]})
+                     "prompt": prompt, "reply": reply_text[:200]})
             return
         except (KeyError, IndexError, TypeError, RuntimeError) as e:
             last_err = f"stream failed: {e}"
+            log_hub({"event": "ask_attempt", "provider": name, "ok": False,
+                     "latency_ms": int((time.time() - t0) * 1000),
+                     "prompt": prompt, "error": last_err,
+                     "reason": "stream failure"})
             log_hub({"event": "ask", "provider": name, "ok": False,
                      "error": last_err, "prompt": prompt})
             print(f"[ask]    {name} stream error -- fallback")
@@ -2370,6 +2386,19 @@ def cmd_selftest(cfg):
         chk("secrets command runs", e.code in (0, 2), f"exit={e.code}")
     except Exception as e:
         chk("secrets command runs", False, str(e))
+
+    # 8) stats command runs (reads the structured hub log without crashing)
+    try:
+        _buf = _io.StringIO()
+        with _cl.redirect_stdout(_buf):
+            cmd_stats(cfg)
+        st_out = _buf.getvalue()
+        chk("stats command runs", "lmm stats" in st_out,
+            st_out.strip().splitlines()[0] if st_out.strip() else "")
+    except SystemExit as e:
+        chk("stats command runs", e.code in (0, None), f"exit={e.code}")
+    except Exception as e:
+        chk("stats command runs", False, str(e))
 
     fails = sum(1 for _, ok, _ in checks if not ok)
     print("")
@@ -2710,6 +2739,64 @@ def cmd_doctor(cfg):
     print("doctor: HEALTHY")
 
 
+def cmd_stats(cfg):
+    """Aggregate the structured hub log into measured routing statistics.
+    Proves (don't trust — measure) HOW well the routing actually performs:
+    per-backend success rate, average latency, total attempts, and how often
+    the first tried backend succeeded. Zero-dep: pure JSONL scan."""
+    p = os.path.join(HOME, ".lmm", "hub.log")
+    if not os.path.exists(p):
+        print("[stats] no hub.log yet. Run `lmm ask` first.")
+        sys.exit(0)
+    attempts = []
+    with open(p, encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                e = json.loads(line)
+            except Exception:
+                continue
+            if e.get("event") == "ask_attempt":
+                attempts.append(e)
+    if not attempts:
+        print("[stats] no ask_attempt events yet. Run `lmm ask` first.")
+        sys.exit(0)
+
+    by_provider = {}
+    first_try_ok = 0
+    total = len(attempts)
+    for i, e in enumerate(attempts):
+        name = e.get("provider", "?")
+        rec = by_provider.setdefault(name, {"ok": 0, "fail": 0, "lat": []})
+        if e.get("ok"):
+            rec["ok"] += 1
+            # first attempt of a session = index 0 or right after an all-fail
+            if i == 0 or (attempts[i - 1].get("provider") == "(all)"):
+                first_try_ok += 1
+        else:
+            rec["fail"] += 1
+        if isinstance(e.get("latency_ms"), int):
+            rec["lat"].append(e["latency_ms"])
+
+    print(f"lmm stats — {total} routing attempt(s) measured:")
+    print(f"{'backend':<32}{'success':>9}{'fail':>6}{'succ%':>8}{'avg_ms':>9}")
+    print("-" * 64)
+    for name, rec in sorted(by_provider.items(),
+                            key=lambda kv: -(kv[1]["ok"] + kv[1]["fail"])):
+        tot = rec["ok"] + rec["fail"]
+        pct = (rec["ok"] / tot * 100) if tot else 0
+        avg = int(sum(rec["lat"]) / len(rec["lat"])) if rec["lat"] else 0
+        print(f"{name:<32}{rec['ok']:>9}{rec['fail']:>6}{pct:>7.0f}%{avg:>9}")
+    overall_ok = sum(r["ok"] for r in by_provider.values())
+    overall_pct = (overall_ok / total * 100) if total else 0
+    print("-" * 64)
+    print(f"{'TOTAL':<32}{overall_ok:>9}{total - overall_ok:>6}{overall_pct:>7.0f}%")
+    print(f"first-try success rate: {first_try_ok}/{total} "
+          f"({first_try_ok / total * 100:.0f}%)")
+
+
 def main():
     ap = argparse.ArgumentParser(
         description="LMM - Local/remote Model Manager (cross-platform, zero-dep)")
@@ -2765,6 +2852,7 @@ def main():
     sub.add_parser("examples")
     sub.add_parser("doctor")
     sub.add_parser("secrets")
+    sub.add_parser("stats")
     args = ap.parse_args()
     if args.version:
         print("lmm 1.0.0")
@@ -2831,6 +2919,8 @@ def main():
         cmd_doctor(cfg)
     elif cmd == "secrets":
         cmd_secrets(cfg)
+    elif cmd == "stats":
+        cmd_stats(cfg)
 
 
 if __name__ == "__main__":
