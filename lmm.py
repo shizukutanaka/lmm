@@ -1522,6 +1522,22 @@ def local_ollama_provider():
             "model": model, "kind": "local", "_implicit": True}
 
 
+def local_lmstudio_provider():
+    """Synthesize an implicit local provider from a running LM Studio server,
+    so `lmm ask` / `lmm serve --hub` can fan out to it too (zero-config hub).
+    Returns dict or None."""
+    d = detect_lmstudio()
+    if not d.get("running"):
+        return None
+    # base_url WITHOUT /v1: fetch_models() appends /v1/models itself
+    # (matching the Ollama convention, which also stores the root URL).
+    endpoint = (d.get("endpoint") or "http://localhost:1234/v1").replace("/v1", "").rstrip("/")
+    models = d.get("models") or []
+    model = models[0] if models else "local-model"
+    return {"api_key": "lmstudio", "base_url": endpoint,
+            "model": model, "kind": "local", "_implicit": True}
+
+
 def resolve_ask_targets(cfg, prompt, explicit):
     """Ordered providers to try. Priority is USER-CONTROLLED via cfg['ask_order']
     (a list of provider names). Falls back to implicit running Ollama.
@@ -1538,6 +1554,12 @@ def resolve_ask_targets(cfg, prompt, explicit):
     if lo and "local-ollama(implicit)" not in provs:
         provs = dict(provs)
         provs["local-ollama(implicit)"] = lo
+    # fold in implicit running LM Studio too (zero-config hub: LM Studio is a
+    # local base just like Ollama, and should be routable without config).
+    ls = local_lmstudio_provider()
+    if ls and "local-lmstudio(implicit)" not in provs:
+        provs = dict(provs)
+        provs["local-lmstudio(implicit)"] = ls
     if explicit:
         if explicit in provs:
             return [(explicit, provs[explicit])]
@@ -1559,6 +1581,9 @@ def resolve_ask_targets(cfg, prompt, explicit):
     lo = local_ollama_provider()        # always-on zero-config safety net
     if lo and "local-ollama(implicit)" not in seen:
         out.append(("local-ollama(implicit)", lo))
+    ls = local_lmstudio_provider()
+    if ls and "local-lmstudio(implicit)" not in seen:
+        out.append(("local-lmstudio(implicit)", ls))
     return out
 
 
