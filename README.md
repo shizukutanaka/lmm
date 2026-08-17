@@ -79,6 +79,42 @@ threshold cannot bound false cache hits, so the semantic tier is **opt-in**, its
 default threshold is a strict `0.95`, and every near miss is logged so you can
 tune it from evidence (`lmm cache`).
 
+#### Verified mode: let each entry earn the right to answer
+
+A static threshold answers *"are these two prompts close?"* when the question is
+*"would this cached answer still be right?"* — and the similarity at which that
+flips is different for every prompt. Set `cache.max_error_rate` and lmm switches
+to vCache's approach instead: **a per-entry threshold, learned online.**
+
+```json
+"cache": { "semantic": true, "max_error_rate": 0.05 }
+```
+
+An entry may only answer once there is statistical evidence its error rate is
+under your bound. Until then a near neighbour triggers **exploration**: lmm pays
+for the real answer, compares it against the one the neighbour would have given,
+and records the outcome on that entry. Agreement is measured by embedding both
+answers — locally, so labelling is free.
+
+That loop is the whole mechanism, and it separates the two cases a static
+threshold cannot tell apart:
+
+| Neighbour | Static threshold | Verified mode |
+|---|---|---|
+| Genuinely interchangeable | served from request 1 | explores, then serves free once certified |
+| Similar wording, different answer | **served from request 1, wrong every time** | never certified, never served |
+
+`lmm cache` reports how many entries are certified and how many observations
+back them.
+
+Two honest notes on the implementation. The labels come from comparing answer
+embeddings, which is a proxy for correctness, not correctness itself. And the
+bound is a [Wilson score](https://en.wikipedia.org/wiki/Binomial_proportion_confidence_interval#Wilson_score_interval)
+lower bound rather than the paper's calibrated Bayesian posterior — so the
+guarantee is "there is statistical evidence the error rate is below δ", not the
+paper's tighter one. Wilson is used precisely because the naive estimate reads
+2-out-of-2 as 100% correct, which would certify an entry on two lucky draws.
+
 RouteLLM and FrugalGPT both learn their scorers from training data. lmm has
 neither the data nor the dependencies for that, so it approximates them with
 lexical features and a heuristic answer verifier. The thresholds — the part you

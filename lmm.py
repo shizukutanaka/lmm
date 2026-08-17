@@ -147,6 +147,16 @@ DEFAULT_CACHE = {
     "max_entries": 2000,
     "embed_model": "nomic-embed-text",
     "max_temp":    0.3,    # above this the caller wants variety, not a cache
+    # vCache (arXiv:2502.03771): a single static similarity threshold cannot
+    # bound the false-hit rate, because the similarity at which a neighbour is
+    # actually interchangeable differs per prompt. Set max_error_rate to a
+    # number and each entry instead EARNS the right to answer, by accumulating
+    # evidence that it was correct at that similarity. null keeps the old
+    # static-threshold behaviour.
+    "max_error_rate": None,   # vCache's delta, e.g. 0.05 for "at most 5% wrong"
+    "confidence":     0.95,   # certainty demanded of the bound itself
+    "answer_match":   0.92,   # answer-embedding similarity that counts as agreement
+    "min_observations": 3,    # never certify an entry on a single lucky sample
 }
 
 # Reliability. Failover across providers already existed, but it abandoned a
@@ -2878,7 +2888,12 @@ def cmd_examples():
         "cache": {
             "enabled": True, "semantic": False, "similarity": 0.95,
             "ttl_hours": 168, "max_entries": 2000,
-            "embed_model": "nomic-embed-text", "max_temp": 0.3
+            "embed_model": "nomic-embed-text", "max_temp": 0.3,
+            # Set max_error_rate (vCache, arXiv:2502.03771) and each cached
+            # entry must earn the right to answer by accumulating evidence
+            # that it was correct; null keeps the static-threshold behaviour.
+            "max_error_rate": None, "confidence": 0.95,
+            "answer_match": 0.92, "min_observations": 3
         },
         # Optional: hand-entered cloud spend, added on top of what lmm
         # measures itself in ~/.lmm/usage.jsonl.
@@ -3202,24 +3217,187 @@ def cache_entries(conf):
     return out
 
 
-def cache_lookup(cfg, messages, model):
-    """Return (entry, how, similarity). `how` is 'exact', 'semantic' or None."""
+# ---- verified semantic cache (vCache, arXiv:2502.03771) --------------------
+# A static similarity threshold answers "are these two prompts close?" when the
+# question is "would this cached answer still be right?" — and the similarity
+# at which that flips differs per prompt. vCache instead learns a threshold per
+# cached entry from observed outcomes, and serves only when the observed error
+# rate is provably under a user-specified bound.
+#
+# What is faithful to the paper here: per-entry thresholds, learned online with
+# no training, from exploration outcomes, under a user-specified max error rate.
+# What is an approximation: the paper uses a Bayesian posterior with a
+# calibrated exploration probability; this uses a Wilson score lower bound and
+# explores whenever an entry is not yet certified. The guarantee is therefore
+# "we have statistical evidence the error rate is below delta", not the paper's
+# tighter bound. Stated plainly because a cache that overclaims correctness is
+# exactly the failure vCache exists to prevent.
+def wilson_lower_bound(successes, trials, confidence=0.95):
+    """Lower bound of the Wilson score interval for a binomial proportion.
+
+    Chosen over the naive successes/trials because that estimate is wildly
+    overconfident on small samples: 2 out of 2 reads as 100% correct, which
+    would certify an entry on two lucky draws. Wilson stays conservative until
+    the evidence is actually there.
+    """
+    if trials <= 0:
+        return 0.0
+    # z for a one-sided bound at the requested confidence
+    z = {0.80: 0.842, 0.90: 1.282, 0.95: 1.645, 0.975: 1.960,
+         0.99: 2.326, 0.999: 3.090}.get(round(confidence, 3), 1.645)
+    p = float(successes) / trials
+    z2 = z * z
+    denom = 1.0 + z2 / trials
+    centre = p + z2 / (2 * trials)
+    margin = z * math.sqrt(max(0.0, p * (1 - p) / trials + z2 / (4 * trials * trials)))
+    return max(0.0, (centre - margin) / denom)
+
+
+def entry_evidence(entry, sim):
+    """(trials, successes) for this entry at similarity >= `sim`.
+
+    Observations at a HIGHER similarity are evidence for a hit at a lower one
+    only in the wrong direction, so the count is restricted to observations at
+    least as far away as the current query — a conservative reading.
+    """
+    trials = successes = 0
+    for obs in entry.get("obs") or []:
+        try:
+            osim, ok = float(obs[0]), bool(obs[1])
+        except (TypeError, ValueError, IndexError):
+            continue
+        if osim <= sim + 1e-9:
+            trials += 1
+            successes += 1 if ok else 0
+    return trials, successes
+
+
+def certified(entry, sim, conf):
+    """May this entry answer at this similarity? Returns (ok, reason).
+
+    The entry is certified when the Wilson lower bound on its observed success
+    rate clears 1 - max_error_rate, with at least `min_observations` behind it.
+    """
+    delta = conf.get("max_error_rate")
+    if delta is None:                       # static-threshold mode
+        return sim >= float(conf.get("similarity", 0.95)), "static threshold"
+    need = float(conf.get("min_observations", 3))
+    trials, successes = entry_evidence(entry, sim)
+    if trials < need:
+        return False, "only %d/%d observations at sim>=%.3f" % (trials, need, sim)
+    lower = wilson_lower_bound(successes, trials,
+                               float(conf.get("confidence", 0.95)))
+    target = 1.0 - float(delta)
+    if lower >= target:
+        return True, "%d/%d correct, lower bound %.3f >= %.3f" % (
+            successes, trials, lower, target)
+    return False, "%d/%d correct, lower bound %.3f < %.3f" % (
+        successes, trials, lower, target)
+
+
+def answers_agree(a, b, conf):
+    """Did the fresh answer say the same thing as the cached one?
+
+    This is the label vCache needs, and lmm can produce it for free: it already
+    embeds locally, so the two ANSWERS are compared the same way the prompts
+    are. Identical text short-circuits; otherwise it is a cosine over local
+    embeddings, and if no embedder is available there is no label to record.
+    """
+    a, b = (a or "").strip(), (b or "").strip()
+    if not a or not b:
+        return None
+    if a == b:
+        return True
+    model = conf.get("embed_model", "nomic-embed-text")
+    ea, eb = embed_text(a, model), embed_text(b, model)
+    if not ea or not eb:
+        return None                          # unlabelled, not "wrong"
+    return cosine(ea, eb) >= float(conf.get("answer_match", 0.92))
+
+
+def record_observation(cfg, key, sim, correct):
+    """Append one exploration outcome to the entry that would have answered.
+
+    Rewrites the cache log because the entries are the record; the file is
+    capped at cache.max_entries, so this stays a small rewrite.
+    """
     conf = merged_cache(cfg)
-    if not conf.get("enabled", True):
-        return None, None, 0.0
     entries = cache_entries(conf)
     if not entries:
-        return None, None, 0.0
+        return
+    hit = False
+    for e in entries:
+        if e.get("key") == key:
+            e.setdefault("obs", []).append([round(float(sim), 4),
+                                            1 if correct else 0])
+            e["obs"] = e["obs"][-50:]        # a long tail adds nothing
+            hit = True
+            break
+    if not hit:
+        return
+    try:
+        tmp = CACHE_LOG + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as fh:
+            for e in entries:
+                fh.write(json.dumps(e, ensure_ascii=False) + "\n")
+        os.replace(tmp, CACHE_LOG)
+    except OSError:
+        pass
+
+
+def label_exploration(cfg, candidate, sim, result, trace=None):
+    """Close the exploration loop: compare the answer we just paid for against
+    the one the neighbour would have given, and record the outcome on it.
+
+    This is what turns similarity into evidence. Without it a per-entry
+    threshold has nothing to learn from.
+    """
+    if not candidate:
+        return
+    conf = merged_cache(cfg)
+    try:
+        fresh = result["choices"][0]["message"]["content"]
+        cached = candidate["result"]["choices"][0]["message"]["content"]
+    except (KeyError, IndexError, TypeError):
+        return
+    agree = answers_agree(fresh, cached, conf)
+    if agree is None:
+        return                               # no embedder: unlabelled, not wrong
+    record_observation(cfg, candidate.get("key"), sim, agree)
+    log_usage({"provider": "cache", "model": candidate.get("model"),
+               "kind": "local", "in": 0, "out": 0, "usd": 0.0,
+               "cache": "explore", "similarity": round(sim, 4),
+               "agreed": bool(agree)})
+    if trace is not None:
+        trace.append("[cache] labelled neighbour at sim=%.3f: %s"
+                     % (sim, "agreed" if agree else "disagreed"))
+
+
+def cache_lookup(cfg, messages, model):
+    """Return (entry, how, similarity, candidate).
+
+    `entry` is non-None ONLY when it may actually be served — that separation
+    is deliberate, because the exploration arm also has a near neighbour in
+    hand and it must not be mistaken for a hit. `how` is 'exact', 'semantic',
+    'explore' or None. `candidate` is the neighbour to label after the real
+    answer arrives, and is set only when `how` is 'explore'.
+    """
+    conf = merged_cache(cfg)
+    if not conf.get("enabled", True):
+        return None, None, 0.0, None
+    entries = cache_entries(conf)
+    if not entries:
+        return None, None, 0.0, None
     key = cache_key(messages, model)
     for e in reversed(entries):                  # newest wins
         if e.get("key") == key:
-            return e, "exact", 1.0
+            return e, "exact", 1.0, None
     if not conf.get("semantic"):
-        return None, None, 0.0
+        return None, None, 0.0, None
     text = normalize_prompt(messages_text(messages))
     emb = embed_text(text, conf.get("embed_model", "nomic-embed-text"))
     if not emb:
-        return None, None, 0.0
+        return None, None, 0.0, None
     best, best_sim = None, 0.0
     for e in entries:
         if e.get("model") != model or not e.get("emb"):
@@ -3227,14 +3405,21 @@ def cache_lookup(cfg, messages, model):
         sim = cosine(emb, e["emb"])
         if sim > best_sim:
             best, best_sim = e, sim
-    thr = float(conf.get("similarity", 0.95))
-    if best and best_sim >= thr:
-        return best, "semantic", best_sim
-    if best:                                     # near miss: evidence for tuning
-        log_usage({"provider": "cache", "model": model, "kind": "local",
-                   "in": 0, "out": 0, "usd": 0.0, "cache": "near-miss",
-                   "similarity": round(best_sim, 4), "threshold": thr})
-    return None, None, best_sim
+    if not best:
+        return None, None, 0.0, None
+    ok, why = certified(best, best_sim, conf)
+    if ok:
+        return best, "semantic", best_sim, None
+    # Not certified. Under vCache mode this is the EXPLORATION arm: the caller
+    # is about to pay for a real answer anyway, so the candidate rides along to
+    # be labelled once that answer arrives. Under static mode it is just a miss.
+    floor = float(conf.get("similarity", 0.95))
+    if conf.get("max_error_rate") is not None and best_sim >= floor:
+        return None, "explore", best_sim, best
+    log_usage({"provider": "cache", "model": model, "kind": "local",
+               "in": 0, "out": 0, "usd": 0.0, "cache": "near-miss",
+               "similarity": round(best_sim, 4), "reason": why})
+    return None, None, best_sim, None
 
 
 def cache_store(cfg, messages, model, result, usd=0.0, temperature=None):
@@ -3331,9 +3516,10 @@ def hub_complete(cfg, messages, targets, opts=None):
     cache_model = targets[0][1].get("model")
 
     # ---- (1) cache -----------------------------------------------------
+    explore = None          # near neighbour awaiting a correctness label
     if use_cache:
         probe_model = cache_model
-        entry, how, sim = cache_lookup(cfg, messages, probe_model)
+        entry, how, sim, explore = cache_lookup(cfg, messages, probe_model)
         if entry:
             saved = float(entry.get("usd", 0.0) or 0.0)
             log_usage({"provider": "cache", "model": probe_model, "kind": "local",
@@ -3343,6 +3529,9 @@ def hub_complete(cfg, messages, targets, opts=None):
             trace.append(f"[cache] {how} hit (sim={sim:.3f}) — $0.0000, "
                          f"saved ~${saved:.4f}")
             return entry["result"], trace
+        if explore:
+            trace.append(f"[cache] exploring: neighbour at sim={sim:.3f} is not "
+                         "certified yet; answering for real and labelling it")
 
     # ---- (2)+(3) routing already applied; now walk the rungs -----------
     rungs = cascade_rungs(cfg, targets, messages) if use_cascade else targets
@@ -3400,6 +3589,7 @@ def hub_complete(cfg, messages, targets, opts=None):
                 stats["spent"] = usd
             if use_cache:
                 cache_store(cfg, messages, cache_model, res, usd, req_temp)
+                label_exploration(cfg, explore, sim, res, trace)
             return res, trace
 
         score, why = verify_answer(messages, answer, cfg, judge)
@@ -3420,6 +3610,7 @@ def hub_complete(cfg, messages, targets, opts=None):
                 stats["spent"] = spent
             if use_cache:
                 cache_store(cfg, messages, cache_model, res, spent, req_temp)
+                label_exploration(cfg, explore, sim, res, trace)
             trace.append(f"[cascade] total ${spent:.4f} over {i + 1} rung(s)")
             return res, trace
 
@@ -3433,6 +3624,7 @@ def hub_complete(cfg, messages, targets, opts=None):
             stats["spent"] = spent
         if use_cache:
             cache_store(cfg, messages, cache_model, best[1], spent, req_temp)
+            label_exploration(cfg, explore, sim, best[1], trace)
         return best[1], trace
     return {"error": last_err or "all providers failed"}, trace
 
@@ -3474,8 +3666,9 @@ def hub_stream(cfg, messages, targets, opts=None):
         return
     cache_model = targets[0][1].get("model")
 
+    explore = None          # near neighbour awaiting a correctness label
     if use_cache:
-        entry, how, sim = cache_lookup(cfg, messages, cache_model)
+        entry, how, sim, explore = cache_lookup(cfg, messages, cache_model)
         if entry:
             saved = float(entry.get("usd", 0.0) or 0.0)
             try:
@@ -3518,6 +3711,7 @@ def hub_stream(cfg, messages, targets, opts=None):
         if use_cache and text:
             cache_store(cfg, messages, cache_model, res,
                         casc_stats.get("spent", 0.0), req_temp)
+            label_exploration(cfg, explore, sim, res)
         for frame in synth_stream(text, cache_model,
                                   res.get("usage") if want_usage else None):
             yield frame
@@ -3585,6 +3779,7 @@ def hub_stream(cfg, messages, targets, opts=None):
                 # Never cache a truncated answer.
                 if completed and use_cache and text:
                     cache_store(cfg, messages, cache_model, res, usd, req_temp)
+                    label_exploration(cfg, explore, sim, res)
         if breaker:
             # A stream that produced bytes counts as up even if the client cut
             # it short; only a failure before the first byte is the provider's.
@@ -3803,8 +3998,26 @@ def cmd_cache(cfg=None, clear=False):
           f"max_entries={conf.get('max_entries')}")
     if conf.get("semantic"):
         print(f"[cache] embed model: {conf.get('embed_model')} (local Ollama)")
+    delta = conf.get("max_error_rate")
+    if delta is None:
+        print("[cache] mode: static threshold — every neighbour above "
+              f"{conf.get('similarity')} is served")
+    else:
+        print(f"[cache] mode: verified (vCache) — max_error_rate={delta}, "
+              f"confidence={conf.get('confidence')}, "
+              f"min_observations={conf.get('min_observations')}")
     print(f"[cache] {len(entries)} live entries, "
           f"{sum(1 for e in entries if e.get('emb'))} with embeddings")
+    if delta is not None and entries:
+        # Per-entry state is the whole point of the verified mode, so show it.
+        certified_n = 0
+        for e in entries:
+            obs = e.get("obs") or []
+            if obs and certified(e, max(o[0] for o in obs), conf)[0]:
+                certified_n += 1
+        observed = sum(len(e.get("obs") or []) for e in entries)
+        print(f"[cache] {certified_n} entr(ies) certified to answer, "
+              f"{observed} observation(s) recorded")
     if entries:
         oldest = min(e.get("at", 0) for e in entries)
         print("[cache] oldest: "

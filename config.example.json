@@ -78,7 +78,11 @@
     "ttl_hours": 168,
     "max_entries": 2000,
     "embed_model": "nomic-embed-text",
-    "max_temp": 0.3
+    "max_temp": 0.3,
+    "max_error_rate": null,
+    "confidence": 0.95,
+    "answer_match": 0.92,
+    "min_observations": 3
   },
   "usage": {
     "openai": 12.5,

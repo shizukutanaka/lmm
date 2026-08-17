@@ -215,7 +215,7 @@ class TestCache(unittest.TestCase):
         result = {"choices": [{"message": {"content": "4"}}]}
         with temp_state():
             lmm.cache_store({}, msgs, "m", result, usd=0.01, temperature=0.0)
-            entry, how, sim = lmm.cache_lookup({}, msgs, "m")
+            entry, how, sim, _cand = lmm.cache_lookup({}, msgs, "m")
             self.assertEqual(how, "exact")
             self.assertEqual(sim, 1.0)
             self.assertEqual(entry["result"], result)
@@ -224,7 +224,7 @@ class TestCache(unittest.TestCase):
         msgs = [{"role": "user", "content": "surprise me"}]
         with temp_state():
             lmm.cache_store({}, msgs, "m", {"ok": 1}, usd=0.0, temperature=0.9)
-            entry, how, _ = lmm.cache_lookup({}, msgs, "m")
+            entry, how, _, _cand = lmm.cache_lookup({}, msgs, "m")
             self.assertIsNone(entry)
             self.assertIsNone(how)
 
@@ -238,7 +238,7 @@ class TestCache(unittest.TestCase):
             entries[0]["at"] = time.time() - 15 * 24 * 3600
             with open(lmm.CACHE_LOG, "w", encoding="utf-8") as fh:
                 fh.write(json.dumps(entries[0]) + "\n")
-            entry, how, _ = lmm.cache_lookup({}, msgs, "m")
+            entry, how, _, _cand = lmm.cache_lookup({}, msgs, "m")
             self.assertIsNone(entry)
 
     def test_disabled_cache_never_hits(self):
@@ -246,8 +246,225 @@ class TestCache(unittest.TestCase):
         cfg = {"cache": {"enabled": False}}
         with temp_state():
             lmm.cache_store({}, msgs, "m", {"ok": 1}, temperature=0.0)
-            entry, how, _ = lmm.cache_lookup(cfg, msgs, "m")
+            entry, how, _, _cand = lmm.cache_lookup(cfg, msgs, "m")
             self.assertIsNone(entry)
+
+
+class TestVerifiedCache(unittest.TestCase):
+    """vCache (arXiv:2502.03771): one static similarity threshold cannot bound
+    the false-hit rate, so an entry has to EARN the right to answer."""
+
+    def test_wilson_is_conservative_on_small_samples(self):
+        # The naive estimate says 2/2 == 100% correct. Certifying an entry on
+        # two lucky draws is exactly the overconfidence this guards against.
+        self.assertLess(lmm.wilson_lower_bound(2, 2), 0.8)
+        self.assertEqual(lmm.wilson_lower_bound(0, 0), 0.0)
+
+    def test_wilson_tightens_as_evidence_accumulates(self):
+        a = lmm.wilson_lower_bound(9, 10)
+        b = lmm.wilson_lower_bound(90, 100)
+        c = lmm.wilson_lower_bound(900, 1000)
+        self.assertLess(a, b)
+        self.assertLess(b, c)
+        self.assertLess(c, 0.9)          # never exceeds the observed rate
+
+    def test_wilson_bounds_are_in_range(self):
+        for k, n in ((0, 5), (5, 5), (3, 7), (1, 100)):
+            v = lmm.wilson_lower_bound(k, n)
+            self.assertGreaterEqual(v, 0.0)
+            self.assertLessEqual(v, 1.0)
+
+    def test_evidence_only_counts_observations_at_or_below_this_similarity(self):
+        # An observation made at sim 0.99 says nothing reassuring about serving
+        # at 0.90, so it must not be counted toward it.
+        entry = {"obs": [[0.99, 1], [0.95, 1], [0.85, 0]]}
+        trials, ok = lmm.entry_evidence(entry, 0.90)
+        self.assertEqual((trials, ok), (1, 0))       # only the 0.85 one
+        trials, ok = lmm.entry_evidence(entry, 0.99)
+        self.assertEqual((trials, ok), (3, 2))
+
+    def test_static_mode_is_the_default_and_unchanged(self):
+        conf = lmm.merged_cache({})
+        self.assertIsNone(conf["max_error_rate"])
+        ok, why = lmm.certified({}, 0.96, conf)
+        self.assertTrue(ok)
+        self.assertIn("static", why)
+        self.assertFalse(lmm.certified({}, 0.90, conf)[0])
+
+    def test_uncertified_entry_is_refused_until_it_has_evidence(self):
+        conf = lmm.merged_cache({"cache": {"max_error_rate": 0.05}})
+        entry = {"obs": [[0.9, 1]]}                  # one sample
+        ok, why = lmm.certified(entry, 0.9, conf)
+        self.assertFalse(ok)
+        self.assertIn("observations", why)
+
+    def test_entry_certifies_once_enough_agreement_accumulates(self):
+        conf = lmm.merged_cache({"cache": {"max_error_rate": 0.30,
+                                           "min_observations": 3}})
+        entry = {"obs": [[0.9, 1]] * 40}
+        ok, why = lmm.certified(entry, 0.9, conf)
+        self.assertTrue(ok, why)
+
+    def test_disagreements_keep_an_entry_uncertified(self):
+        conf = lmm.merged_cache({"cache": {"max_error_rate": 0.05,
+                                           "min_observations": 3}})
+        entry = {"obs": [[0.9, 1], [0.9, 0], [0.9, 1], [0.9, 0], [0.9, 1]]}
+        ok, why = lmm.certified(entry, 0.9, conf)
+        self.assertFalse(ok)
+        self.assertIn("lower bound", why)
+
+    def test_a_stricter_error_bound_certifies_less(self):
+        entry = {"obs": [[0.9, 1]] * 20}
+        loose = lmm.merged_cache({"cache": {"max_error_rate": 0.30}})
+        tight = lmm.merged_cache({"cache": {"max_error_rate": 0.001}})
+        self.assertTrue(lmm.certified(entry, 0.9, loose)[0])
+        self.assertFalse(lmm.certified(entry, 0.9, tight)[0])
+
+    def test_answers_agree_short_circuits_on_identical_text(self):
+        # No embedder needed, and none should be called.
+        saved = lmm.embed_text
+        lmm.embed_text = lambda *a, **k: self.fail("should not embed")
+        try:
+            self.assertTrue(lmm.answers_agree("same", "same", lmm.merged_cache({})))
+        finally:
+            lmm.embed_text = saved
+
+    def test_answers_agree_is_none_without_an_embedder(self):
+        # No label is not the same as a wrong label; an unavailable embedder
+        # must not be recorded as a disagreement.
+        saved = lmm.embed_text
+        lmm.embed_text = lambda *a, **k: None
+        try:
+            self.assertIsNone(lmm.answers_agree("a", "b", lmm.merged_cache({})))
+        finally:
+            lmm.embed_text = saved
+
+    def test_answers_agree_uses_the_answer_match_threshold(self):
+        saved = lmm.embed_text
+        lmm.embed_text = lambda text, model: [1.0, 0.0] if text == "a" else [0.9, 0.44]
+        try:
+            conf = lmm.merged_cache({"cache": {"answer_match": 0.80}})
+            self.assertTrue(lmm.answers_agree("a", "b", conf))
+            conf = lmm.merged_cache({"cache": {"answer_match": 0.999}})
+            self.assertFalse(lmm.answers_agree("a", "b", conf))
+        finally:
+            lmm.embed_text = saved
+
+    def test_observations_persist_onto_the_entry(self):
+        msgs = [{"role": "user", "content": "q"}]
+        with temp_state():
+            lmm.cache_store({}, msgs, "m", {"ok": 1}, temperature=0.0)
+            key = lmm.cache_key(msgs, "m")
+            lmm.record_observation({}, key, 0.93, True)
+            lmm.record_observation({}, key, 0.91, False)
+            entries = lmm.cache_entries(lmm.DEFAULT_CACHE)
+        self.assertEqual(len(entries), 1)
+        self.assertEqual(entries[0]["obs"], [[0.93, 1], [0.91, 0]])
+
+    def test_lookup_returns_an_explore_candidate_instead_of_a_hit(self):
+        # The near neighbour must never come back as a servable entry.
+        msgs_a = [{"role": "user", "content": "what is the capital of France"}]
+        msgs_b = [{"role": "user", "content": "capital of France?"}]
+        cfg = {"cache": {"semantic": True, "max_error_rate": 0.05,
+                         "similarity": 0.5}}
+        saved = lmm.embed_text
+        lmm.embed_text = lambda text, model: [1.0, 0.05] if "capital" in text else [0.0, 1.0]
+        try:
+            with temp_state():
+                lmm.cache_store(cfg, msgs_a, "m", {"ok": 1}, temperature=0.0)
+                entry, how, sim, cand = lmm.cache_lookup(cfg, msgs_b, "m")
+        finally:
+            lmm.embed_text = saved
+        self.assertIsNone(entry)                 # not servable
+        self.assertEqual(how, "explore")
+        self.assertIsNotNone(cand)               # but available to label
+        self.assertGreater(sim, 0.5)
+
+    def test_label_exploration_records_agreement(self):
+        msgs = [{"role": "user", "content": "q"}]
+        answer = {"choices": [{"message": {"content": "the answer is 4"}}]}
+        with temp_state():
+            lmm.cache_store({}, msgs, "m", answer, temperature=0.0)
+            cand = lmm.cache_entries(lmm.DEFAULT_CACHE)[0]
+            lmm.label_exploration({}, cand, 0.93, answer)   # identical text
+            entries = lmm.cache_entries(lmm.DEFAULT_CACHE)
+        self.assertEqual(entries[0]["obs"], [[0.93, 1]])
+
+    def test_label_exploration_records_disagreement(self):
+        msgs = [{"role": "user", "content": "q"}]
+        cached = {"choices": [{"message": {"content": "four"}}]}
+        fresh = {"choices": [{"message": {"content": "seventeen"}}]}
+        saved = lmm.embed_text
+        lmm.embed_text = lambda text, model: [1.0, 0.0] if "four" in text else [0.0, 1.0]
+        try:
+            with temp_state():
+                lmm.cache_store({}, msgs, "m", cached, temperature=0.0)
+                cand = lmm.cache_entries(lmm.DEFAULT_CACHE)[0]
+                lmm.label_exploration({}, cand, 0.93, fresh)
+                entries = lmm.cache_entries(lmm.DEFAULT_CACHE)
+        finally:
+            lmm.embed_text = saved
+        self.assertEqual(entries[0]["obs"], [[0.93, 0]])
+
+    def test_label_exploration_is_a_noop_without_a_candidate(self):
+        with temp_state():
+            lmm.label_exploration({}, None, 0.9, {"x": 1})   # must not raise
+
+    def drive(self, cfg, fresh, rounds=30):
+        """Run the explore/label loop and report the round it certified on."""
+        A = [{"role": "user", "content": "capital of France"}]
+        B = [{"role": "user", "content": "France capital?"}]
+        cached = {"choices": [{"message": {"content": "Paris."}}]}
+        lmm.cache_store(cfg, A, "m", cached, usd=0.02, temperature=0.0)
+        for r in range(1, rounds + 1):
+            entry, how, sim, cand = lmm.cache_lookup(cfg, B, "m")
+            if entry:
+                return r
+            if cand:
+                lmm.label_exploration(cfg, cand, sim, fresh)
+        return None
+
+    def test_an_interchangeable_neighbour_earns_certification(self):
+        cfg = {"cache": {"semantic": True, "max_error_rate": 0.20,
+                         "min_observations": 3, "similarity": 0.80}}
+        same = {"choices": [{"message": {"content": "Paris."}}]}
+        saved = lmm.embed_text
+        lmm.embed_text = lambda t, m: [1.0, 0.06]
+        try:
+            with temp_state():
+                got = self.drive(cfg, same)
+        finally:
+            lmm.embed_text = saved
+        self.assertIsNotNone(got, "a consistently-agreeing entry never certified")
+        self.assertGreater(got, 3)          # not on the first lucky samples
+
+    def test_a_neighbour_whose_answers_differ_is_never_certified(self):
+        # THE point of vCache. Similarity is high enough that a static
+        # threshold would have served this from the very first request — and
+        # been wrong every single time.
+        cfg = {"cache": {"semantic": True, "max_error_rate": 0.20,
+                         "min_observations": 3, "similarity": 0.80}}
+        different = {"choices": [{"message": {"content": "Something else."}}]}
+        saved = lmm.embed_text
+
+        def emb(t, m):
+            if "Paris" in t:
+                return [1.0, 0.0]
+            if "else" in t:
+                return [0.0, 1.0]
+            return [1.0, 0.06]
+        lmm.embed_text = emb
+        try:
+            with temp_state():
+                got = self.drive(cfg, different)
+                # and the static threshold would have served it immediately
+                static = dict(cfg["cache"])
+                static["max_error_rate"] = None
+                ok, _ = lmm.certified({}, 0.99, lmm.merged_cache({"cache": static}))
+        finally:
+            lmm.embed_text = saved
+        self.assertIsNone(got, "certified an entry whose answers disagreed")
+        self.assertTrue(ok, "static mode would indeed have served it")
 
 
 class TestMessagesHandling(unittest.TestCase):
@@ -941,7 +1158,7 @@ class TestHubStream(unittest.TestCase):
             next(gen)
             next(gen)
             gen.close()
-            entry, how, _ = lmm.cache_lookup({}, lmm.as_messages("hi"), "p")
+            entry, how, _, _cand = lmm.cache_lookup({}, lmm.as_messages("hi"), "p")
         self.assertIsNone(entry)
 
     def test_cache_hit_is_replayed_as_a_synthetic_stream(self):
@@ -1155,7 +1372,7 @@ class TestStreamingRegressions(unittest.TestCase):
         with temp_state():
             b"".join(lmm.hub_stream({}, "hi", self.targets(),
                                     {"cascade": True, "cache": True}))
-            entry, how, _ = lmm.cache_lookup({}, lmm.as_messages("hi"), "p")
+            entry, how, _, _cand = lmm.cache_lookup({}, lmm.as_messages("hi"), "p")
             self.assertEqual(how, "exact")
             self.assertGreater(entry["usd"], 0.0)
             out = b"".join(lmm.hub_stream({}, "hi", self.targets(),
