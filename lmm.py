@@ -521,9 +521,12 @@ def verify_reply(task, reply):
                              "def ", "write a", "```"]):
         if "```" not in r and "def " not in r and "class " not in r and "function" not in r:
             return False, "code task but no code block produced"
-    # heavy reasoning task: a one-liner is under-delivery
-    if any(k in t for k in ["explain", "derive", "proof", "説明", "導出",
-                             "証明", "理由", "why"]):
+    # heavy reasoning task: a one-liner is under-delivery — but ONLY for
+    # English tasks. Japanese answers can be correct and concise (e.g.
+    # "シュレーディンガー方程式です"), so we must not punish short JP replies.
+    has_jp = any('\u3040' <= c <= '\u9fff' for c in r)
+    if (not has_jp) and any(k in t for k in
+                            ["explain", "derive", "proof", "理由", "why"]):
         if len(r) < 120:
             return False, f"reasoning task but reply too short ({len(r)} chars)"
     return True, "ok"
@@ -2015,8 +2018,17 @@ def cmd_ask(prompt, provider, cfg, auto=False, verify=False):
             return
     targets = resolve_ask_targets(cfg, prompt, effective)
     if not targets:
-        print("[ask] no provider available. Start Ollama (`lmm serve <model>`) "
-              "or add 'providers' to lmm config (see `lmm examples`).")
+        if provider:
+            known = sorted(set(
+                list((cfg.get("providers") or {}).keys())
+                + [it["name"] for it in discover(cfg) if it["running"]]
+                + ["local-ollama(implicit)", "local-lmstudio(implicit)"]))
+            print(f"[ask] unknown provider '{provider}'.")
+            print(f"[ask] known providers: {', '.join(known)}")
+            print(f"[ask] or omit --provider to use ask_order / auto routing.")
+        else:
+            print("[ask] no provider available. Start Ollama (`lmm serve <model>`) "
+                  "or add 'providers' to lmm config (see `lmm examples`).")
         return
     last_err = None
     for name, prov in targets:
@@ -2433,7 +2445,12 @@ def main():
     elif cmd == "cost":
         print(cost_report(cfg, args.days))
     elif cmd == "route":
-        print(f"task: {args.task}\n=> recommend: {route_task(cfg, args.task)}")
+        rec = route_task(cfg, args.task)
+        best, reason = score_and_route(args.task, cfg, cfg.get("ask_order"))
+        print(f"task: {args.task}")
+        print(f"=> keyword recommend: {rec}")
+        print(f"=> measured best-fit : {best}")
+        print(f"   reason: {reason}")
     elif cmd == "serve":
         if getattr(args, "hub", False):
             cmd_serve_hub(cfg, args.host, args.port)
