@@ -46,6 +46,16 @@
     "token": null,
     "allow_remote": false
   },
+  "retry": {
+    "attempts": 2,
+    "base_ms": 250,
+    "cap_ms": 8000
+  },
+  "breaker": {
+    "enabled": true,
+    "threshold": 3,
+    "cooldown_s": 30
+  },
   "ask_order": [
     "my-local",
     "openai"

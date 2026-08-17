@@ -43,6 +43,11 @@
 #                (with vCache arXiv:2502.03771 on why fuzzy hits must be opt-in)
 # Every call is metered to ~/.lmm/usage.jsonl so the savings are measured
 # rather than asserted -- see `lmm cost`.
+#
+# Failover is backed by two standard reliability patterns: full-jitter retry on
+# transient failures (Marc Brooker, "Exponential Backoff And Jitter", AWS) and a
+# per-provider circuit breaker (Nygard, "Release It!"), so a blip does not lose
+# a good provider and a dead one stops costing every request its timeout.
 # ---------------------------------------------------------------------------
 import os
 import sys
@@ -134,6 +139,28 @@ DEFAULT_CACHE = {
     "max_entries": 2000,
     "embed_model": "nomic-embed-text",
     "max_temp":    0.3,    # above this the caller wants variety, not a cache
+}
+
+# Reliability. Failover across providers already existed, but it abandoned a
+# provider on the first blip and re-tried a dead one first on every request.
+# Two well-worn patterns fix that:
+#   backoff : retry a transient failure on the SAME provider, with full jitter
+#             so a fleet of clients does not retry in lockstep — the "thundering
+#             herd" AWS documents (Marc Brooker, "Exponential Backoff And
+#             Jitter"). A 429 is honoured via Retry-After (RFC 9110 s10.2.3).
+#   breaker : after N consecutive failures a provider is "open" and skipped for
+#             a cooldown, so a down backend stops costing every request its
+#             timeout. The circuit-breaker pattern, Nygard, "Release It!".
+DEFAULT_RETRY = {
+    "attempts": 2,      # total tries per provider (1 = no retry)
+    "base_ms":  250,    # first backoff; doubles each attempt
+    "cap_ms":   8000,   # ceiling on any single backoff
+}
+
+DEFAULT_BREAKER = {
+    "enabled":    True,
+    "threshold":  3,    # consecutive failures before the circuit opens
+    "cooldown_s": 30,   # how long it stays open before a half-open trial
 }
 
 # Cheap lexical features standing in for RouteLLM's learned win-predictor.
@@ -610,6 +637,83 @@ def merged_pricing(cfg):
     return p
 
 
+def merged_retry(cfg):
+    r = dict(DEFAULT_RETRY)
+    r.update(cfg.get("retry") or {})
+    return r
+
+
+def merged_breaker(cfg):
+    b = dict(DEFAULT_BREAKER)
+    b.update(cfg.get("breaker") or {})
+    return b
+
+
+def backoff_delay(attempt, base_ms, cap_ms, rand=None):
+    """Full-jitter backoff (AWS, Marc Brooker): a uniform random wait between 0
+    and the capped exponential. The randomness is what desynchronises a fleet
+    of clients so they do not all retry at the same instant.
+
+        delay = random(0, min(cap, base * 2**attempt))
+
+    `rand` is injectable so the value is testable; production passes None and
+    gets `random.random()`.
+    """
+    import random
+    r = rand if rand is not None else random.random()
+    ceiling = min(cap_ms, base_ms * (2 ** max(0, attempt))) / 1000.0
+    return r * ceiling
+
+
+class CircuitBreaker:
+    """Per-provider failure memory (Nygard, "Release It!").
+
+    closed    -> requests flow; failures are counted.
+    open      -> threshold consecutive failures reached; the provider is skipped
+                 until the cooldown elapses, so a dead backend stops charging
+                 every request its full timeout.
+    half-open -> cooldown elapsed; one trial is allowed. Success closes it,
+                 failure re-opens it.
+
+    The clock is injectable (`now`) so state transitions are testable without
+    sleeping. State is per-process: it helps the long-lived hub, and does no
+    harm to a one-shot `lmm ask`.
+    """
+
+    def __init__(self, threshold=3, cooldown_s=30):
+        self.threshold = threshold
+        self.cooldown_s = cooldown_s
+        self._fails = {}
+        self._open_until = {}
+
+    def record_success(self, name):
+        self._fails.pop(name, None)
+        self._open_until.pop(name, None)
+
+    def record_failure(self, name, now=None):
+        now = time.time() if now is None else now
+        n = self._fails.get(name, 0) + 1
+        self._fails[name] = n
+        if n >= self.threshold:
+            self._open_until[name] = now + self.cooldown_s
+
+    def state(self, name, now=None):
+        now = time.time() if now is None else now
+        until = self._open_until.get(name)
+        if until is None:
+            return "closed"
+        return "open" if now < until else "half-open"
+
+    def available(self, name, now=None):
+        """A provider is available unless its circuit is fully open."""
+        return self.state(name, now) != "open"
+
+
+# Shared by the long-lived hub across requests. `lmm ask` makes a fresh one per
+# process, which is fine — the breaker only pays off when many requests share it.
+HUB_BREAKER = CircuitBreaker()
+
+
 def merged_route(cfg):
     r = {k: list(v) for k, v in DEFAULT_ROUTE.items()}
     for k, v in (cfg.get("route") or {}).items():
@@ -699,8 +803,57 @@ def merged_providers(cfg):
     return provs
 
 
+def classify_http_error(e):
+    """Turn a transport exception into a structured error the retry layer can
+    reason about: {error, status, retriable, retry_after}.
+
+    A 429 or 5xx is worth retrying on the same provider; a 400/401/403 is the
+    request's own fault and never will be. A connection error or timeout has no
+    status and is treated as transient. The extra keys are additive — callers
+    that only read `error` are unaffected, which is why the existing fakes that
+    return a bare {"error": ...} still behave exactly as before.
+    """
+    import urllib.error
+    if isinstance(e, urllib.error.HTTPError):
+        code = e.code
+        ra = None
+        try:
+            ra = e.headers.get("Retry-After") if e.headers else None
+        except Exception:
+            ra = None
+        return {"error": "HTTP %s" % code, "status": code,
+                "retriable": code == 429 or 500 <= code < 600,
+                "retry_after": parse_retry_after(ra)}
+    return {"error": str(e), "status": None, "retriable": True,
+            "retry_after": None}
+
+
+def parse_retry_after(value):
+    """Retry-After is either delay-seconds or an HTTP-date (RFC 9110). Return
+    seconds from now, or None. A hostile or absurd value is left for the caller
+    to cap — this only parses."""
+    if not value:
+        return None
+    value = value.strip()
+    if value.isdigit():
+        return float(value)
+    try:
+        import email.utils
+        dt = email.utils.parsedate_to_datetime(value)
+        if dt is None:
+            return None
+        now = datetime.datetime.now(dt.tzinfo)
+        return max(0.0, (dt - now).total_seconds())
+    except Exception:
+        return None
+
+
 def http_post_json(url, payload, api_key, timeout=60):
-    """Minimal OpenAI-compatible chat completion call (zero-dep, stdlib only)."""
+    """Minimal OpenAI-compatible chat completion call (zero-dep, stdlib only).
+
+    On failure returns a classified error dict (see classify_http_error) rather
+    than raising, so the retry and failover layers can decide what to do.
+    """
     import urllib.request
     data = json.dumps(payload).encode("utf-8")
     req = urllib.request.Request(
@@ -711,7 +864,7 @@ def http_post_json(url, payload, api_key, timeout=60):
         with urllib.request.urlopen(req, timeout=timeout) as resp:
             return json.loads(resp.read().decode("utf-8", "ignore"))
     except Exception as e:  # network / auth errors must surface, not silently pass
-        return {"error": str(e)}
+        return classify_http_error(e)
 
 
 def http_stream_sse(url, payload, api_key, timeout=300):
@@ -736,7 +889,7 @@ def http_stream_sse(url, payload, api_key, timeout=300):
     try:
         resp = urllib.request.urlopen(req, timeout=timeout)
     except Exception as e:
-        yield None, {"error": str(e)}
+        yield None, classify_http_error(e)
         return
     saw_frame = False
     try:
@@ -834,6 +987,40 @@ def call_provider(prov, prompt, temperature=0.7, extra=None):
             payload[k] = extra[k]
     payload.pop("stream", None)                 # we never stream upstream
     return http_post_json(url, payload, prov.get("api_key", ""))
+
+
+def call_with_retry(prov, prompt, temperature=0.7, extra=None, retry=None,
+                    sleep=None):
+    """call_provider with bounded, jittered retry on transient failures.
+
+    Only errors classified `retriable` (429, 5xx, connection/timeout) are
+    retried, and only on the same provider — a 400 or 401 is retried nowhere
+    because it would fail identically. A 429's Retry-After is honoured but
+    capped at the backoff ceiling so a hostile header cannot park the hub.
+
+    A bare {"error": ...} from a monkeypatched fake has no `retriable` key, so
+    it defaults to no retry — the pre-retry behaviour, which keeps every
+    existing test valid.
+    """
+    retry = retry or DEFAULT_RETRY
+    attempts = max(1, int(retry.get("attempts", 1)))
+    sleep = sleep or time.sleep
+    last = None
+    for attempt in range(attempts):
+        res = call_provider(prov, prompt, temperature, extra)
+        if not (isinstance(res, dict) and res.get("error")):
+            return res
+        last = res
+        if not res.get("retriable") or attempt == attempts - 1:
+            return res
+        delay = backoff_delay(attempt, retry.get("base_ms", 250),
+                              retry.get("cap_ms", 8000))
+        ra = res.get("retry_after")
+        if ra is not None:                     # server told us how long to wait
+            delay = min(float(ra), retry.get("cap_ms", 8000) / 1000.0)
+        if delay > 0:
+            sleep(delay)
+    return last
 
 
 def call_provider_stream(prov, prompt, temperature=0.7, extra=None):
@@ -1912,7 +2099,8 @@ def cmd_serve_hub(cfg, host, port):
                         or self.headers.get("X-LMM-No-Cache") is not None)
             extra = {k: req[k] for k in PASSTHROUGH_KEYS if k in req}
             hub_opts = {"cascade": bool(req.get("lmm_cascade")),
-                        "cache": not no_cache, "extra": extra, "source": "hub"}
+                        "cache": not no_cache, "extra": extra, "source": "hub",
+                        "breaker": HUB_BREAKER}
             if req.get("stream"):
                 hub_opts["client_usage"] = bool(
                     (req.get("stream_options") or {}).get("include_usage"))
@@ -2272,6 +2460,13 @@ def cmd_examples():
         # binding wider is refused unless you set a token (recommended) or
         # explicitly opt into an unauthenticated bind.
         "hub": {"token": None, "allow_remote": False},
+        # Retry a TRANSIENT failure (429, 5xx, timeout) on the same provider,
+        # with full-jitter backoff. A 4xx is never retried — it would fail the
+        # same way. attempts=1 disables retrying.
+        "retry": {"attempts": 2, "base_ms": 250, "cap_ms": 8000},
+        # Stop paying a down provider's timeout on every request: after
+        # `threshold` consecutive failures it is skipped for `cooldown_s`.
+        "breaker": {"enabled": True, "threshold": 3, "cooldown_s": 30},
         # Provider priority. Set it and lmm follows your order exactly;
         # leave it out and route_threshold below decides.
         "ask_order": ["my-local", "openai"],
@@ -2761,16 +2956,32 @@ def hub_complete(cfg, messages, targets, opts=None):
     if use_cascade and casc.get("judge"):
         judge = merged_providers(cfg).get(casc["judge"])
     threshold = float(casc.get("threshold", 0.6))
+    retry = merged_retry(cfg)
+    breaker = opts.get("breaker")
     spent = 0.0
     best = None                      # (score, result, name) fallback
     last_err = None
 
+    # Skip providers whose circuit is open, but never skip the last one
+    # standing: refusing to try anything at all is worse than one timeout.
+    if breaker:
+        live = [(n, p) for n, p in rungs if breaker.available(n)]
+        if live:
+            skipped = len(rungs) - len(live)
+            if skipped:
+                trace.append(f"[breaker] skipping {skipped} provider(s) with an "
+                             "open circuit")
+            rungs = live
+
     for i, (name, prov) in enumerate(rungs):
         t0 = time.time()
-        res = call_provider(prov, messages, temperature=temp, extra=extra)
+        res = call_with_retry(prov, messages, temperature=temp, extra=extra,
+                              retry=retry)
         elapsed_ms = int((time.time() - t0) * 1000)
         if isinstance(res, dict) and res.get("error"):
             last_err = res["error"]
+            if breaker:
+                breaker.record_failure(name)
             trace.append(f"[{'cascade' if use_cascade else 'ask'}] "
                          f"rung{i} {name} failed: {last_err} -> next")
             continue
@@ -2778,8 +2989,12 @@ def hub_complete(cfg, messages, targets, opts=None):
             answer = res["choices"][0]["message"]["content"]
         except (KeyError, IndexError, TypeError):
             last_err = "unexpected response shape"
+            if breaker:
+                breaker.record_failure(name)
             trace.append(f"[ask] rung{i} {name} returned an unexpected shape -> next")
             continue
+        if breaker:
+            breaker.record_success(name)       # a real answer closes the circuit
 
         if not use_cascade:
             usd = meter_call(name, prov, prov.get("model"), res, pricing,
@@ -2857,6 +3072,7 @@ def hub_stream(cfg, messages, targets, opts=None):
     use_cascade = opts.get("cascade", casc.get("enabled", False))
     want_usage = bool(opts.get("client_usage"))   # did the CLIENT ask for usage?
 
+    breaker = opts.get("breaker")
     targets = order_targets(cfg, messages, targets)
     if not targets:
         yield sse_frame({"error": {"message": "no provider available"}})
@@ -2915,6 +3131,10 @@ def hub_stream(cfg, messages, targets, opts=None):
 
     # True pass-through.
     last_err = None
+    if breaker:
+        live = [(n, p) for n, p in targets if breaker.available(n)]
+        if live:
+            targets = live       # keep at least one candidate even if all open
     for name, prov in targets:
         t0 = time.time()
         started = False        # any byte written -> failover is no longer possible
@@ -2971,6 +3191,13 @@ def hub_stream(cfg, messages, targets, opts=None):
                 # Never cache a truncated answer.
                 if completed and use_cache and text:
                     cache_store(cfg, messages, cache_model, res, usd, req_temp)
+        if breaker:
+            # A stream that produced bytes counts as up even if the client cut
+            # it short; only a failure before the first byte is the provider's.
+            if started:
+                breaker.record_success(name)
+            elif failed:
+                breaker.record_failure(name)
         if failed and not started:
             last_err = failed                          # nothing written: fail over
             continue

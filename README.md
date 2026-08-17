@@ -293,6 +293,39 @@ keywords, or configure the hub. See `lmm examples` for the full shape —
 | `cache` | `{enabled, semantic, similarity, ttl_hours, max_entries, embed_model, max_temp}` |
 | `pricing` / `route` / `usage` / `extra_runtimes` | As before |
 
+### Failing over well
+
+Falling through to the next provider on error was the only reliability lmm had,
+and it had three holes: a single transient blip abandoned a working provider, a
+permanently dead one was re-tried first on *every* request, and `429`'s
+`Retry-After` was ignored. Two standard patterns close them:
+
+**Retry with full jitter** — a transient failure (`429`, `5xx`, connection
+error, timeout) is retried on the *same* provider before failing over, with the
+delay drawn uniformly from `[0, min(cap, base·2^attempt)]`. That randomisation
+is the point: a fixed exponential schedule makes every client retry in lockstep,
+the thundering herd documented in
+[Exponential Backoff And Jitter](https://aws.amazon.com/blogs/architecture/exponential-backoff-and-jitter/)
+(Marc Brooker, AWS) — full jitter is the default in the AWS SDKs for that reason.
+A `4xx` is never retried, because it would fail identically. `Retry-After`
+(both delay-seconds and HTTP-date forms, per RFC 9110 §10.2.3) is honoured but
+capped at `cap_ms`, so a hostile header can't park the hub.
+
+**Circuit breaker** — after `threshold` consecutive failures a provider's
+circuit opens and it's skipped for `cooldown_s`, then given one half-open trial;
+success closes it. Without this a dead backend charges every single request its
+full timeout. The pattern is from Michael Nygard's *Release It!*. The breaker
+never skips the last candidate standing — refusing to try anything is worse than
+one timeout.
+
+```jsonc
+"retry":   { "attempts": 2, "base_ms": 250, "cap_ms": 8000 },  // attempts:1 = off
+"breaker": { "enabled": true, "threshold": 3, "cooldown_s": 30 }
+```
+
+Breaker state is per-process, so it pays off in the long-lived `serve --hub` and
+is harmless in a one-shot `lmm ask`.
+
 ## Hub security
 
 The hub proxies to your providers using **your** API keys, so whoever can reach

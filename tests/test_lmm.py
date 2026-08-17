@@ -1288,14 +1288,219 @@ class TestUntrustedConfig(unittest.TestCase):
                                     "models_cmd": "echo pwned"}]}
 
     def test_untrusted_config_does_not_run_models_cmd(self):
+        import io
+        import contextlib
         lmm.CONFIG_PATH, lmm.CONFIG_TRUSTED = "lmm.config.json", False
-        lmm.detect_extra(self.cfg())
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            lmm.detect_extra(self.cfg())
         self.assertNotIn("echo pwned", self._ran)    # models_cmd never ran
+        self.assertIn("ignoring models_cmd", err.getvalue())   # and it says why
 
     def test_trusted_config_runs_models_cmd(self):
         lmm.CONFIG_PATH, lmm.CONFIG_TRUSTED = "/home/u/.lmm/config.json", True
         lmm.detect_extra(self.cfg())
         self.assertIn("echo pwned", self._ran)
+
+
+class TestBackoff(unittest.TestCase):
+    """Full-jitter backoff (AWS, Marc Brooker)."""
+
+    def test_delay_is_within_the_capped_exponential(self):
+        # rand injected at the extremes bounds the range.
+        for attempt in range(6):
+            hi = lmm.backoff_delay(attempt, 250, 8000, rand=1.0)
+            lo = lmm.backoff_delay(attempt, 250, 8000, rand=0.0)
+            self.assertEqual(lo, 0.0)                      # full jitter reaches 0
+            self.assertLessEqual(hi, 8000 / 1000.0)        # never exceeds the cap
+            self.assertAlmostEqual(hi, min(8000, 250 * 2 ** attempt) / 1000.0)
+
+    def test_grows_until_the_cap(self):
+        a = lmm.backoff_delay(0, 250, 8000, rand=1.0)
+        b = lmm.backoff_delay(1, 250, 8000, rand=1.0)
+        self.assertGreater(b, a)
+
+
+class TestRetryAfter(unittest.TestCase):
+    def test_integer_seconds(self):
+        self.assertEqual(lmm.parse_retry_after("5"), 5.0)
+        self.assertEqual(lmm.parse_retry_after("0"), 0.0)
+
+    def test_http_date_in_the_future_is_positive(self):
+        import email.utils, datetime as dt
+        future = email.utils.format_datetime(
+            dt.datetime.now(dt.timezone.utc) + dt.timedelta(seconds=30))
+        self.assertGreater(lmm.parse_retry_after(future), 20)
+
+    def test_garbage_and_empty_are_none(self):
+        self.assertIsNone(lmm.parse_retry_after("soon"))
+        self.assertIsNone(lmm.parse_retry_after(""))
+        self.assertIsNone(lmm.parse_retry_after(None))
+
+
+class TestErrorClassification(unittest.TestCase):
+    def make(self, code, retry_after=None):
+        import urllib.error, io
+        hdrs = {}
+        if retry_after is not None:
+            hdrs["Retry-After"] = retry_after
+        return urllib.error.HTTPError("http://x", code, "msg",
+                                      hdrs, io.BytesIO(b""))
+
+    def test_429_and_5xx_are_retriable(self):
+        for code in (429, 500, 502, 503):
+            self.assertTrue(lmm.classify_http_error(self.make(code))["retriable"], code)
+
+    def test_4xx_client_errors_are_not_retriable(self):
+        for code in (400, 401, 403, 404, 422):
+            self.assertFalse(lmm.classify_http_error(self.make(code))["retriable"], code)
+
+    def test_connection_errors_are_retriable(self):
+        got = lmm.classify_http_error(OSError("connection refused"))
+        self.assertTrue(got["retriable"])
+        self.assertIsNone(got["status"])
+
+    def test_retry_after_is_parsed_from_the_header(self):
+        got = lmm.classify_http_error(self.make(429, "7"))
+        self.assertEqual(got["retry_after"], 7.0)
+
+
+class TestCallWithRetry(unittest.TestCase):
+    def setUp(self):
+        self._call = lmm.call_provider
+        self.slept = []
+
+    def tearDown(self):
+        lmm.call_provider = self._call
+
+    def sleep(self, d):
+        self.slept.append(d)
+
+    def sequence(self, results):
+        it = iter(results)
+        self.n = 0
+
+        def _call(prov, prompt, temperature=0.7, extra=None):
+            self.n += 1
+            return next(it)
+        lmm.call_provider = _call
+
+    def test_transient_error_then_success(self):
+        self.sequence([{"error": "503", "retriable": True},
+                       {"choices": [{"message": {"content": "ok"}}]}])
+        res = lmm.call_with_retry({}, "hi",
+                                  retry={"attempts": 3, "base_ms": 1, "cap_ms": 2},
+                                  sleep=self.sleep)
+        self.assertEqual(res["choices"][0]["message"]["content"], "ok")
+        self.assertEqual(self.n, 2)
+        self.assertEqual(len(self.slept), 1)
+
+    def test_permanent_error_is_not_retried(self):
+        self.sequence([{"error": "401", "retriable": False}])
+        res = lmm.call_with_retry({}, "hi",
+                                  retry={"attempts": 3, "base_ms": 1, "cap_ms": 2},
+                                  sleep=self.sleep)
+        self.assertIn("error", res)
+        self.assertEqual(self.n, 1)                # tried once, gave up
+
+    def test_bare_error_from_a_fake_is_not_retried(self):
+        # No `retriable` key -> the pre-retry behaviour, so old fakes still work.
+        self.sequence([{"error": "boom"}])
+        lmm.call_with_retry({}, "hi",
+                            retry={"attempts": 3, "base_ms": 1, "cap_ms": 2},
+                            sleep=self.sleep)
+        self.assertEqual(self.n, 1)
+
+    def test_attempts_are_bounded(self):
+        self.sequence([{"error": "503", "retriable": True}] * 9)
+        lmm.call_with_retry({}, "hi",
+                            retry={"attempts": 3, "base_ms": 1, "cap_ms": 2},
+                            sleep=self.sleep)
+        self.assertEqual(self.n, 3)                # never more than `attempts`
+
+    def test_retry_after_overrides_backoff_and_is_capped(self):
+        self.sequence([{"error": "429", "retriable": True, "retry_after": 999},
+                       {"choices": [{"message": {"content": "ok"}}]}])
+        lmm.call_with_retry({}, "hi",
+                            retry={"attempts": 2, "base_ms": 1, "cap_ms": 3000},
+                            sleep=self.sleep)
+        self.assertEqual(self.slept, [3.0])        # capped at cap_ms, not 999s
+
+
+class TestCircuitBreaker(unittest.TestCase):
+    def test_opens_after_threshold_consecutive_failures(self):
+        cb = lmm.CircuitBreaker(threshold=3, cooldown_s=30)
+        self.assertTrue(cb.available("p", now=0))
+        cb.record_failure("p", now=0)
+        cb.record_failure("p", now=0)
+        self.assertTrue(cb.available("p", now=0))   # 2 < 3, still closed
+        cb.record_failure("p", now=0)
+        self.assertFalse(cb.available("p", now=0))  # tripped
+
+    def test_half_open_after_cooldown(self):
+        cb = lmm.CircuitBreaker(threshold=1, cooldown_s=30)
+        cb.record_failure("p", now=100)
+        self.assertEqual(cb.state("p", now=110), "open")
+        self.assertEqual(cb.state("p", now=131), "half-open")
+        self.assertTrue(cb.available("p", now=131))
+
+    def test_success_closes_the_circuit(self):
+        cb = lmm.CircuitBreaker(threshold=1, cooldown_s=30)
+        cb.record_failure("p", now=0)
+        self.assertFalse(cb.available("p", now=0))
+        cb.record_success("p")
+        self.assertTrue(cb.available("p", now=0))
+        self.assertEqual(cb.state("p", now=0), "closed")
+
+    def test_success_resets_the_failure_count(self):
+        cb = lmm.CircuitBreaker(threshold=3, cooldown_s=30)
+        cb.record_failure("p", now=0)
+        cb.record_failure("p", now=0)
+        cb.record_success("p")                      # count back to 0
+        cb.record_failure("p", now=0)
+        cb.record_failure("p", now=0)
+        self.assertTrue(cb.available("p", now=0))   # only 2 since the reset
+
+
+class TestBreakerInHub(unittest.TestCase):
+    def setUp(self):
+        self._call = lmm.call_provider
+
+    def tearDown(self):
+        lmm.call_provider = self._call
+
+    def targets(self):
+        return [("dead", {"kind": "remote", "model": "d", "price": {"in": 1, "out": 2}}),
+                ("good", {"kind": "remote", "model": "g", "price": {"in": 1, "out": 2}})]
+
+    def test_open_provider_is_skipped(self):
+        seen = []
+
+        def _call(prov, prompt, temperature=0.7, extra=None):
+            seen.append(prov.get("model"))
+            return {"choices": [{"message": {"content": "ok"}}],
+                    "usage": {"prompt_tokens": 1, "completion_tokens": 1}}
+        lmm.call_provider = _call
+        cb = lmm.CircuitBreaker(threshold=1, cooldown_s=999)
+        cb.record_failure("dead", now=time.time())   # force it open
+        with temp_state():
+            lmm.hub_complete({"ask_order": ["dead", "good"]}, "hi", self.targets(),
+                             {"cache": False, "breaker": cb})
+        self.assertEqual(seen, ["g"])                # dead was skipped
+
+    def test_a_provider_failure_is_recorded(self):
+        def _call(prov, prompt, temperature=0.7, extra=None):
+            if prov.get("model") == "d":
+                return {"error": "503", "retriable": False}
+            return {"choices": [{"message": {"content": "ok"}}],
+                    "usage": {"prompt_tokens": 1, "completion_tokens": 1}}
+        lmm.call_provider = _call
+        cb = lmm.CircuitBreaker(threshold=1, cooldown_s=999)
+        with temp_state():
+            lmm.hub_complete({"ask_order": ["dead", "good"]}, "hi", self.targets(),
+                             {"cache": False, "breaker": cb})
+        self.assertFalse(cb.available("dead", now=time.time()))
+        self.assertTrue(cb.available("good", now=time.time()))
 
 
 class temp_state(object):
