@@ -2187,9 +2187,23 @@ def cmd_ask(prompt, provider, cfg, auto=False, verify=False):
             latency = int((time.time() - t0) * 1000)
             reply_text = "".join(full)
             tokens = len(reply_text) // 4  # rough token estimate
+            # measure REAL cost: $/1M tok * actual tokens (FrugalGPT: measure, don't
+            # trust a static table). Local backends cost $0.
+            in_tok = len(prompt) // 4
+            out_tok = tokens
+            pricing = merged_pricing(cfg)
+            if "local-" in name or name.endswith("(implicit)"):
+                cost_usd = 0.0
+            else:
+                fam = name.split(":")[0].lower()
+                pr = pricing.get(fam, pricing.get("default", {"in": 3.0, "out": 15.0}))
+                cost_usd = (in_tok * float(pr.get("in", 3.0))
+                            + out_tok * float(pr.get("out", 15.0))) / 1_000_000.0
+            cost_usd = round(cost_usd, 6)
             log_hub({"event": "ask_attempt", "provider": name, "ok": True,
                      "latency_ms": latency, "prompt": prompt,
-                     "reply_tokens": tokens, "reason": "success"})
+                     "reply_tokens": tokens, "cost_usd": cost_usd,
+                     "reason": "success"})
             log_hub({"event": "ask", "provider": name, "ok": True,
                      "prompt": prompt, "reply": reply_text[:200]})
             return
@@ -2912,7 +2926,7 @@ def cmd_stats(cfg):
     total = len(attempts)
     for i, e in enumerate(attempts):
         name = e.get("provider", "?")
-        rec = by_provider.setdefault(name, {"ok": 0, "fail": 0, "lat": []})
+        rec = by_provider.setdefault(name, {"ok": 0, "fail": 0, "lat": [], "cost": 0.0})
         if e.get("ok"):
             rec["ok"] += 1
             # first attempt of a session = index 0 or right after an all-fail
@@ -2922,22 +2936,28 @@ def cmd_stats(cfg):
             rec["fail"] += 1
         if isinstance(e.get("latency_ms"), int):
             rec["lat"].append(e["latency_ms"])
+        if isinstance(e.get("cost_usd"), (int, float)):
+            rec["cost"] += e["cost_usd"]
 
     print(f"lmm stats — {total} routing attempt(s) measured:")
-    print(f"{'backend':<32}{'success':>9}{'fail':>6}{'succ%':>8}{'avg_ms':>9}")
-    print("-" * 64)
+    print(f"{'backend':<32}{'success':>9}{'fail':>6}{'succ%':>8}{'avg_ms':>9}{'cost$':>10}")
+    print("-" * 74)
+    total_cost = 0.0
     for name, rec in sorted(by_provider.items(),
                             key=lambda kv: -(kv[1]["ok"] + kv[1]["fail"])):
         tot = rec["ok"] + rec["fail"]
         pct = (rec["ok"] / tot * 100) if tot else 0
         avg = int(sum(rec["lat"]) / len(rec["lat"])) if rec["lat"] else 0
-        print(f"{name:<32}{rec['ok']:>9}{rec['fail']:>6}{pct:>7.0f}%{avg:>9}")
+        total_cost += rec["cost"]
+        print(f"{name:<32}{rec['ok']:>9}{rec['fail']:>6}{pct:>7.0f}%{avg:>9}{rec['cost']:>10.4f}")
     overall_ok = sum(r["ok"] for r in by_provider.values())
     overall_pct = (overall_ok / total * 100) if total else 0
-    print("-" * 64)
-    print(f"{'TOTAL':<32}{overall_ok:>9}{total - overall_ok:>6}{overall_pct:>7.0f}%")
+    print("-" * 74)
+    print(f"{'TOTAL':<32}{overall_ok:>9}{total - overall_ok:>6}{overall_pct:>7.0f}%{'':>9}{total_cost:>10.4f}")
     print(f"first-try success rate: {first_try_ok}/{total} "
           f"({first_try_ok / total * 100:.0f}%)")
+    print(f"total estimated cost: ${total_cost:.4f} "
+          f"(local backends are free; cloud costs are measured per actual tokens)")
 
 
 def main():
