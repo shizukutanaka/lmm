@@ -216,12 +216,12 @@ CLAUDE_CREDS    = os.path.join(HOME, ".claude", ".credentials.json")
 
 
 # ----------------------------- low level helpers ---------------------------
-def run(cmd):
+def run(cmd, timeout=25):
     """Run a shell command, tolerating Windows CP932 output. Returns a
     subprocess.CompletedProcess-like object with .stdout/.stderr as text, or
-    None on failure."""
+    None on failure (exception/timeout)."""
     try:
-        r = subprocess.run(cmd, shell=True, capture_output=True, timeout=25)
+        r = subprocess.run(cmd, shell=True, capture_output=True, timeout=timeout)
         r.stdout = r.stdout.decode("utf-8", "ignore") if r.stdout else ""
         r.stderr = r.stderr.decode("utf-8", "ignore") if r.stderr else ""
         return r
@@ -883,8 +883,19 @@ def cmd_pull(model):
         print("usage: lmm pull <ollama-model>  e.g. lmm pull qwen2.5-coder:7b")
         return
     print(f"pulling {model} into local Ollama ...")
-    r = run(f"ollama pull {model}")
-    print((r.stdout.strip() if r else "(pull failed/timeout)"))
+    r = run(f"ollama pull {model}", timeout=900)
+    if r is None or r.returncode != 0:
+        # command itself failed/exceptioned
+        err = (r.stderr.strip() if r and r.stderr else "(pull failed/timeout)")
+        print(err)
+    else:
+        # success: ollama pull prints progress; confirm presence via list
+        confirm = run(f"ollama list", timeout=30)
+        ok = confirm and model.split(":")[0] in (confirm.stdout or "") \
+            and (model.split(":")[1] if ":" in model else "") in (confirm.stdout or "")
+        print((r.stdout.strip() if r.stdout else "") or "pull complete.")
+        if not ok:
+            print("(warning: model not found in `ollama list` after pull)")
     print("done. Use `lmm models` to confirm, `lmm ask` to route to it.")
 
 
@@ -893,8 +904,12 @@ def cmd_serve(model):
         print("usage: lmm serve <ollama-model>  e.g. lmm serve qwen2.5-coder:7b")
         return
     print(f"pulling {model} ...")
-    r = run(f"ollama pull {model}")
-    print((r.stdout.strip() if r else "(pull failed/timeout)"))
+    r = run(f"ollama pull {model}", timeout=900)
+    if r is None or r.returncode != 0:
+        err = (r.stderr.strip() if r and r.stderr else "(pull failed/timeout)")
+        print(err)
+    else:
+        print((r.stdout.strip() if r.stdout else "") or "pull complete.")
     print("endpoint ready: http://localhost:11434  (OpenAI-compatible)")
 
 
@@ -1350,7 +1365,6 @@ def launch_gui(cfg):
     root.title("LMM — Local/remote Model Manager")
     root.geometry("920x560")
     _tray_cleanup = setup_tray(root)  # minimize -> stay in system tray
-    _tray_cleanup = setup_tray(root)
     root.bind("<Map>", lambda e: None)  # restored from tray -> no-op
 
     style = ttk.Style()
