@@ -45,6 +45,12 @@ the merge of the managed-routing line of work into the same tool.
   - **Two commands.** `cli` was an alias for `discover`; `hub-status`'s one
     unique capability — probing each configured provider — moved into
     `doctor`, which is where a health probe belongs.
+  - **A second pre-push hook and its scaffolding.** `hooks/pre-push` was the
+    unwired ancestor of `.githooks/pre-push`; `setup-hooks.bat` wrapped the
+    one command (`git config core.hooksPath .githooks`) that is identical on
+    every platform; `lmm_ROADMAP.md` was a 70-feature speculation whose own
+    conclusion was that most of it should not be built — and whose "build
+    now" list had already been built.
 
 ### Added
 - The managed-routing commands: `chat` (a REPL that keeps history), `config`
@@ -112,6 +118,16 @@ the merge of the managed-routing line of work into the same tool.
   two live checks are already skipped there. The gate now asserts that `doctor`
   runs and reaches a verdict, and prints that verdict, so an unhealthy host is
   still visible without failing the build.
+- **The pre-push guard blocked every push, worked on exactly one machine,
+  and silently skipped its own tree check.** It tested each pushed `.py`
+  file as a lone blob — a premise that died with the three-file split, since
+  a lone `lmm.py` exits 1 by design; it hardcoded one specific machine's
+  temp directory, so it only ran at all on that machine; and it looked for
+  `guard.sh` inside `.githooks/`, where it has never been, so the tree-level
+  check silently never executed. It now checks out the exact pushed revision
+  into a temporary git worktree and runs the selftest there — portable, and
+  proven both ways: a good revision passes, a tree with a module deleted is
+  blocked.
 - **`selftest --guard` ignored its own contract.** It documented "exit code
   only" and then printed the full banner. It now prints failures only, so a
   green run is silent and a red one still says what broke.

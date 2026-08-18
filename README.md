@@ -670,6 +670,14 @@ mkdir -p .github/workflows && cp ci/github-actions-ci.yml .github/workflows/ci.y
 git add .github && git commit -m "ci: enable GitHub Actions" && git push
 ```
 
+For contributors there is also a local proof-before-ship gate: enable it once
+with `git config core.hooksPath .githooks` (same command on every platform).
+`pre-commit` runs `guard.sh` against the working tree, and `pre-push` checks
+out the **exact revision being pushed** into a temporary worktree and runs its
+selftest there — the working tree may contain unpushed edits that would mask
+or cause a failure, so it is the wrong thing to test at push time. Override
+with `LMM_SKIP_HOOK=1` when you mean it.
+
 ## How it works
 
 | Concern        | Approach                                                        |
@@ -690,13 +698,3 @@ git add .github && git commit -m "ci: enable GitHub Actions" && git push
 ## License
 
 MIT — see [LICENSE](LICENSE).
-
-# lmm -- proof-before-ship: every push passes the embedded selftest.
-
-Every `git push` runs the hub's own `selftest --guard` on the exact blob being
-pushed (via `.githooks/pre-push`, wired through `git config core.hooksPath
-.githooks`). A broken hub (valid Python, broken logic) is blocked before it
-reaches the remote. Survives fresh clones — run `setup-hooks.bat` once after
-cloning (Windows) or `git config core.hooksPath .githooks` on other platforms.
-
-Override (explicit, per self-edit-gate): `LMM_SKIP_HOOK=1 git push`.

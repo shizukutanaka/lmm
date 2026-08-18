@@ -3448,6 +3448,45 @@ class TestPackaging(unittest.TestCase):
                 offenders[mod] = extra
         self.assertEqual(offenders, {}, "non-stdlib imports found")
 
+    def test_no_tracked_file_carries_a_personal_machine_path(self):
+        """The pre-push hook hardcoded one contributor's Windows temp
+        directory, which made the guard run on exactly one machine on Earth
+        and fail everywhere else. Pin the class, not the instance: no
+        tracked text file may name a specific user's home directory."""
+        import subprocess
+        import re
+        r = subprocess.run(["git", "ls-files"], cwd=self.root,
+                           stdout=subprocess.PIPE, timeout=60)
+        pat = re.compile(r"C:[/\\]Users[/\\](?!Public)[^/\\]+"
+                         r"|/home/(?!user\b)[a-z][a-z0-9_-]+/"
+                         r"|/Users/[a-z][a-z0-9_-]+/")
+        offenders = []
+        for name in r.stdout.decode().splitlines():
+            p = os.path.join(self.root, name)
+            try:
+                with open(p, encoding="utf-8") as f:
+                    text = f.read()
+            except (UnicodeDecodeError, OSError):
+                continue
+            for m in pat.finditer(text):
+                offenders.append("%s: %s" % (name, m.group(0)))
+        self.assertEqual(offenders, [])
+
+    def test_the_push_gate_proves_the_pushed_revision(self):
+        """pre-push must check out and selftest the exact revision being
+        pushed — testing lone blobs died with the three-file split, and
+        testing the working tree tests the wrong thing. Structural: the hook
+        exists, is the only pre-push, and uses a worktree, not blobs."""
+        hook = os.path.join(self.root, ".githooks", "pre-push")
+        self.assertTrue(os.path.isfile(hook))
+        self.assertFalse(os.path.exists(os.path.join(self.root, "hooks")),
+                         "a second, unwired hooks/ directory is back")
+        with open(hook, encoding="utf-8") as f:
+            text = f.read()
+        self.assertIn("git worktree add", text)
+        self.assertNotIn("git show", text,
+                         "the hook is testing lone blobs again")
+
     def test_a_lone_entry_point_explains_itself(self):
         """Copying lmm.py by itself must not end in an import traceback."""
         import subprocess
