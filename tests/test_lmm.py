@@ -21,7 +21,15 @@ import tempfile
 import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-import lmm  # noqa: E402
+# `lmm` is a thin entry point over two layers: backend.py (the engine) and
+# frontend.py (the cmd_* handlers and the GUI). Tests substitute engine symbols
+# at runtime -- call_provider, embed_text, discover -- and a name rebound on the
+# lmm shim would not be seen by the engine functions that call it, because
+# `from backend import *` copies values at import time. Patching the defining
+# module is therefore the only thing that works, and `lmm` is bound to it here
+# so those substitutions land where the engine actually looks.
+import backend as lmm  # noqa: E402
+import frontend  # noqa: E402
 
 
 class TestPromptStrength(unittest.TestCase):
@@ -861,7 +869,7 @@ class TestConfigMerging(unittest.TestCase):
         import contextlib
         buf = io.StringIO()
         with contextlib.redirect_stdout(buf):
-            lmm.cmd_examples()
+            frontend.cmd_examples()
         json.loads(buf.getvalue())
 
 
@@ -2123,7 +2131,7 @@ class TestHubCostStats(unittest.TestCase):
     def test_dash_cards_render_from_the_same_stats(self):
         with temp_state():
             self.seed()
-            cards = lmm.dash_cards({})
+            cards = frontend.dash_cards({})
         labels = [c[0] for c in cards]
         self.assertIn("Hub spend", labels)
         self.assertIn("Cache savings", labels)
@@ -2142,7 +2150,7 @@ class TestHubCostStats(unittest.TestCase):
              "installed": True}]
         try:
             with temp_state():
-                h = lmm.build_dash({})
+                h = frontend.build_dash({})
         finally:
             lmm.discover = saved
         self.assertTrue(h.startswith("<!doctype"))
@@ -2193,18 +2201,18 @@ class TestPruneSeen(unittest.TestCase):
 
     def test_absent_handles_are_forgotten_after_the_grace(self):
         seen = {100: 1, 200: 1}
-        lmm.prune_seen(seen, live={200}, tick=4, grace=2)
+        frontend.prune_seen(seen, live={200}, tick=4, grace=2)
         self.assertNotIn(100, seen)                  # gone 3 ticks: forgotten
         self.assertIn(200, seen)
 
     def test_recently_absent_handles_survive_the_grace(self):
         seen = {100: 3}
-        lmm.prune_seen(seen, live=set(), tick=4, grace=2)
+        frontend.prune_seen(seen, live=set(), tick=4, grace=2)
         self.assertIn(100, seen)                     # only 1 tick gone
 
     def test_live_handles_are_never_pruned(self):
         seen = {100: 0}
-        lmm.prune_seen(seen, live={100}, tick=99, grace=2)
+        frontend.prune_seen(seen, live={100}, tick=99, grace=2)
         self.assertIn(100, seen)
 
 
@@ -2232,7 +2240,7 @@ class TestPresentationSurfaces(unittest.TestCase):
         buf = io.StringIO()
         with temp_state():
             with contextlib.redirect_stdout(buf):
-                lmm.cmd_cache(cfg)
+                frontend.cmd_cache(cfg)
         out = buf.getvalue()
         self.assertIn("similarity=0.8", out)
         self.assertIn("ttl_hours=1", out)
@@ -2249,7 +2257,7 @@ class TestPresentationSurfaces(unittest.TestCase):
         buf = io.StringIO()
         try:
             with contextlib.redirect_stdout(buf):
-                lmm.cmd_models({})
+                frontend.cmd_models({})
         finally:
             lmm.discover = saved
         out = buf.getvalue()
@@ -2554,11 +2562,11 @@ class TestUsageCompaction(unittest.TestCase):
             self.seed()
             before = io.StringIO()
             with contextlib.redirect_stdout(before):
-                lmm.cmd_cache({})
+                frontend.cmd_cache({})
             lmm.usage_compact(keep=5)
             after = io.StringIO()
             with contextlib.redirect_stdout(after):
-                lmm.cmd_cache({})
+                frontend.cmd_cache({})
         line_b = [l for l in before.getvalue().splitlines() if "hits:" in l][0]
         line_a = [l for l in after.getvalue().splitlines() if "hits:" in l][0]
         self.assertEqual(line_b, line_a)
@@ -2608,7 +2616,7 @@ class TestGuiLogic(unittest.TestCase):
         # `running` is "window or port"; `serving` is "the port answered".
         # Collapsing them was what made a GUI app and a headless server look
         # identical in the table.
-        rows = lmm.gui_rows(self.ITEMS)
+        rows = frontend.gui_rows(self.ITEMS)
         self.assertEqual(len(rows), 2)
         (vals, tag) = rows[0]
         self.assertEqual(tag, "on")
@@ -2618,40 +2626,40 @@ class TestGuiLogic(unittest.TestCase):
         self.assertEqual(rows[1][0][4], "-")      # not serving
 
     def test_rows_have_one_cell_per_column(self):
-        for vals, _ in lmm.gui_rows(self.ITEMS):
+        for vals, _ in frontend.gui_rows(self.ITEMS):
             self.assertEqual(len(vals), 8)        # matches the GUI's `cols`
 
     def test_paid_and_models_render(self):
-        vals = lmm.gui_rows(self.ITEMS)[0][0]
+        vals = frontend.gui_rows(self.ITEMS)[0][0]
         self.assertEqual(vals[2], "free")
         self.assertIn("qwen2.5:7b", vals[6])
-        self.assertEqual(lmm.gui_rows(self.ITEMS)[1][0][2], "PAID")
-        self.assertEqual(lmm.gui_rows(self.ITEMS)[1][0][6], "-")
+        self.assertEqual(frontend.gui_rows(self.ITEMS)[1][0][2], "PAID")
+        self.assertEqual(frontend.gui_rows(self.ITEMS)[1][0][6], "-")
 
     def test_rows_survive_a_sparse_item(self):
         # detect_extra used to omit keys detect_runtime emits.
-        rows = lmm.gui_rows([{"name": "X", "type": "local", "running": False}])
+        rows = frontend.gui_rows([{"name": "X", "type": "local", "running": False}])
         self.assertEqual(rows[0][0][4], "-")
         self.assertEqual(rows[0][0][5], 0)
 
     def test_model_choices_are_deduped_and_sorted(self):
         items = self.ITEMS + [{"name": "LM Studio", "type": "local",
                                "running": True, "models": ["llama3.1:8b", "phi-4"]}]
-        self.assertEqual(lmm.gui_model_choices(items),
+        self.assertEqual(frontend.gui_model_choices(items),
                          ["llama3.1:8b", "phi-4", "qwen2.5:7b"])
 
     def test_model_choices_empty_when_nothing_is_running(self):
-        self.assertEqual(lmm.gui_model_choices([{"name": "X", "models": []}]), [])
+        self.assertEqual(frontend.gui_model_choices([{"name": "X", "models": []}]), [])
 
     def test_gpu_label_warns_only_when_vram_is_tight(self):
-        tight = lmm.gpu_label({"name": "RTX", "used": 900, "total": 1000, "pct": 90})
-        roomy = lmm.gpu_label({"name": "RTX", "used": 100, "total": 1000, "pct": 10})
+        tight = frontend.gpu_label({"name": "RTX", "used": 900, "total": 1000, "pct": 90})
+        roomy = frontend.gpu_label({"name": "RTX", "used": 100, "total": 1000, "pct": 10})
         self.assertIn("\u26a0", tight)
         self.assertNotIn("\u26a0", roomy)
         self.assertIn("RTX", roomy)
 
     def test_gpu_label_handles_no_gpu(self):
-        self.assertEqual(lmm.gpu_label(None), "GPU: n/a")
+        self.assertEqual(frontend.gpu_label(None), "GPU: n/a")
 
 
 class TestWatchDecision(unittest.TestCase):
@@ -2659,7 +2667,7 @@ class TestWatchDecision(unittest.TestCase):
     part that regressed before — recycled handles being skipped forever."""
 
     def watchlist(self):
-        return lmm.watch_list({})
+        return frontend.watch_list({})
 
     def test_watchlist_covers_the_registry(self):
         wl = self.watchlist()
@@ -2668,33 +2676,33 @@ class TestWatchDecision(unittest.TestCase):
         self.assertTrue(all(kw == kw.lower() for _, kw in wl))
 
     def test_watchlist_includes_user_runtimes(self):
-        wl = lmm.watch_list({"extra_runtimes": [{"name": "My Agent"}]})
+        wl = frontend.watch_list({"extra_runtimes": [{"name": "My Agent"}]})
         self.assertIn(("My Agent", "my agent"), wl)
 
     def test_a_window_is_acted_on_once(self):
         seen, wl = {}, [("claude", "claude")]
-        first = lmm.watch_new_windows([(100, "Claude")], seen, 1, wl)
+        first = frontend.watch_new_windows([(100, "Claude")], seen, 1, wl)
         self.assertEqual([(h, t, r) for h, t, r in first],
                          [(100, "Claude", "claude")])
-        again = lmm.watch_new_windows([(100, "Claude")], seen, 2, wl)
+        again = frontend.watch_new_windows([(100, "Claude")], seen, 2, wl)
         self.assertEqual(again, [])               # not hidden twice
 
     def test_a_recycled_handle_is_treated_as_new_again(self):
         # Windows reuses HWND values. Before prune_seen, a new window landing
         # on an old handle was skipped forever and never hidden.
         seen, wl = {}, [("claude", "claude")]
-        lmm.watch_new_windows([(100, "Claude")], seen, 1, wl)
-        lmm.prune_seen(seen, live=set(), tick=5, grace=2)   # window closed
-        again = lmm.watch_new_windows([(100, "Claude")], seen, 6, wl)
+        frontend.watch_new_windows([(100, "Claude")], seen, 1, wl)
+        frontend.prune_seen(seen, live=set(), tick=5, grace=2)   # window closed
+        again = frontend.watch_new_windows([(100, "Claude")], seen, 6, wl)
         self.assertEqual(len(again), 1)
 
     def test_the_owning_runtime_is_identified(self):
-        wl = lmm.watch_list({})
-        got = lmm.watch_new_windows([(1, "ChatGPT")], {}, 1, wl)
+        wl = frontend.watch_list({})
+        got = frontend.watch_new_windows([(1, "ChatGPT")], {}, 1, wl)
         self.assertEqual(got[0][2], "chatgpt")
 
     def test_an_unmatched_title_still_reports_a_placeholder(self):
-        got = lmm.watch_new_windows([(1, "Some Other App")], {}, 1,
+        got = frontend.watch_new_windows([(1, "Some Other App")], {}, 1,
                                     [("claude", "claude")])
         self.assertEqual(got[0][2], "?")
 
@@ -2702,8 +2710,8 @@ class TestWatchDecision(unittest.TestCase):
         # An existing window must keep its tick refreshed, or prune_seen will
         # forget a window that is still open.
         seen, wl = {}, [("claude", "claude")]
-        lmm.watch_new_windows([(100, "Claude")], seen, 1, wl)
-        lmm.watch_new_windows([(100, "Claude")], seen, 7, wl)
+        frontend.watch_new_windows([(100, "Claude")], seen, 1, wl)
+        frontend.watch_new_windows([(100, "Claude")], seen, 7, wl)
         self.assertEqual(seen[100], 7)
 
 
@@ -2813,7 +2821,7 @@ class HubServer(object):
         # fixture was silently swallowing every print in the interpreter for
         # the rest of the run.
         self.thread = threading.Thread(
-            target=lmm.cmd_serve_hub, args=(cfg, host, self.port),
+            target=frontend.cmd_serve_hub, args=(cfg, host, self.port),
             kwargs={"quiet": True}, daemon=True)
         self.thread.start()
         for _ in range(100):                  # wait for the listener
@@ -3060,7 +3068,7 @@ class TestCommandSurfaces(unittest.TestCase):
                 lmm.HOME = d
                 try:
                     with contextlib.redirect_stdout(io.StringIO()):
-                        lmm.cmd_dash({})
+                        frontend.cmd_dash({})
                     path = os.path.join(d, ".lmm_dashboard.html")
                     self.assertTrue(os.path.isfile(path))
                     with open(path, encoding="utf-8") as fh:
@@ -3082,7 +3090,7 @@ class TestCommandSurfaces(unittest.TestCase):
             "R", (), {"stdout": "ok", "stderr": "", "returncode": 0})()
         try:
             with contextlib.redirect_stdout(io.StringIO()):
-                lmm.cmd_serve("qwen2.5-coder:7b")
+                frontend.cmd_serve("qwen2.5-coder:7b")
         finally:
             lmm.run = saved
         self.assertIn("ollama pull qwen2.5-coder:7b", ran)
@@ -3096,7 +3104,7 @@ class TestCommandSurfaces(unittest.TestCase):
         buf = io.StringIO()
         try:
             with contextlib.redirect_stdout(buf):
-                lmm.cmd_serve(None)
+                frontend.cmd_serve(None)
         finally:
             lmm.run = saved
         self.assertEqual(ran, [])
@@ -3113,12 +3121,426 @@ class TestCommandSurfaces(unittest.TestCase):
         buf = io.StringIO()
         try:
             with contextlib.redirect_stdout(buf):
-                lmm.cmd_autostart()
+                frontend.cmd_autostart()
         finally:
             lmm.run = saved_run
         if saved_os != "nt":
             self.assertEqual(ran, [], "autostart shelled out on a non-Windows host")
             self.assertTrue(buf.getvalue().strip())
+
+
+class TestModuleSplit(unittest.TestCase):
+    """`lmm` is three files: an engine, a presentation layer, and a shim.
+
+    The split is only worth having if it holds, so these assert the boundary
+    rather than trusting it: the engine must not grow a cmd_* handler, the
+    entry point must still expose both halves under one name, and rebinding an
+    engine symbol must actually be seen by the engine.
+    """
+
+    def test_backend_holds_no_command_handlers(self):
+        stray = [n for n in dir(lmm) if n.startswith("cmd_")]
+        self.assertEqual(stray, [], "engine grew a CLI handler: %s" % stray)
+        self.assertFalse(hasattr(lmm, "main"),
+                         "argument parsing belongs to the frontend")
+
+    def test_frontend_holds_the_command_handlers(self):
+        for name in ("cmd_ask", "cmd_serve_hub", "cmd_selftest", "cmd_doctor",
+                     "cmd_fit", "cmd_cache", "main"):
+            self.assertTrue(callable(getattr(frontend, name, None)), name)
+
+    def test_entry_point_reexports_both_layers(self):
+        import lmm as entry
+        for name in ("hub_complete", "cache_lookup", "read_gguf"):   # engine
+            self.assertTrue(hasattr(entry, name), name)
+        for name in ("cmd_ask", "launch_gui", "main"):               # frontend
+            self.assertTrue(hasattr(entry, name), name)
+
+    def test_rebinding_an_engine_symbol_is_seen_by_the_engine(self):
+        """The reason the suite patches `backend`, not the `lmm` shim.
+
+        `from backend import *` copies values at import time, so a name
+        rebound on the shim afterwards is invisible to the engine functions
+        that call it. Every patch in this file depends on that being true of
+        the defining module and not of the shim, so it is asserted once here.
+        """
+        import lmm as entry
+        saved = lmm.embed_text
+        try:
+            lmm.embed_text = lambda text, model: [1.0, 0.0]
+            self.assertEqual(lmm.embed_text("x", "m"), [1.0, 0.0])
+            self.assertIsNot(entry.embed_text, lmm.embed_text,
+                             "the shim holds its own copy, as star-import does")
+        finally:
+            lmm.embed_text = saved
+
+
+class TestCommandWiring(unittest.TestCase):
+    """Every registered subcommand must be dispatched, and vice versa.
+
+    `lmm hide` was a silent no-op and `lmm cli` exited 2 because a subparser
+    existed with no matching branch, and a branch existed with no subparser.
+    Both were invisible to a suite that only tested functions, so the wiring
+    is checked structurally, over the whole surface at once.
+    """
+
+    def _parsed(self):
+        import ast
+        path = os.path.join(os.path.dirname(os.path.dirname(
+            os.path.abspath(__file__))), "frontend.py")
+        with open(path, encoding="utf-8") as f:
+            tree = ast.parse(f.read())
+        main = next(n for n in tree.body
+                    if isinstance(n, ast.FunctionDef) and n.name == "main")
+        registered, dispatched = set(), set()
+        for node in ast.walk(main):
+            if (isinstance(node, ast.Call)
+                    and isinstance(node.func, ast.Attribute)
+                    and node.func.attr == "add_parser"
+                    and node.args
+                    and isinstance(node.args[0], ast.Constant)):
+                registered.add(node.args[0].value)
+            if isinstance(node, ast.Compare) and isinstance(node.left, ast.Name) \
+                    and node.left.id == "cmd":
+                for c in node.comparators:
+                    if isinstance(c, ast.Constant) and isinstance(c.value, str):
+                        dispatched.add(c.value)
+        return registered, dispatched
+
+    def test_every_subcommand_is_dispatched(self):
+        registered, dispatched = self._parsed()
+        self.assertTrue(registered, "no subcommands found")
+        self.assertEqual(sorted(registered - dispatched), [],
+                         "registered but never dispatched (a silent no-op)")
+
+    def test_every_dispatch_branch_has_a_subcommand(self):
+        registered, dispatched = self._parsed()
+        self.assertEqual(sorted(dispatched - registered), [],
+                         "dispatched but unregistered (argparse exits 2)")
+
+    def test_surface_the_selftest_gate_requires_is_present(self):
+        """`lmm selftest` — this repo's CI gate — asserts these exist."""
+        registered, _ = self._parsed()
+        needed = ["discover", "status", "models", "cost", "route", "serve",
+                  "ask", "chat", "hub-status", "config", "log", "selftest",
+                  "stop", "dash", "gui", "watch", "autostart", "hide",
+                  "examples"]
+        self.assertEqual([c for c in needed if c not in registered], [])
+
+
+class TestUnifiedCallProvider(unittest.TestCase):
+    """One transport serves the hub and the interactive commands.
+
+    The hub needs caller-supplied parameters forwarded (tools, max_tokens);
+    `lmm ask` and `lmm chat` need a full history and a token stream. Those
+    grew as two signatures on two branches, so the merged one is pinned here.
+    """
+
+    def setUp(self):
+        self.stub = StubBackend()
+        self.prov = {"api_key": "k", "base_url": self.stub.base_url,
+                     "model": "m", "kind": "local"}
+
+    def tearDown(self):
+        self.stub.stop()
+
+    def test_messages_win_over_prompt(self):
+        lmm.call_provider(self.prov, "ignored",
+                          messages=[{"role": "system", "content": "be terse"},
+                                    {"role": "user", "content": "hi"}])
+        sent = self.stub.seen[-1]["messages"]
+        self.assertEqual([m["role"] for m in sent], ["system", "user"])
+
+    def test_bare_prompt_becomes_one_user_turn(self):
+        lmm.call_provider(self.prov, "hi")
+        self.assertEqual(self.stub.seen[-1]["messages"],
+                         [{"role": "user", "content": "hi"}])
+
+    def test_extra_params_are_forwarded(self):
+        lmm.call_provider(self.prov, "hi", extra={"max_tokens": 7})
+        self.assertEqual(self.stub.seen[-1]["max_tokens"], 7)
+
+    def test_non_streaming_never_asks_upstream_to_stream(self):
+        lmm.call_provider(self.prov, "hi")
+        self.assertFalse(self.stub.seen[-1].get("stream"))
+
+    def test_stream_returns_text_chunks(self):
+        gen = lmm.call_provider(self.prov, "hi", stream=True)
+        self.assertNotIsInstance(gen, dict)
+        text = "".join(gen)
+        self.assertIn("answer is 4", text)
+        self.assertTrue(self.stub.seen[-1]["stream"])
+
+    def test_a_provider_with_no_model_reports_instead_of_calling(self):
+        res = lmm.call_provider({"base_url": "http://127.0.0.1:1/v1"}, "hi")
+        self.assertIn("error", res)
+
+
+class TestRunTimeout(unittest.TestCase):
+    """`lmm pull` downloads for minutes; a status probe must not wait that long."""
+
+    def test_default_is_short(self):
+        import inspect
+        self.assertEqual(
+            inspect.signature(lmm.run).parameters["timeout"].default, 25)
+
+    def test_caller_can_extend_it(self):
+        r = lmm.run("exit 0", timeout=120)
+        self.assertIsNotNone(r)
+        self.assertEqual(r.returncode, 0)
+
+
+class TestMergedCommands(unittest.TestCase):
+    """Behaviour that exists because two branches each solved half of it."""
+
+    def _capture(self, fn, *a, **kw):
+        import io
+        import contextlib
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            fn(*a, **kw)
+        return buf.getvalue()
+
+    def test_discover_save_seeds_ask_order_from_what_is_running(self):
+        saved_home, saved_disc = lmm.HOME, lmm.discover
+        d = tempfile.mkdtemp(prefix="lmm-home-")
+        try:
+            lmm.HOME = d
+            lmm.discover = lambda cfg, **kw: [
+                {"name": "Ollama", "running": True, "paid": False},
+                {"name": "Jan", "running": False, "paid": False}]
+            out = self._capture(frontend.cmd_discover, {}, False, True)
+            with open(os.path.join(d, ".lmm", "config.json")) as f:
+                written = json.load(f)
+            self.assertEqual(written["ask_order"], ["Ollama"])
+            self.assertIn("Ollama", out)
+        finally:
+            lmm.HOME, lmm.discover = saved_home, saved_disc
+            shutil.rmtree(d, ignore_errors=True)
+
+    def test_discover_save_with_nothing_running_writes_nothing(self):
+        saved_home, saved_disc = lmm.HOME, lmm.discover
+        d = tempfile.mkdtemp(prefix="lmm-home-")
+        try:
+            lmm.HOME = d
+            lmm.discover = lambda cfg, **kw: [
+                {"name": "Ollama", "running": False, "paid": False}]
+            out = self._capture(frontend.cmd_discover, {}, False, True)
+            self.assertFalse(os.path.exists(os.path.join(d, ".lmm", "config.json")),
+                             "wrote an empty priority list over the user's config")
+            self.assertIn("nothing to save", out)
+        finally:
+            lmm.HOME, lmm.discover = saved_home, saved_disc
+            shutil.rmtree(d, ignore_errors=True)
+
+    def test_models_lists_runtimes_and_configured_providers(self):
+        """A cloud provider needs no local process, so discover never sees it."""
+        saved_disc, saved_fetch = lmm.discover, frontend.fetch_models
+        try:
+            lmm.discover = lambda cfg, **kw: [
+                {"name": "Ollama", "running": True, "models": ["llama3:8b"]}]
+            frontend.fetch_models = lambda prov: ["gpt-4o-mini"]
+            out = self._capture(frontend.cmd_models,
+                                {"providers": {"openai": {
+                                    "api_key": "k", "base_url": "http://x/v1",
+                                    "model": "gpt-4o-mini", "kind": "cloud"}}})
+            self.assertIn("llama3:8b", out)
+            self.assertIn("gpt-4o-mini", out)
+        finally:
+            lmm.discover, frontend.fetch_models = saved_disc, saved_fetch
+
+    def test_ask_auto_routes_by_measured_fit(self):
+        saved = frontend.score_and_route
+        seen = []
+        try:
+            frontend.score_and_route = lambda task, cfg, order: (
+                seen.append(task) or (None, "no candidates"))
+            out = self._capture(frontend.cmd_ask, "explain gradient descent",
+                                None, {}, auto=True)
+            self.assertEqual(seen, ["explain gradient descent"])
+            self.assertIn("auto-routing skipped", out)
+        finally:
+            frontend.score_and_route = saved
+
+    def test_ask_verify_prints_the_backend_that_passed_the_gate(self):
+        saved = frontend.route_and_verify
+        try:
+            frontend.route_and_verify = lambda task, cfg, order: (
+                "good", "verified ok", "42")
+            out = self._capture(frontend.cmd_ask, "q", None, {}, verify=True)
+            self.assertIn("good", out)
+            self.assertIn("42", out)
+        finally:
+            frontend.route_and_verify = saved
+
+    def test_ask_verify_says_so_when_nothing_passes(self):
+        saved = frontend.route_and_verify
+        try:
+            frontend.route_and_verify = lambda task, cfg, order: (
+                None, "all replies unfit", None)
+            out = self._capture(frontend.cmd_ask, "q", None, {}, verify=True)
+            self.assertIn("no backend passed", out)
+            self.assertIn("all replies unfit", out)
+        finally:
+            frontend.route_and_verify = saved
+
+    def test_unknown_provider_names_the_ones_that_exist(self):
+        """A typo is not an outage; a dead end should carry the fix."""
+        saved = lmm.discover
+        try:
+            lmm.discover = lambda cfg, **kw: []
+            out = self._capture(frontend.cmd_ask, "q", "openia", {})
+            self.assertIn("unknown provider 'openia'", out)
+            self.assertIn("known providers", out)
+        finally:
+            lmm.discover = saved
+
+
+class TestPackaging(unittest.TestCase):
+    """An install that cannot start is worse than no install.
+
+    Splitting one file into three broke both installers and the documented
+    curl line: they still shipped `lmm.py` alone, so every fresh install died
+    on `from backend import *` before printing anything. These derive the file
+    list from the repository rather than hardcoding it, so adding a fourth
+    module fails here until the installers and the README know about it.
+    """
+
+    def setUp(self):
+        self.root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        self.modules = sorted(
+            f for f in os.listdir(self.root)
+            if f.endswith(".py") and not f.startswith("test"))
+
+    def test_the_repo_has_the_modules_we_think_it_has(self):
+        self.assertEqual(self.modules, ["backend.py", "frontend.py", "lmm.py"])
+
+    def _read(self, name):
+        with open(os.path.join(self.root, name), encoding="utf-8") as f:
+            return f.read()
+
+    def test_installers_ship_every_module(self):
+        for installer in ("install.sh", "install.ps1"):
+            text = self._read(installer)
+            for mod in self.modules:
+                self.assertIn(mod, text,
+                              "%s does not ship %s" % (installer, mod))
+
+    def test_readme_tells_you_to_fetch_every_module(self):
+        readme = self._read("README.md")
+        install = readme[readme.index("## Install"):readme.index("## Usage")]
+        for mod in self.modules:
+            self.assertIn(mod, install,
+                          "the install instructions never mention " + mod)
+
+    def test_every_import_resolves_to_the_standard_library(self):
+        """"Zero dependencies" is the headline claim, so it gets a test.
+
+        It was only ever checked by a CI step that read `lmm.py`, which after
+        the split imports almost nothing — the check would have passed while a
+        third-party import sat in `backend.py`. Scanning every module keeps it
+        honest, and deriving the local names from the repo means a new module
+        is not mistaken for a missing package.
+        """
+        import ast
+        if not hasattr(sys, "stdlib_module_names"):
+            self.skipTest("needs Python 3.10+ to introspect the stdlib list")
+        local = {m[:-3] for m in self.modules}
+        offenders = {}
+        for mod in self.modules:
+            names = set()
+            for node in ast.walk(ast.parse(self._read(mod))):
+                if isinstance(node, ast.Import):
+                    names.update(a.name.split(".")[0] for a in node.names)
+                elif (isinstance(node, ast.ImportFrom) and node.level == 0
+                        and node.module):
+                    names.add(node.module.split(".")[0])
+            extra = sorted(n for n in names
+                           if n not in sys.stdlib_module_names and n not in local)
+            if extra:
+                offenders[mod] = extra
+        self.assertEqual(offenders, {}, "non-stdlib imports found")
+
+    def test_a_lone_entry_point_explains_itself(self):
+        """Copying lmm.py by itself must not end in an import traceback."""
+        import subprocess
+        d = tempfile.mkdtemp(prefix="lmm-lone-")
+        try:
+            shutil.copy(os.path.join(self.root, "lmm.py"),
+                        os.path.join(d, "lmm.py"))
+            r = subprocess.run([sys.executable, os.path.join(d, "lmm.py"),
+                                "discover"], cwd=d, stdout=subprocess.PIPE,
+                               stderr=subprocess.PIPE, timeout=120)
+            err = r.stderr.decode("utf-8", "ignore")
+            self.assertEqual(r.returncode, 1, err)
+            self.assertNotIn("Traceback", err)
+            self.assertIn("backend.py", err)
+            self.assertIn("same directory", err)
+        finally:
+            shutil.rmtree(d, ignore_errors=True)
+
+    def test_install_sh_produces_a_working_command(self):
+        import subprocess
+        if not shutil.which("bash"):
+            self.skipTest("bash not available")
+        home = tempfile.mkdtemp(prefix="lmm-home-")
+        try:
+            env = dict(os.environ, HOME=home)
+            r = subprocess.run(["bash", os.path.join(self.root, "install.sh")],
+                               env=env, stdout=subprocess.PIPE,
+                               stderr=subprocess.PIPE, timeout=120)
+            self.assertEqual(r.returncode, 0,
+                             r.stderr.decode("utf-8", "ignore"))
+            launcher = os.path.join(home, ".local", "bin", "lmm")
+            self.assertTrue(os.path.isfile(launcher), "no launcher installed")
+            v = subprocess.run([launcher, "--version"], env=env,
+                               stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                               timeout=120)
+            out = v.stdout.decode("utf-8", "ignore")
+            self.assertEqual(v.returncode, 0,
+                             out + v.stderr.decode("utf-8", "ignore"))
+            self.assertIn("lmm ", out)
+        finally:
+            shutil.rmtree(home, ignore_errors=True)
+
+
+class TestSelftestGate(unittest.TestCase):
+    """`lmm selftest --guard` is what CI and the pre-push hook actually run."""
+
+    def _run(self, *args):
+        import subprocess
+        root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        env = dict(os.environ, LMM_SELFTEST_SKIP_LIVE="1")
+        return subprocess.run([sys.executable, os.path.join(root, "lmm.py"),
+                               "selftest"] + list(args), cwd=root, env=env,
+                              stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                              timeout=300)
+
+    def test_guard_mode_exits_zero_and_stays_quiet(self):
+        r = self._run("--guard")
+        out = r.stdout.decode("utf-8", "ignore")
+        self.assertEqual(r.returncode, 0, out + r.stderr.decode("utf-8", "ignore"))
+        self.assertEqual(out.strip(), "",
+                         "a green guard run has nothing to say:\n" + out)
+
+    def test_verbose_mode_reports_every_check(self):
+        r = self._run()
+        out = r.stdout.decode("utf-8", "ignore")
+        self.assertEqual(r.returncode, 0, out)
+        self.assertIn("SELFTEST PASS", out)
+        self.assertIn("[PASS]", out)
+
+    def test_a_machine_without_a_backend_does_not_fail_the_gate(self):
+        """`doctor` grades the machine; `selftest` grades lmm.
+
+        Requiring "doctor: HEALTHY" here made the gate unpassable on any host
+        without a live backend — including this project's own CI runner, where
+        the live checks are skipped for exactly that reason.
+        """
+        r = self._run()
+        out = r.stdout.decode("utf-8", "ignore")
+        self.assertIn("doctor command runs", out)
+        self.assertNotIn("[FAIL] doctor", out)
 
 
 class temp_state(object):

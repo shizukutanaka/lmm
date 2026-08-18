@@ -1,7 +1,6 @@
-# lmm — Local/remote Model Manager
+# lmm — Local/remote Model Manager & Unified Inference Hub
 
-
-> One file. Zero dependencies. One endpoint in front of every LLM you use —
+> Three files, no dependencies. One endpoint in front of every LLM you use —
 > and a bill you can actually see.
 
 `lmm` is a tiny, cross-platform manager for **all** your LLM runtimes: local
@@ -15,7 +14,7 @@ claimed. On Windows it also keeps those apps' windows off your taskbar.
 
 ## Why this exists (first principles)
 
-Running LLMs locally and remotely at the same time creates three problems, and
+Running LLMs locally and remotely at the same time creates four problems, and
 `lmm` is organised around them:
 
 1. **You cannot see what you are spending.** Cloud spend arrives a month late
@@ -25,38 +24,60 @@ Running LLMs locally and remotely at the same time creates three problems, and
 2. **The strongest model is the wrong default.** Most prompts do not need it.
    `lmm` routes on a cost threshold, runs cheap models first and escalates only
    on a bad answer, and reuses answers it already paid for.
-3. **State must be visible** (Nielsen heuristic #1 — *Visibility of System
+3. **You should not have to remember which backend to call.** `lmm` holds the
+   routing brain — `ask_order`, automatic fallback, and a reply check that can
+   fall through a backend that answered badly — so one prompt reaches the right
+   place whether you type `lmm ask`, `lmm chat`, or point an app at
+   `lmm serve --hub`.
+4. **State must be visible** (Nielsen heuristic #1 — *Visibility of System
    Status*), so you should not have to remember commands to see it. Hence the
-   dashboard, and — on Windows, where each LLM app grabs its own taskbar
-   button — the ability to keep them out of your way automatically.
+   dashboard, `lmm log` and `lmm stats` — and, on Windows, where each LLM app
+   grabs its own taskbar button, the ability to keep them out of your way.
 
 ## Install
 
 ```bash
-# download the single file
-curl -fsSL https://raw.githubusercontent.com/shizukutanaka/lmm/main/lmm.py -o ~/.local/bin/lmm && chmod +x ~/.local/bin/lmm
-# or just:  python lmm.py <command>
-
-# install + shell alias (macOS/Linux)
+# clone (or download the three files) and install
+git clone https://github.com/shizukutanaka/lmm && cd lmm
 ./install.sh
 # Windows:  powershell -ExecutionPolicy Bypass -File install.ps1
+
+# no clone? fetch the three files into one directory and run it in place
+for f in lmm.py backend.py frontend.py; do
+  curl -fsSLO https://raw.githubusercontent.com/shizukutanaka/lmm/main/$f
+done
+python lmm.py <command>
 ```
 
 Requires only Python 3.8+ (tkinter optional, for the GUI). No `pip install`.
+
+`lmm` is three files, not one: `lmm.py` is a thin entry point over `backend.py`
+(the engine — no CLI, no GUI, so it can be tested without a terminal or a
+display) and `frontend.py` (argument parsing, the `cmd_*` handlers and the
+dashboard). **They must stay in the same directory.** The installer places all
+three in `~/.local/share/lmm` and puts a small launcher on your PATH; if you
+copy files by hand and miss one, `lmm` says which one rather than throwing an
+import traceback.
 
 ## Usage
 
 ```
 lmm                 -> live GUI dashboard (default; falls back to text status headless)
-lmm discover        -> list every detected runtime (CLI)
+lmm discover        -> list every detected runtime (--save seeds ask_order)
 lmm cli             -> same as discover (explicit CLI mode)
 lmm status          -> runtimes + GPU + hub/cache/breaker summary
-lmm models          -> models on every running runtime
+lmm models          -> models on every running runtime and configured provider
+lmm pull <model>    -> pull a model into the local Ollama store
 lmm cost [--days N] -> measured spend: Anthropic logs + lmm's own hub telemetry
 lmm route "task"    -> recommend local vs remote (--explain for the score)
+lmm priority        -> show ask_order, or --optimize it from measured results
 lmm fit [model|f.gguf] -> does it fit in your GPU, and at what context length?
 lmm bench           -> measure TTFT / TPOT / throughput per provider
-lmm ask "prompt"    -> ask any backend: cached, routed, optionally cascaded
+
+# --- asking ---
+lmm ask "prompt"    -> one question, cached, routed, optionally cascaded
+                       (--cascade, --auto, --verify, --explain, --no-cache)
+lmm chat            -> interactive REPL that keeps conversation history
 lmm serve <model>   -> pull + expose a local model endpoint (Ollama)
 lmm serve --hub     -> OpenAI-compatible proxy over every configured provider
 lmm cache           -> prompt-cache stats (--clear to drop it)
@@ -66,6 +87,7 @@ lmm watch           -> background daemon: auto-hide new LLM windows
 lmm autostart       -> register `watch` to run at OS login (zero effort)
 lmm dash            -> generate + open a self-contained HTML dashboard
 lmm gui             -> open the live GUI dashboard explicitly
+lmm config <init|list|get|set|unset> [key] [value] -> manage hub settings (CLI)
 lmm examples        -> print a sample config file
 ```
 
@@ -313,6 +335,105 @@ setup, so including it would measure your machine's cold start rather than its
 steady-state serving speed. Results are medians over the measured runs, with
 the TTFT range shown so a single lucky sample can't masquerade as a result.
 
+### The hub, in one minute
+
+```bash
+# 1. Ask anything — lmm picks the backend (ask_order), falls back on failure
+$ lmm ask "What is 2+2?"
+[ask] -> trying local-ollama(implicit) (qwen2.5-coder:7b)
+4
+
+# 2. Streaming + conversation (REPL keeps history across turns)
+$ lmm chat
+you> explain recursion in one sentence.
+hub> Recursion is when a function calls itself to solve smaller subproblems.
+
+# 3. A stable OpenAI-compatible endpoint for ANY client (zero config)
+$ lmm serve --hub --port 8080
+# now:  curl http://localhost:8080/v1/chat/completions  (OpenAI SDK works)
+
+# 3b. Real models, real routing — point any OpenAI SDK at the hub:
+$ python -c "from openai import OpenAI; c=OpenAI(base_url='http://localhost:8080/v1',api_key='lmm'); print([m.id for m in c.models.list().data])"
+# -> ['qwen2.5-coder:3b', 'qwen2.5-coder:7b', 'qwen2.5-coder:14b']
+$ python -c "from openai import OpenAI; c=OpenAI(base_url='http://localhost:8080/v1',api_key='lmm'); print(c.chat.completions.create(model='qwen2.5-coder:3b', messages=[{'role':'user','content':'hi'}]).model)"
+# -> qwen2.5-coder:3b   (routed to the exact model you asked for)
+
+# 4. User-controlled routing priority
+$ lmm config set ask_order '["openai","local-ollama(implicit)"]'
+
+# 5. Prove what the hub actually did (measurement, not assumption)
+$ lmm log
+[OK ] 2026-08-17T02:44:22 ask   -> local-ollama(implicit) prompt='What is 2+2?'
+[OK ] 2026-08-17T02:51:18 serve -> local-ollama(implicit) reply='STREAMOK'
+```
+
+### Unified model registry
+
+`lmm models` lists models across **every** detected backend — local Ollama *and*
+any configured cloud OpenAI-compatible endpoint (`/v1/models`). It measures each
+live; unreachable backends are reported, not assumed-present.
+
+```bash
+$ lmm models
+Ollama (local):
+  - qwen2.5-coder:7b
+  - qwen2.5-coder:3b
+openai (cloud):
+  - gpt-4o
+  - gpt-4o-mini
+
+$ lmm pull qwen2.5-coder:7b   # stock the local store, then route to it
+```
+
+### Self-prove it works (`selftest`)
+
+```bash
+$ lmm selftest
+lmm selftest — measuring, not trusting:
+  [PASS] self syntax (py_compile)
+  [PASS] command surface complete
+  [PASS] implicit Ollama reachable -- qwen2.5-coder:7b
+  [PASS] live ask routing returns reply -- SELFTEST_OK
+  [PASS] observability (hub.log writable) -- created
+  [PASS] verify_reply detects hallucination -- hallucinated token
+  [PASS] route_and_verify falls back bad->good -- verified ok
+  [PASS] doctor command runs -- doctor: HEALTHY
+  [PASS] config validate command runs -- config: VALID
+  [PASS] secrets command runs -- secrets: CLEAN
+  [PASS] stats command runs
+  [PASS] priority --optimize runs
+
+SELFTEST PASS — 12 checks, the hub proves itself.
+```
+
+`lmm selftest` runs **real measurements** (not trust): it compiles itself, checks
+the command surface, probes Ollama, performs a live routed `ask`, confirms
+`hub.log` is writable, and runs the diagnostic commands. Non-zero exit on any
+failure — usable as a fleet/CI gate. `LMM_SELFTEST_SKIP_LIVE=1` skips the two
+checks that need a running backend, which is how CI runs it.
+
+`lmm selftest --guard` is the same run in machine-readable form: it prints
+**only failures** and lets the exit code carry the verdict, so a green run is
+silent. That is what `guard.sh`, the pre-push hook and the GitHub Actions
+workflow invoke.
+
+One distinction matters here: **`doctor` grades your machine, `selftest` grades
+lmm.** A laptop with nothing running is an unhealthy machine and a perfectly
+working tool, so the gate asserts that `doctor` runs and reaches a verdict — and
+prints that verdict — rather than demanding a healthy host. Requiring
+`doctor: HEALTHY` made the gate unpassable on any CI runner, which is exactly
+where it needs to pass.
+
+`lmm` routes every `ask` / `chat` / `serve --hub` request through the **same**
+logic:
+1. Explicit `--provider NAME` (if it's a configured provider).
+2. Else your `ask_order` list (`lmm config set ask_order [...]`).
+3. Else a sensible default (keyword match → configured → implicit running Ollama).
+4. Always-on zero-config safety net: a running Ollama is appended automatically.
+
+If a provider errors (network/auth), `lmm` falls through to the next — silently
+for unspecified targets, respecting your explicit choice otherwise.
+
 ### The taskbar problem, solved
 
 - **One-off:** `lmm hide claude` strips Claude's taskbar button immediately
@@ -323,7 +444,7 @@ the TTFT range shown so a single lucky sample can't masquerade as a result.
   taskbar again. Disable by deleting the scheduled task / launchd plist /
   systemd unit.
 
-### Examples
+## Examples
 
 ```bash
 $ lmm              # GUI opens: live table of every runtime + GPU + cost
@@ -379,6 +500,16 @@ Works with zero config. `~/.lmm/config.json` (or `~/.config/lmm/config.json`,
 or `./lmm.config.json`) can add runtimes, override pricing, change routing
 keywords, or configure the hub. See `lmm examples` for the full shape —
 `config.example.json` is generated from it, so the two never drift.
+
+Edit settings from the CLI with `lmm config` — no hand-editing JSON:
+
+```bash
+lmm config init                                   # create ~/.lmm/config.json
+lmm config set ask_order '["openai","local-ollama(implicit)"]'
+lmm config set providers.openai '{"kind":"cloud","base_url":"https://api.openai.com/v1","api_key":"$OPENAI_API_KEY","model":"gpt-4o"}'
+lmm config get ask_order
+lmm config unset providers.openai
+```
 
 There are 35 settings in total. **You need five of them**, and only if you
 want the hub — everything else has a working default:
@@ -499,8 +630,8 @@ portable cross-process file lock does not exist in the standard library, and
 that trade is taken openly rather than papered over.
 
 Version history lives in [CHANGELOG.md](CHANGELOG.md) — useful because
-"upgrading" a single-file tool is just re-downloading `lmm.py`, and the log is
-how you tell what a newer copy changed.
+"upgrading" here means re-copying three files with no package manager to tell
+you what moved, and the log is how you tell what a newer copy changed.
 
 ## Tests & CI
 
@@ -509,26 +640,36 @@ python3 -m unittest discover -s tests -v
 ```
 
 Stdlib `unittest`, no network, no fixtures to install — the same
-zero-dependency rule the tool follows. `lmm.py` stays a single distributable
-file; the tests live outside it.
+zero-dependency rule the tool follows. The tests live outside the distributable
+modules.
 
-A GitHub Actions workflow lives at **`ci/github-actions-ci.yml`**. It is not in
-`.github/workflows/` because pushes from this repo's GitHub App are rejected
-without `workflows` permission, so enabling it is a one-line copy you run
-yourself:
+The suite carries the claims this README makes, so they cannot quietly stop
+being true:
+
+- **Zero dependencies** — every import in all three modules is checked against
+  the standard library list. This used to be a CI step that read `lmm.py`
+  alone, which after the split would have passed with a third-party import
+  sitting in `backend.py`.
+- **The install works** — `install.sh` runs into a throwaway `HOME` and the
+  resulting command must actually start. The split broke this exact path, and
+  nothing caught it.
+- **Every subcommand is wired** — the registered subparsers and the dispatch
+  branches are compared as sets. `lmm hide` was once a silent no-op and
+  `lmm cli` exited 2, both because those two lists disagreed.
+- **The layers stay apart** — the engine may not grow a `cmd_*` handler.
+
+Two workflows cover CI. **`.github/workflows/guard.yml`** already runs
+`lmm selftest --guard`: the tool proving itself on one interpreter, which is
+also what `guard.sh` and the pre-push hook run locally. The matrix that runs
+the suite on Python 3.8 through 3.13 lives at **`ci/github-actions-ci.yml`**
+and is not yet in `.github/workflows/`, because pushes from this repo's GitHub
+App are rejected without `workflows` permission. Enabling it is a one-line copy
+you run yourself:
 
 ```bash
 mkdir -p .github/workflows && cp ci/github-actions-ci.yml .github/workflows/ci.yml
 git add .github && git commit -m "ci: enable GitHub Actions" && git push
 ```
-
-It runs the full suite (which itself includes the zero-config smoke test of
-every command and the `config.example.json` sync check) on Python 3.8 through
-3.13 (3.8 being the floor this
-README promises), a zero-config smoke test of every command, a check that
-`config.example.json` matches `lmm examples` output, and a mechanical
-assertion that every import in `lmm.py` resolves to the standard library — so
-the zero-dependency claim is enforced, not just stated.
 
 ## How it works
 
@@ -537,12 +678,26 @@ the zero-dependency claim is enforced, not just stated.
 | Discovery      | Every registry runtime: process + TCP port probe + data dir, all concurrent |
 | Secrets        | Only *check* existence of existing credentials; never store one |
 | Cost           | Real tokens from `~/.claude/projects/*.jsonl` × public pricing, plus lmm's own metered hub calls |
-| Routing        | Lexical strength score vs a cost threshold; your `ask_order` overrides it |
+| Routing        | Lexical strength score vs a cost threshold; your `ask_order` overrides it; implicit Ollama safety net |
+| Verification   | The reply is scored, not just the pick — `--verify` falls through a backend that answered badly |
 | Cache          | sha256 of the normalized conversation; optional local-embedding similarity tier |
+| Streaming      | SSE pass-through, stdlib only — token-by-token to the CLI and to proxy clients |
+| Observability  | Every routed turn logged to `~/.lmm/hub.log`; `lmm log` and `lmm stats` read it back |
+| Health         | `hub-status` probes each backend live; `doctor` and `selftest` grade the setup and the tool |
 | Taskbar hide   | `WS_EX_TOOLWINDOW` on visible windows (Win); headless launch advised for servers |
 | Auto mode      | `watch` daemon hides new LLM windows every few seconds          |
-| Portability    | `expanduser` paths, `tasklist`/`pgrep`, `tkinter` for the GUI   |
+| Portability    | `expanduser` paths, `tasklist`/`pgrep`, `tkinter` for the GUI  |
 
 ## License
 
 MIT — see [LICENSE](LICENSE).
+
+# lmm -- proof-before-ship: every push passes the embedded selftest.
+
+Every `git push` runs the hub's own `selftest --guard` on the exact blob being
+pushed (via `.githooks/pre-push`, wired through `git config core.hooksPath
+.githooks`). A broken hub (valid Python, broken logic) is blocked before it
+reaches the remote. Survives fresh clones — run `setup-hooks.bat` once after
+cloning (Windows) or `git config core.hooksPath .githooks` on other platforms.
+
+Override (explicit, per self-edit-gate): `LMM_SKIP_HOOK=1 git push`.

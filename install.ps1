@@ -1,13 +1,26 @@
-# lmm installer (Windows, PowerShell). Copies lmm.py to ~\.local\bin and adds
-# an `lmm` function to your PowerShell $PROFILE if not already present.
+# lmm installer (Windows, PowerShell).
+#
+# lmm is three files that import each other — lmm.py (entry), backend.py
+# (engine) and frontend.py (CLI + GUI) — so they are installed together into a
+# library directory and an `lmm` function is added to your PowerShell $PROFILE.
+# Copying only lmm.py, as this script used to, produced an `lmm` that could not
+# start: the import of backend.py failed immediately.
 $ErrorActionPreference = "Stop"
 
-$src = Join-Path $PSScriptRoot "lmm.py"
-$destDir = Join-Path $env:USERPROFILE ".local\bin"
-$dest = Join-Path $destDir "lmm.py"
-New-Item -ItemType Directory -Force -Path $destDir | Out-Null
-Copy-Item $src $dest -Force
-Write-Host "installed -> $dest"
+$files = @("lmm.py", "backend.py", "frontend.py")
+foreach ($f in $files) {
+    if (-not (Test-Path (Join-Path $PSScriptRoot $f))) {
+        Write-Error "install: $f not found next to this script - incomplete checkout?"
+    }
+}
+
+$libDir = Join-Path $env:USERPROFILE ".local\share\lmm"
+New-Item -ItemType Directory -Force -Path $libDir | Out-Null
+foreach ($f in $files) {
+    Copy-Item (Join-Path $PSScriptRoot $f) (Join-Path $libDir $f) -Force
+}
+$dest = Join-Path $libDir "lmm.py"
+Write-Host "installed -> $libDir"
 
 # A function, not Set-Alias: an alias to a .py file only resolves when PATHEXT
 # and the python file association line up, which they usually do not. A

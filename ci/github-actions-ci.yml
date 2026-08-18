@@ -1,13 +1,17 @@
 name: ci
 
-# NOTE: this cannot live in .github/workflows/ in this repo — pushes from the
-# Claude GitHub App are rejected without `workflows` permission (verified: the
-# remote refuses the push). Copy it there yourself to enable CI:
+# NOTE: this cannot live in .github/workflows/ when pushed from the Claude
+# GitHub App — the remote rejects such pushes without `workflows` permission
+# (verified: both `git push` and the contents API refuse it). Copy it there
+# yourself to enable the matrix:
 #     mkdir -p .github/workflows && cp ci/github-actions-ci.yml .github/workflows/ci.yml
 #
-# lmm is a single zero-dependency file, so CI needs no install step and no
-# cache — it exists to enforce two claims the README makes: the test suite
-# passes, and the tool really does run on Python 3.8+.
+# This complements `.github/workflows/guard.yml`, which already runs
+# `lmm selftest --guard` — the tool proving itself on one interpreter. What is
+# missing from that gate is the two claims the README makes about the *suite*:
+# that it passes, and that lmm really runs on Python 3.8+. That is this file.
+#
+# lmm has no dependencies, so CI needs no install step and no cache.
 on:
   push:
     branches: ["**"]
@@ -32,31 +36,18 @@ jobs:
         with:
           python-version: ${{ matrix.python-version }}
 
-      - name: Byte-compile
-        run: python -m py_compile lmm.py
+      # All three modules, not just the entry point: after the backend /
+      # frontend split, compiling lmm.py alone proves almost nothing.
+      - name: Byte-compile every module
+        run: python -m py_compile lmm.py backend.py frontend.py
 
       - name: Unit tests
         run: python -m unittest discover -s tests -v
+        env:
+          LMM_SELFTEST_SKIP_LIVE: "1"
 
-      # The zero-config smoke test and the config.example.json sync check used
-      # to live here as separate steps. They are now TestCliSmoke in the suite
-      # above, so they run for developers too instead of only in CI.
-      - name: Every import resolves to the standard library
-        run: |
-          python - <<'PY'
-          import ast, sys, pathlib
-          src = pathlib.Path("lmm.py").read_text(encoding="utf-8")
-          names = set()
-          for node in ast.walk(ast.parse(src)):
-              if isinstance(node, ast.Import):
-                  names.update(a.name.split(".")[0] for a in node.names)
-              elif isinstance(node, ast.ImportFrom) and node.level == 0 and node.module:
-                  names.add(node.module.split(".")[0])
-          stdlib = getattr(sys, "stdlib_module_names", None)
-          assert stdlib, "needs Python 3.10+ to introspect the stdlib list"
-          extra = sorted(n for n in names if n not in stdlib and n != "lmm")
-          print("imports:", ", ".join(sorted(names)))
-          if extra:
-              sys.exit("non-stdlib imports found: %s" % extra)
-          print("all imports are stdlib")
-          PY
+      # The zero-config smoke test, the config.example.json sync check and the
+      # stdlib-only import check used to live here as separate steps. They are
+      # now TestCliSmoke and TestPackaging in the suite above, so they run for
+      # developers too instead of only in CI — and the import check now scans
+      # every module rather than the one that no longer holds the imports.

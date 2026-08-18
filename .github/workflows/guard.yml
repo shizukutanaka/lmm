@@ -1,0 +1,18 @@
+name: guard
+on:
+  push:
+  pull_request:
+jobs:
+  selftest:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.x"
+      # Server-side proof: even if a local hook is bypassed, the pushed code
+      # must still prove itself. No live Ollama on CI, so skip live checks.
+      - name: lmm self-proves (measure, don't trust)
+        env:
+          LMM_SELFTEST_SKIP_LIVE: "1"
+        run: python lmm.py selftest --guard

@@ -4,17 +4,46 @@ All notable changes to `lmm` are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project aims
 to follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-`lmm` is a single file, so "upgrading" is re-downloading `lmm.py`. This log is
-how you tell what a newer copy changed. Config is backward compatible across
-every version below: new keys have defaults, and no existing key changed
-meaning.
+`lmm` ships as plain files with no package manager, so "upgrading" is copying
+them over the old ones — and this log is how you tell what a newer copy
+changed. As of 1.2.0 there are three of them (`lmm.py`, `backend.py`,
+`frontend.py`) and they must stay together; before that there was one. Config
+is backward compatible across every version below: new keys have defaults, and
+no existing key changed meaning.
 
 ## [1.2.0]
 
 Reading models from disk, a cache that can prove it's safe to reuse an answer,
-and the round of fixes that took the hub from "works" to "holds up under load".
+the round of fixes that took the hub from "works" to "holds up under load", and
+the merge of the managed-routing line of work into the same tool.
+
+### Changed
+- **`lmm` is now three files**: `lmm.py` (entry point) over `backend.py` (the
+  engine — no CLI, no GUI, so it is testable without a terminal or a display)
+  and `frontend.py` (argument parsing, the `cmd_*` handlers, the dashboard).
+  They must live in the same directory. The installers place all three in
+  `~/.local/share/lmm` and put a launcher on your PATH.
+- `call_provider` takes one signature for every caller: `messages` for a full
+  history, `extra` for caller-supplied parameters the hub forwards, and
+  `stream=True` for the token-by-token path `lmm ask` and `lmm chat` render.
 
 ### Added
+- The managed-routing commands: `chat` (a REPL that keeps history), `config`
+  (init/list/get/set/unset, so settings need no hand-edited JSON), `priority`
+  (show `ask_order`, or `--optimize` it from measured results), `pull`,
+  `hub-status`, `log`, `stats`, `doctor`, `secrets`, and `selftest`.
+- `lmm ask --auto` picks the first backend by measured task fit, and
+  `--verify` scores the reply and falls through a backend that answered badly.
+  Routing on a guess and checking the answer are complementary, so both sit
+  alongside the cache/cascade cost path rather than replacing it.
+- `lmm discover --save` seeds `ask_order` from what is actually running, and
+  `lmm models` now lists configured cloud providers as well as local runtimes
+  — a cloud backend needs no local process, so discovery alone never saw it.
+- Naming a provider that does not exist now prints the names that do.
+- The suite carries the README's claims: the zero-dependency rule is checked
+  across every module, `install.sh` is run into a throwaway `HOME` and the
+  resulting command must start, and the registered subcommands are compared
+  against the dispatch branches as sets.
 - `lmm fit` reads a `.gguf` file directly (`lmm fit ./model.gguf`), so
   LM Studio / llama.cpp / KoboldCPP users can size a model with no runtime
   running. Weights and parameter count come from the file itself — only the
@@ -31,6 +60,21 @@ and the round of fixes that took the hub from "works" to "holds up under load".
   suite stays zero-dependency.
 
 ### Fixed
+- **Splitting the file broke every install.** `install.sh` and `install.ps1`
+  still copied `lmm.py` alone, and the README still told you to `curl` it on
+  its own, so a fresh install died on `from backend import *` before printing
+  anything. The installers now ship all three modules, and an entry point that
+  cannot find its siblings names the missing file instead of raising
+  `ModuleNotFoundError`.
+- **The CI gate could not pass on CI.** `lmm selftest` required
+  `doctor: HEALTHY`, but `doctor` grades the *machine* — a runner with no
+  backend running is an unhealthy machine and a working tool, which is why the
+  two live checks are already skipped there. The gate now asserts that `doctor`
+  runs and reaches a verdict, and prints that verdict, so an unhealthy host is
+  still visible without failing the build.
+- **`selftest --guard` ignored its own contract.** It documented "exit code
+  only" and then printed the full banner. It now prints failures only, so a
+  green run is silent and a red one still says what broke.
 - **Cascade treated a tool call as an empty answer.** A reply that calls a
   tool leaves `content` null, so the verifier scored it 0 and escalated
   through every rung — up to ~460× the cost of the one correct call it had

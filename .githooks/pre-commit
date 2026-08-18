@@ -1,0 +1,22 @@
+#!/usr/bin/env bash
+# lmm pre-commit hook -- never let a broken hub enter the history.
+# Runs the offline CI-equivalent guard.sh (python lmm.py selftest --guard) so a
+# broken hub is caught at commit time, server-independent.
+#
+# Override (self-edit-gate convention): LMM_SKIP_HOOK=1 git commit
+set -u
+if [ "${LMM_SKIP_HOOK:-0}" = "1" ]; then
+  echo "[pre-commit] LMM_SKIP_HOOK=1 -- guard bypassed (explicit override)." >&2
+  exit 0
+fi
+# guard.sh lives at the repo root, one level up from .githooks/
+here="$(cd "$(dirname "$0")" && pwd)"
+repo_root="$(cd "$here/.." && pwd)"
+if [ -x "$repo_root/guard.sh" ]; then
+  if ! bash "$repo_root/guard.sh" >/dev/null 2>&1; then
+    echo "[pre-commit] BLOCKED: $repo_root/guard.sh reported a broken hub." >&2
+    echo "[pre-commit] Fix it (or run: LMM_SKIP_HOOK=1 git commit to override)." >&2
+    exit 1
+  fi
+fi
+exit 0
