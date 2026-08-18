@@ -2283,7 +2283,7 @@ class TestCliSmoke(unittest.TestCase):
     """
 
     COMMANDS = [
-        ["--version"], ["discover"], ["discover", "--json"], ["cli"],
+        ["--version"], ["discover"], ["discover", "--json"],
         ["status"], ["models"], ["cost"], ["cost", "--days", "7"],
         ["route", "summarize this"], ["route", "--explain", "hi"],
         ["fit", "--vram", "8"], ["bench"], ["cache"], ["examples"],
@@ -3222,7 +3222,7 @@ class TestCommandWiring(unittest.TestCase):
         """`lmm selftest` — this repo's CI gate — asserts these exist."""
         registered, _ = self._parsed()
         needed = ["discover", "status", "models", "cost", "route", "serve",
-                  "ask", "chat", "hub-status", "config", "log", "selftest",
+                  "ask", "chat", "config", "log", "selftest", "doctor",
                   "stop", "dash", "gui", "watch", "autostart", "hide",
                   "examples"]
         self.assertEqual([c for c in needed if c not in registered], [])
@@ -3348,19 +3348,6 @@ class TestMergedCommands(unittest.TestCase):
             self.assertIn("gpt-4o-mini", out)
         finally:
             lmm.discover, frontend.fetch_models = saved_disc, saved_fetch
-
-    def test_ask_auto_routes_by_measured_fit(self):
-        saved = frontend.score_and_route
-        seen = []
-        try:
-            frontend.score_and_route = lambda task, cfg, order: (
-                seen.append(task) or (None, "no candidates"))
-            out = self._capture(frontend.cmd_ask, "explain gradient descent",
-                                None, {}, auto=True)
-            self.assertEqual(seen, ["explain gradient descent"])
-            self.assertIn("auto-routing skipped", out)
-        finally:
-            frontend.score_and_route = saved
 
     def test_ask_verify_prints_the_backend_that_passed_the_gate(self):
         saved = frontend.route_and_verify
@@ -3502,6 +3489,124 @@ class TestPackaging(unittest.TestCase):
             self.assertIn("lmm ", out)
         finally:
             shutil.rmtree(home, ignore_errors=True)
+
+
+class TestOneOfEach(unittest.TestCase):
+    """The merge briefly created two of everything; these pin the collapse.
+
+    Two routers disagreed on exactly the prompts where routing matters
+    ("refactor this 500-line module" went to a 3B model), and the second
+    observability log had none of the first one's protections. One of each,
+    verified — not asserted.
+    """
+
+    def test_there_is_exactly_one_router(self):
+        self.assertFalse(hasattr(lmm, "score_and_route"),
+                         "a second prompt scorer is back")
+        self.assertFalse(hasattr(lmm, "backend_catalog"))
+
+    def test_route_and_verify_orders_by_the_one_router(self):
+        """The verify loop must try backends in order_targets order."""
+        saved_call, saved_lo = lmm.call_provider, lmm.local_ollama_provider
+        tried = []
+        try:
+            lmm.local_ollama_provider = lambda: None
+            def call(prov, prompt, **kw):
+                tried.append(prov["model"])
+                # long enough to clear verify_reply's under-delivery floor
+                # for reasoning tasks (120 chars)
+                return {"choices": [{"message": {"content":
+                        "The Schrodinger equation governs how the quantum "
+                        "state of a physical system evolves over time via "
+                        "the Hamiltonian, and it underlies superposition "
+                        "and interference throughout quantum mechanics."}}]}
+            lmm.call_provider = call
+            cfg = {"providers": {
+                "a": {"api_key": "x", "base_url": "http://127.0.0.1:1/v1",
+                      "model": "m-a", "kind": "local"},
+                "b": {"api_key": "x", "base_url": "http://127.0.0.1:2/v1",
+                      "model": "m-b", "kind": "local"}}}
+            name, reason, reply = lmm.route_and_verify(
+                "explain quantum mechanics", cfg, ["b", "a"])
+            self.assertEqual(tried, ["m-b"],
+                             "ask_order was not honoured by the verify loop")
+            self.assertEqual(name, "b")
+            self.assertIn("verified ok", reason)
+        finally:
+            lmm.call_provider = saved_call
+            lmm.local_ollama_provider = saved_lo
+
+    def test_trail_events_share_the_protected_log(self):
+        """log_hub must land in USAGE_LOG — cap, compaction and lock included.
+        hub.log had none of the three; 50k events measured 14.7 MB and grew
+        forever, while the protected log held at 3.7 MB under the same load."""
+        with temp_state():
+            lmm.log_hub({"event": "ask", "provider": "p", "ok": True})
+            self.assertTrue(os.path.isfile(lmm.USAGE_LOG))
+            events = lmm.read_usage()
+            self.assertEqual(len(events), 1)
+            self.assertEqual(events[0]["event"], "ask")
+
+    def test_trail_events_do_not_pollute_cost_totals(self):
+        """A trail entry carries a provider but is not a billable call."""
+        with temp_state():
+            lmm.log_usage({"provider": "openai", "model": "m", "kind": "remote",
+                           "in": 100, "out": 200, "usd": 0.01})
+            lmm.log_hub({"event": "ask", "provider": "openai", "ok": True,
+                         "prompt": "q"})
+            lmm.log_hub({"event": "ask_attempt", "provider": "openai",
+                         "ok": True, "latency_ms": 5})
+            st = lmm.hub_cost_stats()
+            self.assertEqual(st["calls"], 1,
+                             "trail events were counted as billable calls")
+            self.assertAlmostEqual(st["measured"], 0.01)
+
+    def test_measure_performance_reads_the_shared_trail(self):
+        with temp_state():
+            lmm.log_hub({"event": "ask_attempt", "provider": "p", "ok": True,
+                         "latency_ms": 10})
+            lmm.log_hub({"event": "ask_attempt", "provider": "p", "ok": False,
+                         "latency_ms": 30})
+            st = lmm.measure_performance()
+            self.assertEqual(st["p"]["ok"], 1)
+            self.assertEqual(st["p"]["fail"], 1)
+            self.assertEqual(st["p"]["avg_ms"], 20)
+
+    def test_the_trail_is_bounded(self):
+        """The reason the second log had to die: unbounded growth."""
+        with temp_state():
+            saved = lmm.USAGE_MAX_BYTES
+            try:
+                lmm.USAGE_MAX_BYTES = 20_000
+                for i in range(2000):
+                    lmm.log_hub({"event": "ask", "provider": "p", "ok": True,
+                                 "prompt": "x" * 40})
+                size = os.path.getsize(lmm.USAGE_LOG)
+                self.assertLess(size, 60_000,
+                                "trail writes bypass the byte cap")
+            finally:
+                lmm.USAGE_MAX_BYTES = saved
+
+    def test_doctor_probes_each_configured_provider(self):
+        """hub-status's one unique capability, folded into doctor."""
+        import io
+        import contextlib
+        stub = StubBackend()
+        try:
+            cfg = {"providers": {"stub": {
+                "api_key": "k", "base_url": stub.base_url,
+                "model": "m", "kind": "local"}},
+                "ask_order": ["stub"]}
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                try:
+                    frontend.cmd_doctor(cfg)
+                except SystemExit:
+                    pass
+            out = buf.getvalue()
+            self.assertIn("provider 'stub' answers", out)
+        finally:
+            stub.stop()
 
 
 class TestSelftestGate(unittest.TestCase):

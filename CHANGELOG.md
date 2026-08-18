@@ -27,15 +27,35 @@ the merge of the managed-routing line of work into the same tool.
   history, `extra` for caller-supplied parameters the hub forwards, and
   `stream=True` for the token-by-token path `lmm ask` and `lmm chat` render.
 
+### Removed
+- The merge briefly created two of everything, and the duplicates are gone:
+  - **A second router.** Three copies of the same heavy/code/private heuristic
+    routed prompts (`prompt_strength`, `score_and_route`, and a third inlined
+    in `route_and_verify`), and on the prompts where routing matters most they
+    disagreed — "refactor this 500-line module into testable units" scored as
+    a *light* task and went to a 3B model. One router remains; `--verify`'s
+    closed loop and `priority --optimize` now order candidates through it.
+    `ask --auto` is gone with it.
+  - **A second observability log.** `hub.log` had no size cap, no compaction
+    and no lock — the exact unbounded-growth and lost-write bugs already fixed
+    for `usage.jsonl`, alive under another name (measured: 14.7 MB and growing
+    at 50k events, vs 3.7 MB capped). The trail now lives in the metering log;
+    `lmm log`, `lmm stats` and `priority --optimize` read it from there. An
+    old `hub.log` is left where it was but no longer written or read.
+  - **Two commands.** `cli` was an alias for `discover`; `hub-status`'s one
+    unique capability — probing each configured provider — moved into
+    `doctor`, which is where a health probe belongs.
+
 ### Added
 - The managed-routing commands: `chat` (a REPL that keeps history), `config`
   (init/list/get/set/unset, so settings need no hand-edited JSON), `priority`
-  (show `ask_order`, or `--optimize` it from measured results), `pull`,
-  `hub-status`, `log`, `stats`, `doctor`, `secrets`, and `selftest`.
-- `lmm ask --auto` picks the first backend by measured task fit, and
-  `--verify` scores the reply and falls through a backend that answered badly.
-  Routing on a guess and checking the answer are complementary, so both sit
-  alongside the cache/cascade cost path rather than replacing it.
+  (show `ask_order`, or `--optimize` it from measured results), `pull`, `log`,
+  `stats`, `doctor` (which also probes each configured provider), `secrets`,
+  and `selftest`.
+- `lmm ask --verify` scores the reply after the call and falls through a
+  backend that answered badly — the complement of routing, which can only
+  guess before the call. It sits alongside the cache/cascade cost path rather
+  than replacing it, and orders its candidates through the same router.
 - `lmm discover --save` seeds `ask_order` from what is actually running, and
   `lmm models` now lists configured cloud providers as well as local runtimes
   — a cloud backend needs no local process, so discovery alone never saw it.

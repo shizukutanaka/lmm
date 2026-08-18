@@ -963,28 +963,19 @@ def cmd_examples():
 
 
 def cmd_ask(prompt, provider, cfg, cascade=False, no_cache=False,
-            explain=False, auto=False, verify=False):
+            explain=False, verify=False):
     """Unified inference over every backend: cache, threshold routing, optional
     cheap-first cascade, and metering - all of it the same code path the hub
     serves, so `lmm ask` and an app pointed at `lmm serve --hub` behave alike.
 
-    --auto and --verify pick the backend a different way. --auto scores the
-    task against each backend's measured fit before the request; --verify
-    measures the reply afterwards and falls through to the next backend if it
-    is unusable. Routing on a guess and checking the answer are complementary,
-    so both stay available alongside the cost path.
+    --verify measures the reply after the call and falls through to the next
+    backend if it is unusable — the complement of routing, which can only
+    guess before the call. Both orderings come from the same router.
     """
     if not (prompt or "").strip():
         print("usage: lmm ask \"your question\" [--provider NAME] [--cascade]")
         return
     effective = provider
-    if auto and not provider:
-        best, reason = score_and_route(prompt, cfg, cfg.get("ask_order"))
-        if best:
-            print(f"[ask] auto-routed: {reason}")
-            effective = best
-        else:
-            print(f"[ask] auto-routing skipped: {reason}")
     if verify and not provider:
         name, vreason, reply = route_and_verify(prompt, cfg, cfg.get("ask_order"))
         if name and reply is not None:
@@ -1299,55 +1290,11 @@ def cmd_pull(model):
     print("done. Use `lmm models` to confirm, `lmm ask` to route to it.")
 
 
-def cmd_hub_status(cfg):
-    """Measure hub health: list every backend lmm would route to, and probe
-    each one for liveness (zero-config Ollama included). The hub is only as
-    trustworthy as what this reports — measure, don't assume."""
-    targets = resolve_ask_targets(cfg, "", None)
-    if not targets:
-        lo = backend.local_ollama_provider()
-        if lo:
-            targets = [("local-ollama(implicit)", lo)]
-    if not targets:
-        print("[hub-status] no backends available (no config, no Ollama).")
-        return
-    print(f"HUB STATUS — {len(targets)} backend(s):")
-    print("-" * 68)
-    for name, prov in targets:
-        # probe: a tiny completion request, or a models fetch for local
-        ok = False
-        detail = ""
-        try:
-            if prov.get("kind") == "local" and "11434" in prov["base_url"]:
-                r = backend.run("ollama list")
-                ok = bool(r and r.returncode == 0)
-                detail = "ollama reachable" if ok else "ollama not responding"
-            else:
-                # cloud: lightweight models list (GET) to test connectivity/auth
-                import urllib.request
-                url = prov["base_url"].rstrip("/") + "/models"
-                req = urllib.request.Request(
-                    url, headers={"Authorization": f"Bearer {prov.get('api_key','')}"})
-                with urllib.request.urlopen(req, timeout=8) as resp:
-                    ok = resp.status == 200
-                    detail = f"HTTP {resp.status}"
-        except Exception as e:
-            detail = str(e)[:60]
-        flag = "OK " if ok else "DOWN"
-        print(f"  [{flag}] {name:24} {prov['model'] or '(no model)'}")
-        print(f"         {prov['base_url']}  -> {detail}")
-    print("-" * 68)
-    live = sum(1 for n, p in targets
-               if (p.get("kind") == "local" and "11434" in p["base_url"]
-                    and bool(backend.run("ollama list"))) or False)
-    print("Tip: `lmm serve --hub` exposes these as one OpenAI-compatible endpoint.")
-
-
 def cmd_chat(provider, cfg):
     """Interactive chat REPL over the hub. Keeps conversation history
     (messages) across turns and routes every user turn through the SAME
     unified routing (ask_order + fallback) as `lmm ask`. Each turn is logged
-    to hub.log. Local OR cloud, one interface. Type 'exit'/'quit'/'/exit' to
+    to the trail. Local OR cloud, one interface. Type 'exit'/'quit'/'/exit' to
     leave."""
     print("lmm chat — type 'exit' to quit. Routes every turn via the hub.")
     messages = []
@@ -1408,22 +1355,18 @@ def cmd_chat(provider, cfg):
 
 
 def cmd_log(n, cfg):
-    """Show the last n hub events from ~/.lmm/hub.log (proof of what the hub
-    actually routed/served). Defaults to 20."""
-    p = os.path.join(backend.HOME, ".lmm", "hub.log")
-    if not os.path.exists(p):
-        print("[log] no hub.log yet. Run `lmm ask` or `lmm serve --hub` first.")
-        return
+    """Show the last n hub-trail events (proof of what the hub actually
+    routed/served). Defaults to 20. The trail lives in the metering log —
+    trail entries are the ones carrying an "event" key."""
     try:
         n = int(n)
     except Exception:
         n = 20
-    lines = [l for l in open(p, encoding="utf-8").read().splitlines() if l.strip()]
-    for l in lines[-n:]:
-        try:
-            e = json.loads(l)
-        except Exception:
-            print(l); continue
+    events = [e for e in backend.read_usage() if e.get("event")]
+    if not events:
+        print("[log] no hub events yet. Run `lmm ask` or `lmm serve --hub` first.")
+        return
+    for e in events[-n:]:
         ts = e.get("ts", "?")
         kind = e.get("event", "?")
         prov = e.get("provider", "-")
@@ -1698,7 +1641,8 @@ def cmd_secrets(cfg):
 def cmd_doctor(cfg):
     """First-principles health check: don't trust that lmm works — MEASURE it.
     Runs real probes (config loads, Ollama reachable, a backend is running,
-    ask_order resolves, hub.log writable) and exits non-zero if any FAILs."""
+    ask_order resolves, each provider answers, trail writable) and exits
+    non-zero if any FAILs."""
     fails = []
 
     def chk(name, ok, detail=""):
@@ -1749,13 +1693,33 @@ def cmd_doctor(cfg):
             ("unresolved: " + ", ".join(unresolved)) if unresolved else
             f"{len(order)} entr(ies) OK")
 
-    # 5) hub.log writable
+    # 5) each configured provider answers (was `lmm hub-status`, folded in:
+    #    the machine checks above see local processes, but a cloud provider
+    #    has no process to see — only a probe can grade it)
+    provs = (cfg.get("providers") or {}) if isinstance(cfg, dict) else {}
+    for name, prov in provs.items():
+        ok = False
+        detail = ""
+        try:
+            import urllib.request
+            url = (prov.get("base_url", "").rstrip("/")) + "/models"
+            req = urllib.request.Request(
+                url, headers={"Authorization":
+                              f"Bearer {prov.get('api_key', '')}"})
+            with urllib.request.urlopen(req, timeout=5) as resp:
+                ok = resp.status == 200
+                detail = f"HTTP {resp.status}"
+        except Exception as e:
+            detail = str(e)[:60]
+        chk(f"provider '{name}' answers", ok, detail)
+
+    # 6) the trail is writable (observability is part of health)
     try:
         log_hub({"event": "doctor", "provider": "(self)", "ok": True,
                  "prompt": "doctor probe"})
-        chk("hub.log writable", True)
+        chk("usage trail writable", True)
     except Exception as e:
-        chk("hub.log writable", False, str(e))
+        chk("usage trail writable", False, str(e))
 
     print("")
     if fails:
@@ -1765,26 +1729,12 @@ def cmd_doctor(cfg):
 
 
 def cmd_stats(cfg):
-    """Aggregate the structured hub log into measured routing statistics.
+    """Aggregate the hub trail into measured routing statistics.
     Proves (don't trust — measure) HOW well the routing actually performs:
     per-backend success rate, average latency, total attempts, and how often
     the first tried backend succeeded. Zero-dep: pure JSONL scan."""
-    p = os.path.join(backend.HOME, ".lmm", "hub.log")
-    if not os.path.exists(p):
-        print("[stats] no hub.log yet. Run `lmm ask` first.")
-        sys.exit(0)
-    attempts = []
-    with open(p, encoding="utf-8") as f:
-        for line in f:
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                e = json.loads(line)
-            except Exception:
-                continue
-            if e.get("event") == "ask_attempt":
-                attempts.append(e)
+    attempts = [e for e in backend.read_usage()
+                if e.get("event") == "ask_attempt"]
     if not attempts:
         print("[stats] no ask_attempt events yet. Run `lmm ask` first.")
         sys.exit(0)
@@ -1831,7 +1781,7 @@ def cmd_stats(cfg):
 def cmd_selftest(cfg, guard=False):
     """Self-prove the hub works. Runs real measurements (not trust):
     syntax, command surface, implicit-Ollama reachability, a live `ask`
-    routing that must return a real reply, and hub.log observability.
+    routing that must return a real reply, and trail observability.
     Each check is pass/fail; a non-zero failure count means `lmm` is broken.
 
     guard=True is for callers that only read the exit code (guard.sh, CI).
@@ -1866,7 +1816,7 @@ def cmd_selftest(cfg, guard=False):
         src = _f.read()
     cmds = _re.findall(r"add_parser\(['\"]([\w-]+)['\"]", src)
     needed = ["discover", "status", "models", "cost", "route", "serve",
-              "ask", "chat", "hub-status", "config", "log", "selftest",
+              "ask", "chat", "config", "log", "selftest", "doctor",
               "stop", "dash", "gui", "watch", "autostart", "hide", "examples"]
     missing = [c for c in needed if c not in cmds]
     chk("command surface complete", not missing,
@@ -1898,13 +1848,14 @@ def cmd_selftest(cfg, guard=False):
     else:
         chk("live ask routing returns reply", False, "no provider")
 
-    # 5) observability: hub.log gets written
-    before = os.path.exists(os.path.join(backend.HOME, ".lmm", "hub.log"))
+    # 5) observability: the trail gets written, and lands in the ONE log
+    #    (hub.log used to be a second file with no cap, no compaction and no
+    #    lock — the bugs already fixed for usage.jsonl, alive under another
+    #    name)
     log_hub({"event": "selftest", "provider": "(self)", "ok": True,
              "prompt": "selftest probe"})
-    after = os.path.exists(os.path.join(backend.HOME, ".lmm", "hub.log"))
-    chk("observability (hub.log writable)", after,
-        ("created" if not before else "appended"))
+    seen = any(e.get("event") == "selftest" for e in backend.read_usage())
+    chk("observability (trail writable)", seen)
 
     # 6) closed-loop verify routing — the hub must PROVE its own core claim
     #    ("measure the answer, don't just trust the pick"). Two deterministic
@@ -2126,42 +2077,6 @@ def setup_tray(root, tooltip="LMM Dashboard"):
     return cleanup
 
 
-def gui_ask(prompt, cfg, explicit=None, auto=False):
-    """Non-streaming ask for the GUI: routes by ask_order (priority), returns
-    the first successful reply text, or an error string. Never prints; the GUI
-    owns the display. If `explicit` (a backend name) is given, that backend is
-    used directly (user pinned it in the GUI). If `auto` is True and no
-    explicit backend is pinned, the backend is chosen by measured task fit."""
-    effective = explicit
-    if auto and not explicit:
-        best, reason = score_and_route(prompt, cfg, cfg.get("ask_order"))
-        if best:
-            effective = best
-            prompt = f"[auto: {reason}]\n{prompt}"
-    targets = resolve_ask_targets(cfg, prompt, effective)
-    if not targets:
-        return "[ask] no provider available. Run `lmm discover --save` first."
-    last_err = None
-    for name, prov in targets:
-        r = call_provider(prov, prompt, stream=False)
-        if isinstance(r, dict) and r.get("error"):
-            last_err = r["error"]
-            log_hub({"event": "ask", "provider": name, "ok": False,
-                     "error": last_err, "prompt": prompt, "via": "gui"})
-            continue
-        try:
-            reply = r["choices"][0]["message"]["content"]
-            log_hub({"event": "ask", "provider": name, "ok": True,
-                     "prompt": prompt, "reply": reply[:200], "via": "gui"})
-            return f"[{name}] {reply}"
-        except (KeyError, IndexError, TypeError) as e:
-            last_err = f"bad response: {e}"
-            log_hub({"event": "ask", "provider": name, "ok": False,
-                     "error": last_err, "prompt": prompt, "via": "gui"})
-            continue
-    return f"[ask] all providers failed. last error: {last_err}"
-
-
 def main():
     ap = argparse.ArgumentParser(
         description="LMM - Local/remote Model Manager (cross-platform, zero-dep)")
@@ -2173,7 +2088,6 @@ def main():
     p.add_argument("--json", action="store_true")
     p.add_argument("--save", action="store_true",
                    help="seed ask_order from the backends that are running")
-    sub.add_parser("cli", help="same as discover (explicit CLI mode)")
     sub.add_parser("status")
     sub.add_parser("models")
     p = sub.add_parser("pull", help="pull a model into local Ollama")
@@ -2213,8 +2127,6 @@ def main():
     p.add_argument("--no-cache", action="store_true", help="bypass the prompt cache")
     p.add_argument("--explain", action="store_true",
                    help="show routing score, rung scores and per-call cost")
-    p.add_argument("--auto", action="store_true",
-                   help="route by measured task fit, not the static ask_order")
     p.add_argument("--verify", action="store_true",
                    help="closed loop: measure each reply, fall back if unfit")
     p = sub.add_parser("chat", help="interactive hub chat REPL (keeps history)")
@@ -2227,7 +2139,6 @@ def main():
                    help="start OpenAI-compatible proxy over all configured providers")
     p.add_argument("--host", default="127.0.0.1")
     p.add_argument("--port", type=int, default=8080)
-    sub.add_parser("hub-status")
     p = sub.add_parser("stop")
     p.add_argument("runtime", nargs="?")
     p = sub.add_parser("cache")
@@ -2268,8 +2179,6 @@ def main():
     cmd = args.cmd or "gui"
     if cmd == "discover":
         cmd_discover(cfg, getattr(args, "json", False), getattr(args, "save", False))
-    elif cmd == "cli":
-        cmd_discover(cfg, False)
     elif cmd == "status":
         cmd_status(cfg)
     elif cmd == "models":
@@ -2292,7 +2201,6 @@ def main():
                 cascade=getattr(args, "cascade", False),
                 no_cache=getattr(args, "no_cache", False),
                 explain=getattr(args, "explain", False),
-                auto=getattr(args, "auto", False),
                 verify=getattr(args, "verify", False))
     elif cmd == "chat":
         cmd_chat(args.provider, cfg)
@@ -2301,8 +2209,6 @@ def main():
             cmd_serve_hub(cfg, args.host, args.port)
         else:
             cmd_serve(args.model)
-    elif cmd == "hub-status":
-        cmd_hub_status(cfg)
     elif cmd == "stop":
         cmd_stop(args.runtime, cfg)
     elif cmd == "cache":

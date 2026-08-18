@@ -15,7 +15,7 @@
 # Commands (no subcommand -> the live GUI dashboard):
 #   gui                 live GUI dashboard (tkinter; the default command)
 #   discover [--json]   list every detected runtime (--save seeds ask_order)
-#   cli                 same as discover (explicit CLI mode)
+#                       (this is also the explicit CLI mode)
 #   status              runtimes + GPU + hub/cache/breaker summary
 #   models              models on every running runtime and configured provider
 #   pull <model>        pull a model into local Ollama
@@ -25,15 +25,14 @@
 #   priority            show or re-rank ask_order by MEASURED performance
 #   bench               measure TTFT / TPOT / throughput per provider
 #   ask "prompt"        one question, routed across every backend
-#                       (--cascade, --auto, --verify, --explain, --no-cache)
+#                       (--cascade, --verify, --explain, --no-cache)
 #   chat                interactive REPL that keeps conversation history
 #   serve <model>       pull + expose a local model endpoint (Ollama)
 #   serve --hub         OpenAI-compatible proxy over all configured providers
-#   hub-status          probe every backend the hub would route to
 #   stop  <runtime>     stop a running runtime
 #   cache               prompt-cache stats (--clear)
 #   selftest [--guard]  self-prove the hub works (measure, don't trust)
-#   doctor              diagnose configuration and reachability
+#   doctor              grade the machine: config, backends, each provider
 #   secrets             scan the config for anything that must not be there
 #   stats               measured routing outcomes from the hub log
 #   log [n]             recent hub events (proof of what was routed where)

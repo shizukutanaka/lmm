@@ -2005,6 +2005,8 @@ def hub_cost_stats(days=None, events=None):
             st["local_tokens"] += ev.get("local_tokens", 0) or 0
             st["rollups"] = st.get("rollups", 0) + 1
             continue
+        if ev.get("event"):
+            continue          # hub-trail entry (ask/verify/serve), not a call
         hit = ev.get("cache")
         if hit in st["hits"]:
             st["hits"][hit] += 1
@@ -3333,7 +3335,7 @@ def percentile(xs, p):
 # how yesterday's measurements should re-rank tomorrow's ask_order.
 #
 # They share the transport (call_provider) and the pricing table with the hub,
-# and write their own observability trail to ~/.lmm/hub.log, which is what
+# and write their own observability trail into the metering log, which is what
 # `lmm log`, `lmm stats` and `lmm selftest` read.
 # ===========================================================================
 
@@ -3396,19 +3398,15 @@ def save_config(cfg):
 
 
 def log_hub(entry):
-    """Append a structured hub event to ~/.lmm/hub.log (JSONL). This is how the
-    hub proves what it actually did — measurement, not assumption. The hub is
-    only as trustworthy as this log."""
-    import datetime
-    try:
-        d = os.path.join(HOME, ".lmm")
-        os.makedirs(d, exist_ok=True)
-        entry = dict(entry)
-        entry.setdefault("ts", datetime.datetime.now().isoformat(timespec="seconds"))
-        with open(os.path.join(d, "hub.log"), "a", encoding="utf-8") as f:
-            f.write(json.dumps(entry, ensure_ascii=False) + chr(10))
-    except Exception:
-        pass
+    """Record one hub-trail event (ask, ask_attempt, verify, serve...).
+
+    The trail shares ~/.lmm/usage.jsonl with the metering events rather than
+    owning a second file: hub.log had no size cap, no compaction and no lock —
+    the exact unbounded-growth and lost-write bugs already fixed for the usage
+    log, alive again under a different name. One file means the trail gets
+    those protections for free. Trail events carry an "event" key; metering
+    events never do, and every aggregator discriminates on that."""
+    log_usage(dict(entry))
 
 
 def detect_lmstudio():
@@ -3474,86 +3472,6 @@ def resolve_provider_by_model(provs, model_id):
     return None
 
 
-def _model_size_b(name):
-    """Extract approximate model size in billions from a model id, else None."""
-    import re
-    m = re.search(r"(\d+(?:\.\d+)?)\s*b", (name or "").lower())
-    return float(m.group(1)) if m else None
-
-
-def backend_catalog(cfg):
-    """Build a catalog of every routable backend WITH measured capability
-    signals (size in B params, local/remote, paid). This is the first-principles
-    view: we route on *measured ability*, not on a static priority list."""
-    targets = resolve_ask_targets(cfg, "", None)
-    cat = []
-    for name, prov in targets:
-        size = _model_size_b(prov.get("model"))
-        cat.append({
-            "name": name,
-            "model": prov.get("model"),
-            "size_b": size,
-            "kind": prov.get("kind", "remote"),
-            "paid": (prov.get("kind") == "remote"),
-            "base_url": prov.get("base_url"),
-        })
-    return cat
-
-
-def score_and_route(task, cfg, ask_order=None):
-    """First-principles routing: MEASURE the task, match to MEASURED backend
-    ability. ask_order is a *tie-breaker weight*, not a blind master.
-
-    Returns (backend_name, reason) or (None, reason)."""
-    t = (task or "").lower()
-    cat = backend_catalog(cfg)
-    cat = [c for c in cat if c["base_url"]]  # only reachable backends
-    if not cat:
-        return None, "no reachable backend"
-    # task signals
-    words = len(t.split())
-    heavy = any(k in t for k in
-                ["explain", "derive", "proof", "quantum", "analyze", "design",
-                 "architecture", "research", "compare", "why", "理由", "説明",
-                 "設計", "解析", "比較", "導出", "証明", "考察"])
-    code = any(k in t for k in
-               ["code", "function", "bug", "refactor", "クラス", "関数",
-                "コード", "実装", "デバッグ", "write a", "def ", "```"])
-    is_private = any(k in t for k in
-                    merged_route(cfg).get("private", []) + ["secret", "社内"])
-    # score each backend
-    scored = []
-    for c in cat:
-        s = 0.0
-        size = c["size_b"]
-        if size is None:
-            size = 8.0 if c["kind"] == "remote" else 3.0  # cloud=big, unknown local=mid
-        # ability vs task difficulty
-        if heavy:
-            s += min(size, 70) / 7.0          # bigger model -> much better at hard tasks
-        else:
-            s += 1.0                          # light task: any model fine
-        if code and "coder" in (c["model"] or "").lower():
-            s += 2.0                          # code-tuned model bonus
-        if is_private and c["kind"] == "local":
-            s += 3.0                          # privacy prefers local
-        if c["kind"] == "local" and not c["paid"]:
-            s += 0.5                          # free is nice
-        # ask_order as a tie-breaker weight (priority respected, not obeyed)
-        if ask_order:
-            try:
-                idx = ask_order.index(c["name"])
-                s += max(0, (len(ask_order) - idx)) * 0.1
-            except ValueError:
-                pass
-        scored.append((s, c))
-    scored.sort(key=lambda x: -x[0])
-    best = scored[0][1]
-    return best["name"], f"score={scored[0][0]:.1f} size={best['size_b']}b " \
-                         f"task={'heavy' if heavy else 'light'}" \
-                         f"{'/code' if code else ''}{'/private' if is_private else ''}"
-
-
 def verify_reply(task, reply):
     """First-principles QUALITY GATE: don't trust that a backend answered well
     — MEASURE it. Returns (ok, reason). This closes the routing loop: a backend
@@ -3591,53 +3509,23 @@ def verify_reply(task, reply):
 
 
 def route_and_verify(task, cfg, ask_order=None, max_tries=3):
-    """Closed-loop routing (measure -> run -> verify -> fallback if bad).
-    Picks backends by score_and_route ordering, tries each, and if verify_reply
-    says the answer is unfit, FALLS BACK to the next — recording the measured
-    reason. This is 'measure, don't trust' made operational."""
-    t = (task or "").lower()
-    cat = backend_catalog(cfg)
-    cat = [c for c in cat if c["base_url"]]
-    if not cat:
-        return None, "no reachable backend", None
-    # build an ordered candidate list by reusing score_and_route's score fn
-    # (score each catalog entry the same way, sort descending)
-    heavy = any(k in t for k in
-                ["explain", "derive", "proof", "quantum", "analyze", "design",
-                 "architecture", "research", "compare", "why", "理由", "説明",
-                 "設計", "解析", "比較", "導出", "証明", "考察"])
-    code = any(k in t for k in
-               ["code", "function", "bug", "refactor", "クラス", "関数",
-                "コード", "実装", "デバッグ", "write a", "def ", "```"])
-    is_private = any(k in t for k in
-                    merged_route(cfg).get("private", []) + ["secret", "社内"])
-    rank = []
-    for c in cat:
-        s = 0.0
-        size = c["size_b"]
-        if size is None:
-            size = 8.0 if c["kind"] == "remote" else 3.0
-        s += min(size, 70) / 7.0 if heavy else 1.0
-        if code and "coder" in (c["model"] or "").lower():
-            s += 2.0
-        if is_private and c["kind"] == "local":
-            s += 3.0
-        if c["kind"] == "local" and not c["paid"]:
-            s += 0.5
-        if ask_order:
-            try:
-                idx = ask_order.index(c["name"])
-                s += max(0, (len(ask_order) - idx)) * 0.1
-            except ValueError:
-                pass
-        rank.append((s, c))
-    rank.sort(key=lambda x: -x[0])
-    order = [c["name"] for _, c in rank]
+    """Closed-loop routing: run, verify the reply, fall back if it is unfit.
+
+    The candidate order comes from order_targets — the same router `lmm ask`,
+    the cascade and the hub use. This function used to carry its own inlined
+    scorer (a third copy of the heavy/code/private heuristic), and on the
+    prompts where routing matters most the copies disagreed: "refactor this
+    500-line module into testable units" scored as a light task and went to a
+    3B model. One router means one place to be wrong. What this layer adds is
+    the verify step: measure the answer, not just the pick."""
+    if ask_order is not None:
+        cfg = dict(cfg)
+        cfg["ask_order"] = list(ask_order)
     targets = resolve_ask_targets(cfg, task, None)
-    ordered = [t_ for t_ in targets if t_[0] in order]
-    ordered += [t_ for t_ in targets if t_[0] not in order]
+    if not targets:
+        return None, "no reachable backend", None
     tried = []
-    for name, prov in ordered[:max_tries]:
+    for name, prov in order_targets(cfg, task, targets)[:max_tries]:
         r = call_provider(prov, task, stream=False)
         if isinstance(r, dict) and r.get("error"):
             tried.append(f"{name} error: {r['error']}")
@@ -3657,34 +3545,23 @@ def route_and_verify(task, cfg, ask_order=None, max_tries=3):
 
 
 def measure_performance():
-    """Scan hub.log for ask_attempt events and return {provider: {ok, fail,
-    avg_ms}}. Reuses the same JSONL source cmd_stats reads — measure, don't
-    trust: this is the REAL observed routing outcome, not a guess."""
-    import os as _os
-    import json as _json
+    """Aggregate ask_attempt trail events into {provider: {ok, fail, avg_ms}}.
+    This is the REAL observed routing outcome, not a guess — and reading it
+    through read_usage means compaction and the fold's lock discipline apply
+    here too. Old attempts fold away with the rest of the tail; recency is the
+    point of a performance measurement."""
     from collections import defaultdict
-    p = _os.path.join(HOME, ".lmm", "hub.log")
     stat = defaultdict(lambda: {"ok": 0, "fail": 0, "lat": []})
-    if not _os.path.exists(p):
-        return stat
-    with open(p, encoding="utf-8") as f:
-        for line in f:
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                e = _json.loads(line)
-            except Exception:
-                continue
-            if e.get("event") != "ask_attempt":
-                continue
-            n = e.get("provider", "?")
-            if e.get("ok"):
-                stat[n]["ok"] += 1
-            else:
-                stat[n]["fail"] += 1
-            if isinstance(e.get("latency_ms"), int):
-                stat[n]["lat"].append(e["latency_ms"])
+    for e in read_usage():
+        if e.get("event") != "ask_attempt":
+            continue
+        n = e.get("provider", "?")
+        if e.get("ok"):
+            stat[n]["ok"] += 1
+        else:
+            stat[n]["fail"] += 1
+        if isinstance(e.get("latency_ms"), int):
+            stat[n]["lat"].append(e["latency_ms"])
     for v in stat.values():
         v["avg_ms"] = int(sum(v["lat"]) / len(v["lat"])) if v["lat"] else 0
     return stat

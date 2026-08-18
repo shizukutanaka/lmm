@@ -64,7 +64,6 @@ import traceback.
 ```
 lmm                 -> live GUI dashboard (default; falls back to text status headless)
 lmm discover        -> list every detected runtime (--save seeds ask_order)
-lmm cli             -> same as discover (explicit CLI mode)
 lmm status          -> runtimes + GPU + hub/cache/breaker summary
 lmm models          -> models on every running runtime and configured provider
 lmm pull <model>    -> pull a model into the local Ollama store
@@ -76,7 +75,7 @@ lmm bench           -> measure TTFT / TPOT / throughput per provider
 
 # --- asking ---
 lmm ask "prompt"    -> one question, cached, routed, optionally cascaded
-                       (--cascade, --auto, --verify, --explain, --no-cache)
+                       (--cascade, --verify, --explain, --no-cache)
 lmm chat            -> interactive REPL that keeps conversation history
 lmm serve <model>   -> pull + expose a local model endpoint (Ollama)
 lmm serve --hub     -> OpenAI-compatible proxy over every configured provider
@@ -394,7 +393,7 @@ lmm selftest — measuring, not trusting:
   [PASS] command surface complete
   [PASS] implicit Ollama reachable -- qwen2.5-coder:7b
   [PASS] live ask routing returns reply -- SELFTEST_OK
-  [PASS] observability (hub.log writable) -- created
+  [PASS] observability (trail writable)
   [PASS] verify_reply detects hallucination -- hallucinated token
   [PASS] route_and_verify falls back bad->good -- verified ok
   [PASS] doctor command runs -- doctor: HEALTHY
@@ -408,7 +407,7 @@ SELFTEST PASS — 12 checks, the hub proves itself.
 
 `lmm selftest` runs **real measurements** (not trust): it compiles itself, checks
 the command surface, probes Ollama, performs a live routed `ask`, confirms
-`hub.log` is writable, and runs the diagnostic commands. Non-zero exit on any
+the trail is writable, and runs the diagnostic commands. Non-zero exit on any
 failure — usable as a fleet/CI gate. `LMM_SELFTEST_SKIP_LIVE=1` skips the two
 checks that need a running backend, which is how CI runs it.
 
@@ -682,8 +681,8 @@ git add .github && git commit -m "ci: enable GitHub Actions" && git push
 | Verification   | The reply is scored, not just the pick — `--verify` falls through a backend that answered badly |
 | Cache          | sha256 of the normalized conversation; optional local-embedding similarity tier |
 | Streaming      | SSE pass-through, stdlib only — token-by-token to the CLI and to proxy clients |
-| Observability  | Every routed turn logged to `~/.lmm/hub.log`; `lmm log` and `lmm stats` read it back |
-| Health         | `hub-status` probes each backend live; `doctor` and `selftest` grade the setup and the tool |
+| Observability  | Every routed turn recorded in `~/.lmm/usage.jsonl` alongside the metering — one log, one lock, one size cap; `lmm log` and `lmm stats` read it back |
+| Health         | `doctor` grades the machine — including a live probe of each configured provider — and `selftest` grades the tool |
 | Taskbar hide   | `WS_EX_TOOLWINDOW` on visible windows (Win); headless launch advised for servers |
 | Auto mode      | `watch` daemon hides new LLM windows every few seconds          |
 | Portability    | `expanduser` paths, `tasklist`/`pgrep`, `tkinter` for the GUI  |
