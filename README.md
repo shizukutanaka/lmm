@@ -47,7 +47,7 @@ Requires only Python 3.8+ (tkinter optional, for the GUI). No `pip install`.
 ## Usage
 
 ```
-lmm                 -> open the live GUI dashboard (default)
+lmm                 -> live GUI dashboard (default; falls back to text status headless)
 lmm discover        -> list every detected runtime (CLI)
 lmm cli             -> same as discover (explicit CLI mode)
 lmm status          -> runtimes + GPU + hub/cache/breaker summary

@@ -2774,11 +2774,28 @@ def launch_gui(cfg):
         import tkinter as tk
         from tkinter import ttk, messagebox
     except Exception as e:
-        print("tkinter unavailable on this system:", e)
+        # `lmm` with no arguments lands here on every server, container and
+        # WSL box — environments with no tkinter and no display. The tool's
+        # whole thesis is visibility of system status, so complaining about a
+        # GUI toolkit the user never asked for and showing NOTHING was the
+        # worst possible first contact. Degrade to the text status instead.
+        print(f"(no GUI here — tkinter unavailable: {e}; showing text status. "
+              "`lmm dash` renders the HTML dashboard.)")
+        cmd_status(cfg)
         return
     import threading
 
-    root = tk.Tk()
+    try:
+        root = tk.Tk()
+    except Exception as e:
+        # tkinter installed but no display — ssh sessions and CI runners land
+        # here, where the import above succeeds and Tk() is what fails. An
+        # uncaught TclError traceback is the same broken first contact as a
+        # missing tkinter, so it gets the same graceful exit.
+        print(f"(no GUI here — no display: {e}; showing text status. "
+              "`lmm dash` renders the HTML dashboard.)")
+        cmd_status(cfg)
+        return
     root.title("LMM — Local/remote Model Manager")
     root.geometry("920x560")
 

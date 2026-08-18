@@ -2335,6 +2335,24 @@ class TestCliSmoke(unittest.TestCase):
         r = self.run_cmd(["--version"])
         self.assertIn(lmm.VERSION, r.stdout.decode())
 
+    def test_bare_lmm_shows_status_when_no_gui_is_possible(self):
+        # The default command is the GUI. On every server, container and ssh
+        # session that means no tkinter or no display — and the tool used to
+        # print one line about a toolkit the user never asked for, show
+        # nothing, and exit. First contact must show STATUS.
+        import subprocess
+        env = dict(os.environ)
+        env["HOME"] = self.home
+        env.pop("DISPLAY", None)              # simulate headless even with tk
+        r = subprocess.run([sys.executable, os.path.join(self.root, "lmm.py")],
+                           capture_output=True, timeout=120, env=env)
+        out = r.stdout.decode()
+        self.assertEqual(r.returncode, 0, r.stderr.decode()[:400])
+        self.assertNotIn("Traceback", r.stderr.decode())
+        # it fell back to the text status rather than showing nothing
+        self.assertIn("GPU:", out)
+        self.assertIn("hub:", out)
+
     def test_an_unknown_command_fails_loudly(self):
         r = self.run_cmd(["definitely-not-a-command"])
         self.assertNotEqual(r.returncode, 0)
