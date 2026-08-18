@@ -1,18 +1,108 @@
 {
   "pricing": {
-    "my-model": { "in": 1.0, "out": 2.0, "cw": 1.0, "cr": 0.1 }
+    "my-model": {
+      "in": 1.0,
+      "out": 2.0,
+      "cw": 1.0,
+      "cr": 0.1
+    }
   },
   "route": {
-    "private": ["secret", "社内", "private", "local", "offline"],
-    "heavy":   ["code", "設計", "refactor", "debug", "architecture"]
+    "private": [
+      "secret",
+      "社内"
+    ],
+    "heavy": [
+      "code",
+      "設計"
+    ]
+  },
+  "providers": {
+    "openai": {
+      "api_key": "sk-...",
+      "base_url": "https://api.openai.com/v1",
+      "model": "gpt-4o",
+      "kind": "remote",
+      "price": "openai-gpt4o"
+    },
+    "gemini": {
+      "api_key": "AIza...",
+      "base_url": "https://generativelanguage.googleapis.com/v1beta/openai/",
+      "model": "gemini-1.5-pro",
+      "kind": "remote",
+      "price": {
+        "in": 1.25,
+        "out": 5.0
+      }
+    },
+    "my-local": {
+      "api_key": "ollama",
+      "base_url": "http://localhost:11434/v1",
+      "model": "qwen2.5-coder:7b",
+      "kind": "local"
+    }
+  },
+  "hub": {
+    "token": null,
+    "allow_remote": false
+  },
+  "retry": {
+    "attempts": 2,
+    "base_ms": 250,
+    "cap_ms": 8000
+  },
+  "breaker": {
+    "enabled": true,
+    "threshold": 3,
+    "cooldown_s": 30
+  },
+  "ask_order": [
+    "my-local",
+    "openai"
+  ],
+  "route_threshold": 0.5,
+  "cascade": {
+    "enabled": false,
+    "rungs": [
+      "my-local",
+      "openai"
+    ],
+    "threshold": 0.6,
+    "max_rungs": 3,
+    "judge": null
+  },
+  "cache": {
+    "enabled": true,
+    "semantic": false,
+    "similarity": 0.95,
+    "ttl_hours": 168,
+    "max_entries": 2000,
+    "embed_model": "nomic-embed-text",
+    "max_temp": 0.3,
+    "max_error_rate": null,
+    "confidence": 0.95,
+    "answer_match": 0.92,
+    "min_observations": 3
+  },
+  "usage": {
+    "openai": 12.5,
+    "gemini": {
+      "in": 1000000,
+      "out": 2000000
+    }
   },
   "extra_runtimes": [
     {
       "name": "vLLM",
       "type": "local",
       "paid": false,
-      "procs": ["vllm", "vllm.entrypoints"],
-      "installed_paths": ["~/.vllm"],
+      "procs": [
+        "vllm",
+        "vllm.entrypoints"
+      ],
+      "installed_paths": [
+        "~/.vllm"
+      ],
       "endpoint": "http://localhost:8000/v1",
       "models_cmd": "curl -s http://localhost:8000/v1/models"
     },
@@ -20,8 +110,12 @@
       "name": "My Remote Agent",
       "type": "remote",
       "paid": true,
-      "procs": ["myagent"],
-      "installed_paths": ["~/myagent"],
+      "procs": [
+        "myagent"
+      ],
+      "installed_paths": [
+        "~/myagent"
+      ],
       "endpoint": "https://api.myagent.example"
     }
   ]

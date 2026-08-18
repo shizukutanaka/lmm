@@ -1,179 +1,162 @@
+#!/usr/bin/env python3
+# frontend.py - everything a person touches
+# ---------------------------------------------------------------------------
+# Argument parsing, the cmd_* handlers, and the tkinter dashboard. All of the
+# engine lives in backend.py; this layer only decides what to show and what to
+# ask for. Keeping the two apart means the engine can be tested without a
+# terminal or a display, and this file can change how something is presented
+# without touching how it is computed.
+#
+# Note on `backend.x` vs a bare `x`: `from backend import *` copies values into
+# this module at import time, so rebinding backend.x afterwards would not be
+# seen here. Anything a test (or `lmm selftest`) substitutes at runtime is
+# therefore reached through the module, deliberately.
+# ---------------------------------------------------------------------------
 import backend
 from backend import *
 
-
-
-
-
-
-
-
-# ------------------------------- config ------------------------------------
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-# ----------------------------- detectors -----------------------------------
-
-
-
-
-
-
-
-
-# --------------------- taskbar-hiding (Windows only) -----------------------
-WS_EX_TOOLWINDOW = 0x00000080
-WS_EX_APPWINDOW = 0x00040000
-GWL_EXSTYLE = -20
-
-
-
-
-def hide_taskbar(runtime):
-    """Remove a runtime's GUI windows from the taskbar, using RUNTIME_REGISTRY.
-
-    Two strategies (first-principles, from how Windows decides a taskbar
-    button exists):
-      1. SERVER-ONLY / headless-first apps (Ollama, LM Studio via `lms`,
-         Jan, KoboldCPP, vLLM, Open WebUI, llama.cpp): they never need a
-         taskbar button — advise the headless launch and don't touch windows.
-      2. GUI apps (Claude, ChatGPT, Cursor, Perplexity, GPT4All, AnythingLLM,
-         Chatbox, Msty, Devin/Cua): set WS_EX_TOOLWINDOW on every visible
-         top-level window so it leaves the taskbar immediately, without
-         closing or minimizing the app. Idempotent; restart restores it.
-    """
-    rt = (runtime or "").lower()
-    entry = RUNTIME_REGISTRY.get(rt)
-    if entry is None:
-        return (f"unknown runtime '{runtime}'. choices: "
-                + ", ".join(sorted(RUNTIME_REGISTRY)))
-    if os.name != "nt":
-        return ("hide is only supported on Windows (the taskbar is a Windows "
-                "concept). On other OSes these apps already run without a dock "
-                "button when launched headless.")
-    titles = entry.get("titles", [])
-    if not titles:
-        # server-only / headless-first runtime
-        return (f"'{runtime}' runs without a taskbar button by design. "
-                f"{entry.get('headless', '')}")
-    wins = _enum_windows_by_title(titles)
-    if not wins:
-        return (f"no visible '{runtime}' window is on the taskbar right now. "
-                f"(If it isn't running, start it headless: "
-                f"{entry.get('headless', 'n/a')})")
-    user32 = ctypes.windll.user32
-    SetWindowLongW = user32.SetWindowLongW
-    GetWindowLongW = user32.GetWindowLongW
-    count = 0
-    for hwnd, title in wins:
-        try:
-            ex = GetWindowLongW(hwnd, GWL_EXSTYLE)
-            new_ex = (ex | WS_EX_TOOLWINDOW) & ~WS_EX_APPWINDOW
-            if new_ex != ex:
-                SetWindowLongW(hwnd, GWL_EXSTYLE, new_ex)
-                count += 1
-        except Exception:
-            pass
-    return (f"removed {count} '{runtime}' window(s) from the taskbar "
-            f"(the app keeps running, hidden from the taskbar). "
-            f"Restart the app to restore its taskbar button.")
-
-
-
-
-
-
-# ------------------------------ cost ---------------------------------------
-
-
-
-
-
-
 # ------------------------------ routing ------------------------------------
+def cmd_route(cfg, task, explain=False):
+    """Recommend local vs remote, and with --explain show the RouteLLM-style
+    strength score that drives provider ordering."""
+    print(f"task: {task}\n=> recommend: {route_task(cfg, task)}")
+    if not explain:
+        return
+    score, feats = prompt_strength(cfg, task)
+    thr = cfg.get("route_threshold", DEFAULT_ROUTE_THRESHOLD)
+    print("")
+    print("strength features (RouteLLM-style, arXiv:2406.18665):")
+    for label, w in feats or [("(no features matched)", 0.0)]:
+        print(f"  {label:38} {w:+.2f}")
+    if is_private(cfg, task):
+        print("  private keyword -> local pinned regardless of score")
+    rel = ">=" if thr is not None and score >= thr else "<"
+    print(f"  strength s = {score:.2f}  {rel}  threshold {thr}")
+    targets = resolve_ask_targets(cfg, task, None)
+    if targets:
+        mode = "strong-first" if thr is not None and score >= thr else "weak-first"
+        if cfg.get("ask_order"):
+            mode = "user ask_order (auto-routing deferred)"
+        print(f"=> {mode}: "
+              + ", ".join(n for n, _ in backend.order_targets(cfg, task, targets)))
+    else:
+        print("=> no providers configured; add 'providers' or start Ollama")
+    fit = best_local_fit()
+    if fit:
+        print(f"   largest installed model that fits: {fit['model']} "
+              f"({fit['gib']:.1f} of {fit['budget_gib']:.1f} GiB free "
+              f"at {fit['ctx']:,} ctx)")
 
 
 # ------------------------------ dashboard -----------------------------------
 def build_dash(cfg):
-    items = discover(cfg)
+    items = backend.discover(cfg)
     gpu = gpu_info()
-    cost = cost_report(cfg)
     now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     rows = ""
     for it in items:
         cls = "on" if it["running"] else "off"
         paid = "PAID" if it.get("paid") else "free"
         models = ", ".join(it.get("models", [])) or "-"
+        # `running` means "a window OR a port" — a GUI app with no API and a
+        # headless server look identical under it. `serving` (the port answers)
+        # is the signal that actually decides whether lmm can route to it.
+        serving = "YES" if it.get("serving") else "-"
         rows += (f'<tr class="{cls}"><td>{html.escape(it["name"])}</td>'
                  f'<td>{it["type"]}</td><td>{paid}</td>'
                  f'<td>{"YES" if it["running"] else "no"}</td>'
+                 f'<td>{serving}</td>'
                  f'<td>{it.get("procs", 0)}</td><td>{html.escape(models)}</td>'
                  f'<td>{html.escape(str(it.get("endpoint", "-")))}</td></tr>')
-    cost_html = html.escape(cost).replace("\n", "<br>")
     gpu_html = (f'{gpu["name"]} {gpu["used"]}/{gpu["total"]} MiB ({gpu["pct"]}%)'
                 if gpu else "n/a")
+
+    # Telemetry as structured cards, sharing hub_cost_stats with the text
+    # report. The previous dashboard pasted cost_report()'s entire formatted
+    # text into one <div> — a metered hub deserves numbers, not prose.
+    card_html = ""
+    for label, value, note in dash_cards(cfg):
+        card_html += (f'<div class="card"><div class="clabel">{html.escape(label)}</div>'
+                      f'<div class="cval">{html.escape(value)}</div>'
+                      f'<div class="cnote">{html.escape(note)}</div></div>')
+    summary = html.escape(cost_summary(cfg))
     return f"""<!doctype html><html><head><meta charset="utf-8">
 <title>LMM Dashboard</title><style>
 body{{font-family:system-ui,Segoe UI,Arial;margin:0;background:#0d1117;color:#e6edf3}}
 h1{{padding:16px 20px;margin:0;font-size:18px;background:#161b22;border-bottom:1px solid #30363d}}
 .meta{{padding:8px 20px;color:#8b949e;font-size:13px}}
 .gpu{{padding:8px 20px;color:#7ee787;font-size:13px}}
+.summary{{padding:4px 20px 8px;font-size:13px}}
+.cards{{display:flex;flex-wrap:wrap;gap:12px;margin:12px 2%}}
+.card{{flex:1 1 170px;background:#161b22;border:1px solid #30363d;border-radius:8px;padding:12px 14px}}
+.clabel{{color:#8b949e;font-size:12px}}
+.cval{{color:#7ee787;font-size:20px;font-weight:600;margin:4px 0}}
+.cnote{{color:#8b949e;font-size:11px}}
 table{{border-collapse:collapse;width:96%;margin:12px 2%}}
 th,td{{border:1px solid #30363d;padding:8px 10px;font-size:13px;text-align:left}}
 th{{background:#161b22}}
 tr.on td:first-child{{color:#7ee787}} tr.off{{opacity:.55}}
-.cost{{margin:12px 2%;padding:12px;background:#161b22;border:1px solid #30363d;
-border-radius:6px;font-family:ui-monospace,Consolas,monospace;font-size:12px;
-white-space:pre-wrap}}
 </style></head><body>
 <h1>🧠 LMM — Local/remote Model Manager</h1>
 <div class="meta">generated {now}</div>
 <div class="gpu">GPU: {gpu_html}</div>
+<div class="summary">{summary}</div>
+<div class="cards">{card_html}</div>
 <table><tr><th>Runtime</th><th>Type</th><th>Cost</th><th>Running</th>
-<th>Procs</th><th>Models</th><th>Endpoint</th></tr>
+<th>Serving</th><th>Procs</th><th>Models</th><th>Endpoint</th></tr>
 {rows}</table>
-<div class="cost">{cost_html}</div>
 </body></html>"""
+
+
+def dash_cards(cfg):
+    """Telemetry cards as (label, value, note) rows, from the same
+    hub_cost_stats the text report reads — one aggregation, two renderers."""
+    st = hub_cost_stats()
+    cards = [("Hub spend",
+              f"${st['measured']:,.4f}" if st["calls"] else "$0",
+              f"{st['calls']} metered call(s)" if st["calls"] else "no calls yet")]
+    hits = st["hits"]["exact"] + st["hits"]["semantic"]
+    if hits:
+        cards.append(("Cache savings", f"${st['saved_cache']:,.4f}",
+                      f"{hits} hit(s): {st['hits']['exact']} exact / "
+                      f"{st['hits']['semantic']} semantic"))
+    if st["ttfts"]:
+        cards.append(("Stream TTFT", f"{median(st['ttfts']):.0f} ms p50",
+                      f"p90 {percentile(st['ttfts'], 90):.0f} ms over "
+                      f"{len(st['ttfts'])} stream(s)"))
+    if st["local_calls"]:
+        cards.append(("Local (free)", f"{st['local_calls']} call(s)",
+                      f"{st['local_tokens']:,} tokens run at $0"))
+    if st["est_usd"] or st["partial_usd"]:
+        note = []
+        if st["est_usd"]:
+            note.append(f"${st['est_usd']:,.4f} estimated")
+        if st["partial_usd"]:
+            note.append(f"${st['partial_usd']:,.4f} partial")
+        # kept apart on purpose: a card labelled measured must not hide guesses
+        cards.append(("Not clean measurements", " · ".join(note),
+                      "usage inferred, or stream abandoned mid-flight"))
+    tripped = [n for n in list(HUB_BREAKER._open_until)
+               if HUB_BREAKER.state(n) != "closed"]
+    if tripped:
+        cards.append(("Circuit breaker", f"{len(tripped)} open",
+                      ", ".join(sorted(tripped))))
+    return cards
 
 
 # ------------------------------ commands -----------------------------------
 def cmd_discover(cfg, as_json, save=False):
-    items = discover(cfg)
+    items = backend.discover(cfg)
     if as_json:
         print(json.dumps(items, indent=2, ensure_ascii=False))
         return
     if save:
-        # Save detected backends as the initial priority order (running first).
+        # Seed ask_order from what is actually running, so a first-time user
+        # gets a working priority list without hand-writing one.
         running = [it["name"] for it in items
                    if it["running"] and it["name"] != "-"]
         if not running:
-            print("[discover] no running backends detected — nothing to save.")
+            print("[discover] no running backends detected - nothing to save.")
             return
         cfg = dict(cfg)
         cfg["ask_order"] = running
@@ -196,8 +179,991 @@ def cmd_discover(cfg, as_json, save=False):
         print(f"[{flag}] {it['name']:<30} {paid:<5}{extra}")
 
 
+def cmd_status(cfg):
+    gpu = gpu_info()
+    print("GPU:", gpu["name"] if gpu else "n/a",
+          f"({gpu['used']}/{gpu['total']} MiB, {gpu['pct']}%)" if gpu else "")
+    print("-" * 64)
+    # with_models=False: status does not display model lists, so probing every
+    # serving runtime's /v1/models just to discard the result was pure latency.
+    for it in backend.discover(cfg, with_models=False):
+        print(f"{it['name']:<32} running={it['running']!s:<5} "
+              f"serving={it.get('serving', False)!s:<5} "
+              f"procs={it.get('procs', 0)}")
+    # For a tool whose headline feature is a metered hub, `status` should show
+    # the hub's state, not only the runtimes'.
+    print("-" * 64)
+    print("hub:", cost_summary(cfg))
+    conf = merged_cache(cfg)
+    entries = cache_entries(conf)
+    print(f"cache: {len(entries)} live entries"
+          + (" (semantic on)" if conf.get("semantic") else ""))
+    tripped = [n for n in list(HUB_BREAKER._open_until)
+               if HUB_BREAKER.state(n) != "closed"]
+    if tripped:
+        print("breaker: open ->", ", ".join(sorted(tripped)))
 
 
+def cmd_models(cfg=None):
+    """Every model you can actually reach, from both directions.
+
+    discover() harvests model lists from any OpenAI-compatible /models endpoint
+    on a *running* runtime (LM Studio, Jan, KoboldCPP, vLLM, ...), which is what
+    you see locally. Configured providers are a second source: a cloud backend
+    is reachable without any local process, so it never shows up in discover.
+    Listing only one of the two is the tool disagreeing with itself.
+    """
+    cfg = cfg or {}
+    found = False
+    for it in backend.discover(cfg, with_models=True):
+        ms = it.get("models") or []
+        if not ms:
+            continue
+        found = True
+        print(f"{it['name']}:")
+        for m in ms:
+            print("  -", m)
+    for name, prov in (merged_providers(cfg) or {}).items():
+        models = fetch_models(prov)
+        if not models:
+            continue
+        found = True
+        print(f"{name} ({prov.get('kind', '?')}):")
+        for m in models:
+            print("  -", m)
+    if not found:
+        print("no models found on any running runtime or configured provider "
+              "(start one, e.g. `lmm serve <model>`, or see `lmm examples`)")
+
+
+def cmd_fit(model=None, ctx=None, vram=None, kv="f16", as_json=False):
+    """Answer the question every local-LLM user actually has: does this model
+    run on this machine, and at what context length?"""
+    gpu = gpu_info()
+    if vram:
+        budget, src = float(vram), "--vram"
+    elif gpu:
+        budget = (gpu["total"] - gpu["used"]) / 1024.0
+        src = f"{gpu['name']} ({gpu['total'] - gpu['used']} of {gpu['total']} MiB free)"
+    else:
+        print("[fit] no GPU detected and no --vram given. "
+              "Pass --vram <GiB> to size a machine you do not have in front of you.")
+        return
+
+    models = [model] if model else (detect_ollama().get("models") or [])
+    if not models:
+        print("[fit] no model given and no Ollama models installed. Try: "
+              "lmm fit llama3.1:8b --vram 24, or point it at a file: "
+              "lmm fit ./model.gguf")
+        return
+
+    rows = []
+    for name in models:
+        # A path to a .gguf is sized from the file itself — no runtime needed,
+        # which is what makes `fit` usable for LM Studio / llama.cpp / KoboldCPP
+        # users who have weights on disk but nothing registered with Ollama.
+        if looks_like_gguf(name):
+            got = read_gguf(name)
+            if got.get("error"):
+                rows.append({"model": name, "error": got["error"]})
+                continue
+            spec = got
+        else:
+            spec = ollama_model_info(name)
+        if not spec:
+            params = params_from_name(name)
+            rows.append({"model": name, "error": (
+                "no metadata — start Ollama so `lmm fit` can read the real "
+                "layer and KV-head counts, or pass a .gguf path"),
+                "weights_only_gib": (params * quant_bpw(None) / 8.0 / GIB
+                                     if params else None)})
+            continue
+        want = ctx or spec["ctx_max"] or 4096
+        est = estimate_vram(spec, want, None, kv)
+        rows.append({"model": name, "ctx": want, "kv_type": kv, "spec": spec,
+                     "est": est, "fits": est["total_gib"] <= budget,
+                     "max_ctx": max_context_for(spec, budget, None, kv)})
+
+    if as_json:
+        print(json.dumps({"budget_gib": round(budget, 2), "source": src,
+                          "rows": rows}, indent=2, default=str))
+        return
+
+    print(f"VRAM budget: {budget:.1f} GiB  [{src}]")
+    print(f"KV cache dtype: {kv}  "
+          f"({KV_BYTES.get(kv.lower(), 2.0)} bytes/element)")
+    print("-" * 72)
+    for r in rows:
+        if r.get("error"):
+            print(f"  {r['model']:<32} ? {r['error']}")
+            if r.get("weights_only_gib"):
+                print(f"  {'':<32}   weights alone ~{r['weights_only_gib']:.1f} GiB "
+                      f"(assuming q4_k_m)")
+            continue
+        e, s = r["est"], r["spec"]
+        mark = "OK  " if r["fits"] else "OVER"
+        label = os.path.basename(r["model"]) if s.get("source") == "gguf" \
+            else r["model"]
+        print(f"  [{mark}] {label:<28} {e['total_gib']:6.2f} GiB "
+              f"@ {r['ctx']:,} ctx")
+        # Say where the numbers came from: a GGUF gives exact weights and an
+        # exact parameter count, Ollama metadata gives an estimated weights term.
+        origin = ("exact from file" if s.get("source") == "gguf"
+                  else "estimated from quant table")
+        print(f"         weights {e['weights_gib']:.2f} ({origin}) + "
+              f"kv {e['kv_gib']:.2f} + overhead {e['overhead_gib']:.2f}   "
+              f"({s['params']/1e9:.2f}B params, {e['bpw']:.2f} bpw"
+              + (f" {s['quant']}" if s.get("quant") else "")
+              + f", {s['layers']}L, {s['kv_heads']} kv-heads x {s['head_dim']})")
+        if r["max_ctx"]:
+            print(f"         fits up to {r['max_ctx']:,} tokens of context")
+        else:
+            print("         weights alone do not fit — use a smaller quant or model")
+        if not r["fits"] and kv == "f16":
+            alt = estimate_vram(s, r["ctx"], None, "q8_0")
+            if alt["total_gib"] <= budget:
+                print(f"         -> fits at {alt['total_gib']:.2f} GiB with "
+                      f"--kv q8_0 (llama.cpp --cache-type-k/v q8_0)")
+    print("-" * 72)
+    if any(r.get("spec", {}).get("source") == "gguf" for r in rows):
+        print("GGUF rows read weights and parameter count from the file, so only "
+              "the\n0.5 GiB overhead is an estimate. KV cache is exact for the "
+              "given context.")
+    else:
+        print("Estimates. bits-per-weight are llama.cpp measurements on "
+              "LLaMA-family models;\noverhead is a 0.5 GiB middle estimate for "
+              "context and scratch buffers.")
+
+
+def cmd_serve(model):
+    if not model:
+        print("usage: lmm serve <ollama-model>  e.g. lmm serve qwen2.5-coder:7b")
+        return
+    print(f"pulling {model} ...")
+    r = backend.run(f"ollama pull {model}")
+    print((r.stdout.strip() if r else "(pull failed/timeout)"))
+    print("endpoint ready: http://localhost:11434  (OpenAI-compatible)")
+
+
+def cmd_serve_hub(cfg, host, port, quiet=False):
+    """Start an OpenAI-compatible proxy that fans out to every configured
+    provider (cloud + local). Apps point at this one endpoint; `lmm` routes
+    each request. This is the hub: one endpoint, many backends."""
+    import http.server, socketserver, threading, hmac, secrets
+    provs = merged_providers(cfg)
+    if not provs and not backend.local_ollama_provider():
+        print("[hub] no providers configured and no local Ollama running. "
+              "Start Ollama (`lmm serve <model>`) or add 'providers' to lmm "
+              "config (see `lmm examples`). Nothing to proxy.")
+        return
+
+    # The `breaker` config key was documented in `lmm examples` but never read:
+    # HUB_BREAKER was built from the defaults at import time, so anyone who set
+    # a threshold or cooldown had it silently ignored. Apply it here, where the
+    # config is finally in hand.
+    brk = merged_breaker(cfg)
+    HUB_BREAKER.threshold = int(brk.get("threshold", 3))
+    HUB_BREAKER.cooldown_s = float(brk.get("cooldown_s", 30))
+    hub_breaker = HUB_BREAKER if brk.get("enabled", True) else None
+
+    hub = merged_hub(cfg)
+    token = hub.get("token") or None
+    allowed, lines = hub_bind_check(host, hub,
+                                   lambda: secrets.token_urlsafe(24))
+    for line in lines:
+        if not quiet:
+            print(line)
+    if not allowed:
+        return
+
+    class Handler(http.server.BaseHTTPRequestHandler):
+        def _send(self, code, obj):
+            body = json.dumps(obj, ensure_ascii=False).encode("utf-8")
+            self.send_response(code)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def _stream(self, frames):
+            """Relay SSE frames. No Content-Length: the body length is unknown
+            when the headers go out, which is the whole point of streaming.
+            Each frame is flushed so the client sees tokens as they arrive
+            rather than in one buffered lump at the end."""
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream")
+            self.send_header("Cache-Control", "no-cache")
+            self.send_header("Connection", "close")
+            self.end_headers()
+            try:
+                for frame in frames:
+                    self.wfile.write(frame)
+                    self.wfile.flush()
+            except (BrokenPipeError, ConnectionResetError):
+                pass          # client hung up mid-stream; nothing to report
+            finally:
+                # Closing explicitly runs hub_stream's own finally, which is
+                # what records the spend on an abandoned stream. Relying on
+                # refcounting to finalise the generator happens to work on
+                # CPython but is not a language guarantee.
+                close = getattr(frames, "close", None)
+                if close:
+                    close()
+
+        def _authed(self):
+            """Constant-time token check. A plain `==` on a secret leaks its
+            length and prefix through timing, and this endpoint is reachable by
+            whoever the bind allows."""
+            if not token:
+                return True
+            got = self.headers.get("Authorization", "") or ""
+            if got.startswith("Bearer "):
+                got = got[7:]
+            return hmac.compare_digest(got.strip(), token)
+
+        def _deny(self):
+            # 401 with no hint about the expected value.
+            self._send(401, {"error": {"message": "missing or invalid bearer "
+                                                  "token for the lmm hub",
+                                       "type": "invalid_request_error"}})
+
+        def do_GET(self):
+            if not self._authed():
+                self._deny()
+                return
+            if self.path.rstrip("/").endswith("/v1/models"):
+                self._send(200, {"object": "list", "data": [
+                    {"id": n, "object": "model", "owned_by": p["kind"]}
+                    for n, p in provs.items()]})
+            else:
+                self._send(404, {"error": "not found"})
+
+        def do_POST(self):
+            if not self._authed():
+                self._deny()
+                return
+            if not self.path.rstrip("/").endswith("/v1/chat/completions"):
+                self._send(404, {"error": "only /v1/chat/completions supported"})
+                return
+            length = int(self.headers.get("Content-Length", 0))
+            try:
+                req = json.loads(self.rfile.read(length).decode("utf-8", "ignore"))
+            except Exception as e:
+                self._send(400, {"error": f"bad json: {e}"})
+                return
+            # Routing, cascade, cache and metering are the SAME code path as
+            # `lmm ask` (hub_complete) — one hub, one routing brain. The whole
+            # messages array is forwarded, so system prompts and prior turns
+            # survive the hop.
+            msgs = req.get("messages", [])
+            explicit = req.get("model", "")  # may be a configured provider name
+            targets = resolve_ask_targets(
+                cfg, messages_text(msgs), explicit if explicit in provs else None)
+            if not targets:
+                self._send(400, {"error": "no provider available for model '%s'" % explicit})
+                return
+            no_cache = (bool(req.get("lmm_no_cache"))
+                        or self.headers.get("X-LMM-No-Cache") is not None)
+            extra = {k: req[k] for k in PASSTHROUGH_KEYS if k in req}
+            hub_opts = {"cascade": bool(req.get("lmm_cascade")),
+                        "cache": not no_cache, "extra": extra, "source": "hub",
+                        "breaker": hub_breaker}
+            if req.get("stream"):
+                hub_opts["client_usage"] = bool(
+                    (req.get("stream_options") or {}).get("include_usage"))
+                self._stream(hub_stream(cfg, msgs, targets, hub_opts))
+                return
+            res, _trace = hub_complete(cfg, msgs, targets, hub_opts)
+            if isinstance(res, dict) and res.get("error"):
+                self._send(502, {"error": "all providers failed: %s" % res["error"]})
+                return
+            self._send(200, res)
+
+        def log_message(self, *a):
+            pass
+
+    class S(socketserver.ThreadingMixIn, http.server.HTTPServer):
+        daemon_threads = True
+
+    httpd = S((host, port), Handler)
+    quiet or print(f"[hub] OpenAI-compatible endpoint: http://{host}:{port}/v1")
+    quiet or print(f"[hub] backends: {', '.join(provs)}")
+    quiet or print("[hub] Ctrl+C to stop.")
+    try:
+        httpd.serve_forever()
+    except KeyboardInterrupt:
+        print("")
+        print("[hub] stopped.")
+
+
+def cmd_stop(runtime, cfg):
+    # Every runtime the registry can detect should also be stoppable —
+    # `lmm stop cursor` used to answer "unknown runtime" about an app
+    # `lmm discover` had just listed. STOP_TABLE stays for its aliases
+    # (e.g. "llama-server", which is not a registry key).
+    table = {k: list(v.get("procs", [])) for k, v in RUNTIME_REGISTRY.items()}
+    table.update(STOP_TABLE)
+    for e in cfg.get("extra_runtimes", []):
+        table[e["name"].lower()] = e.get("procs", [])
+    names = table.get((runtime or "").lower())
+    if not names:
+        print("unknown runtime. choices:", ", ".join(sorted(table)))
+        return
+    for n in names:
+        if os.name == "nt":
+            r = backend.run(f'taskkill.exe /IM "{n}" /F')
+        else:
+            r = backend.run(f"pkill -f '{n}' || true")
+        ok = (r and r.returncode == 0) if r else False
+        print(f"stop {n}: {'ok' if ok else 'no-process-or-failed'}")
+
+
+def cmd_dash(cfg):
+    out = os.path.join(backend.HOME, ".lmm_dashboard.html")
+    with open(out, "w", encoding="utf-8") as f:
+        f.write(build_dash(cfg))
+    print("dashboard ->", out)
+    try:
+        webbrowser.open(out)
+    except Exception:
+        pass
+
+
+def prune_seen(seen, live, tick, grace=2):
+    """Forget window handles absent for `grace` ticks. Because Windows recycles
+    HWNDs, a handle we never forget will eventually match a new window that
+    reused it and wrongly skip hiding it. Mutates and returns `seen`."""
+    for hwnd in [h for h, t in seen.items() if h not in live and tick - t > grace]:
+        del seen[hwnd]
+    return seen
+
+
+def watch_list(cfg):
+    """(runtime name, lowercase title keyword) pairs the daemon watches.
+
+    Registry entries plus cfg extra_runtimes — cmd_stop already treats those as
+    first class and the daemon should agree. Pure, so the composition is
+    testable off Windows.
+    """
+    out = []
+    for rt, entry in RUNTIME_REGISTRY.items():
+        for kw in entry.get("titles", []):
+            out.append((rt, kw.lower()))
+    for e in (cfg or {}).get("extra_runtimes", []):
+        for kw in e.get("titles", []) or [e.get("name", "")]:
+            if kw:
+                out.append((e.get("name", "?"), kw.lower()))
+    return out
+
+
+def watch_new_windows(windows, seen, tick, watchlist):
+    """Decide what to act on this tick: [(hwnd, title, runtime)] for windows
+    not seen before. Also stamps `seen` so the caller only has to prune.
+
+    Separated from the ctypes calls because the DECISION is what regressed
+    before (recycled handles being skipped forever), and the decision needs no
+    Windows API to verify.
+    """
+    fresh = []
+    for hwnd, title in windows:
+        first = hwnd not in seen
+        seen[hwnd] = tick
+        if not first:
+            continue
+        low = (title or "").lower()
+        rt = next((r for r, kw in watchlist if kw in low), "?")
+        fresh.append((hwnd, title, rt))
+    return fresh
+
+
+def cmd_watch(cfg, interval=3.0):
+    """Background daemon: automatically strip the taskbar button from any
+    newly-spawned LLM-runtime window. This is the root-cause fix (not a
+    per-app band-aid): the user never has to click 'hide' — it happens the
+    moment an app launches. Idempotent; safe to leave running.
+    Press Ctrl-C to stop."""
+    if os.name != "nt":
+        print("watch is currently Windows-only (taskbar is a Windows concept).")
+        return
+    print(f"[lmm watch] auto-hiding new LLM windows every {interval}s. Ctrl-C to stop.")
+    # One sweep per tick, not one per registry entry: sixteen full EnumWindows
+    # passes every few seconds is fifteen too many, and entries with no titles
+    # were enumerating the whole desktop just to match nothing. cfg-defined
+    # extra_runtimes participate too — cmd_stop already treats them as first
+    # class, and the daemon should agree.
+    watchlist = watch_list(cfg)          # (runtime name, lowercase keyword)
+    all_keywords = [kw for _, kw in watchlist]
+    # HWND -> last tick seen. Windows RECYCLES window handles, so a plain
+    # ever-growing "seen" set eventually swallows a brand-new window that
+    # happens to reuse an old handle — the daemon silently stops working in
+    # exactly the always-on scenario `lmm autostart` sets up. Entries that
+    # vanish from the enumeration are dropped so a recycled handle counts as
+    # new again.
+    seen = {}
+    tick = 0
+    try:
+        while True:
+            tick += 1
+            current = _enum_windows_by_title(all_keywords)
+            live = set(h for h, _ in current)
+            for hwnd, title, rt in watch_new_windows(current, seen, tick,
+                                                     watchlist):
+                try:
+                    user32 = ctypes.windll.user32
+                    ex = user32.GetWindowLongW(hwnd, GWL_EXSTYLE)
+                    new_ex = (ex | WS_EX_TOOLWINDOW) & ~WS_EX_APPWINDOW
+                    if new_ex != ex:
+                        user32.SetWindowLongW(hwnd, GWL_EXSTYLE, new_ex)
+                        print(f"  auto-hidden '{rt}' window: {title!r}")
+                except Exception:
+                    pass
+            prune_seen(seen, live, tick)
+            time.sleep(interval)
+    except KeyboardInterrupt:
+        print("\n[lmm watch] stopped.")
+
+
+def cmd_autostart():
+    """Register `lmm watch` to start automatically with the OS, so the
+    taskbar stays clean with zero user action (root-cause fix, not a band-aid).
+    Prefers USER-level mechanisms that need no admin rights:
+      Win  -> Startup folder shortcut (no UAC)
+      mac  -> launchd agent (RunAtLoad)
+      Linux-> systemd --user
+    Falls back to Task Scheduler only on Windows if the Startup shortcut fails.
+    """
+    if os.name != "nt":
+        # `watch` exits immediately off-Windows, but launchd KeepAlive and
+        # systemd Restart=always would restart it forever — registering a
+        # service whose only behaviour is a restart loop. Refuse instead.
+        print("autostart registers `lmm watch`, which is Windows-only "
+              "(the taskbar is a Windows concept). Nothing to register here.")
+        return
+    me = os.path.abspath(__file__)
+    python_exe = sys.executable
+    if os.name == "nt":
+        # 1) Startup folder shortcut — user-level, no admin needed
+        startup = os.path.join(os.environ.get("APPDATA", backend.HOME),
+                               "Microsoft", "Windows", "Start Menu",
+                               "Programs", "Startup")
+        try:
+            os.makedirs(startup, exist_ok=True)
+            lnk = os.path.join(startup, "lmm-watch.lnk")
+            ps = (
+                f'$s=(New-Object -ComObject WScript.Shell).CreateShortcut('
+                f"'{lnk}');"
+                f"$s.TargetPath='{python_exe}';"
+                f"$s.Arguments='\"{me}\" watch';"
+                f"$s.WindowStyle=7;"  # 7 = minimized
+                f"$s.Save()"
+            )
+            r = backend.run(f'powershell -NoProfile -Command "{ps}"')
+            if r and r.returncode == 0 and os.path.exists(lnk):
+                print(f"registered lmm watch via Startup folder (no admin needed): {lnk}")
+                return
+        except Exception as e:
+            pass
+        # 2) fallback: Task Scheduler (may need admin)
+        cmd = (f'schtasks /Create /TN "lmm-watch" /TR '
+               f'"{python_exe} \"{me}\" watch" /SC ONLOGON /F')
+        r = backend.run(cmd)
+        if r and r.returncode == 0:
+            print("registered lmm watch with Windows Task Scheduler (runs at logon).")
+        else:
+            print("autostart registration failed. Manual option: copy this to your "
+                  "Startup folder as a shortcut:\n"
+                  f'  {python_exe} "{me}" watch')
+
+
+def gpu_label(gpu):
+    """The GPU line for the GUI header. Pure, so the ⚠ threshold is testable
+    without a display."""
+    if not gpu:
+        return "GPU: n/a"
+    text = "GPU: %s %s/%s MiB (%s%%)" % (gpu["name"], gpu["used"], gpu["total"],
+                                         gpu["pct"])
+    # flag a nearly-full card: the next model load is the one that fails
+    return text + "  \u26a0" if gpu["pct"] >= 85 else text
+
+
+def gui_rows(items):
+    """(values, tag) per runtime for the GUI table.
+
+    Lifted out of launch_gui's paint() closure so it can be tested without
+    tkinter — which is not installed everywhere, and was the excuse for this
+    layer having no coverage while it silently drifted.
+    """
+    rows = []
+    for it in items:
+        rows.append(((
+            it["name"], it["type"],
+            "PAID" if it.get("paid") else "free",
+            "YES" if it["running"] else "no",
+            "YES" if it.get("serving") else "-",
+            it.get("procs", 0),
+            ", ".join(it.get("models", [])) or "-",
+            str(it.get("endpoint", "-")),
+        ), "on" if it["running"] else "off"))
+    return rows
+
+
+def gui_model_choices(items):
+    """Dropdown values: every model on every discovered runtime, deduped."""
+    models = []
+    for it in items:
+        models.extend(it.get("models") or [])
+    return sorted(set(models))
+
+
+def launch_gui(cfg):
+    """Zero-dependency live dashboard (tkinter). Implements the UX principles
+    gathered from the research:
+      * Nielsen #1 Visibility of System Status — live status, always informed
+      * Norman's Gulf of Evaluation — one glance shows state -> next action
+      * Backstage vs Frontstage (NN/g) — show cost/VRAM only when it matters
+      * Direct manipulation — buttons do the action immediately
+      * Trust = Communication — never stores secrets; states are honest
+    """
+    try:
+        import tkinter as tk
+        from tkinter import ttk, messagebox
+    except Exception as e:
+        # `lmm` with no arguments lands here on every server, container and
+        # WSL box — environments with no tkinter and no display. The tool's
+        # whole thesis is visibility of system status, so complaining about a
+        # GUI toolkit the user never asked for and showing NOTHING was the
+        # worst possible first contact. Degrade to the text status instead.
+        print(f"(no GUI here — tkinter unavailable: {e}; showing text status. "
+              "`lmm dash` renders the HTML dashboard.)")
+        cmd_status(cfg)
+        return
+    import threading
+
+    try:
+        root = tk.Tk()
+    except Exception as e:
+        # tkinter installed but no display — ssh sessions and CI runners land
+        # here, where the import above succeeds and Tk() is what fails. An
+        # uncaught TclError traceback is the same broken first contact as a
+        # missing tkinter, so it gets the same graceful exit.
+        print(f"(no GUI here — no display: {e}; showing text status. "
+              "`lmm dash` renders the HTML dashboard.)")
+        cmd_status(cfg)
+        return
+    root.title("LMM — Local/remote Model Manager")
+    root.geometry("920x560")
+
+    style = ttk.Style()
+    try:
+        style.theme_use("clam")
+    except Exception:
+        pass
+
+    # --- top bar ---------------------------------------------------------
+    top = ttk.Frame(root)
+    top.pack(fill="x", padx=8, pady=6)
+    ttk.Label(top, text="🧠 LMM Dashboard", font=("Segoe UI", 14, "bold")).pack(side="left")
+    gpu_var = tk.StringVar(value="GPU: …")
+    ttk.Label(top, textvariable=gpu_var, foreground="#2e7d32").pack(side="right")
+    cost_label = ttk.Label(top, text="", foreground="#1565c0")
+    cost_label.pack(side="right", padx=12)
+
+    # --- runtime table ---------------------------------------------------
+    cols = ("Runtime", "Type", "Cost", "Running", "Serving", "Procs", "Models",
+            "Endpoint")
+    tree = ttk.Treeview(root, columns=cols, show="headings", height=12)
+    widths = (170, 70, 60, 70, 66, 60, 200, 190)
+    for c, w in zip(cols, widths):
+        tree.heading(c, text=c)
+        tree.column(c, width=w, anchor="w")
+    tree.pack(fill="both", expand=True, padx=8, pady=4)
+
+    # --- action bar ------------------------------------------------------
+    bar = ttk.Frame(root)
+    bar.pack(fill="x", padx=8, pady=6)
+    ttk.Label(bar, text="Runtime:").pack(side="left")
+    rt_var = tk.StringVar()
+    rt_cb = ttk.Combobox(bar, textvariable=rt_var, width=18,
+                         values=sorted(RUNTIME_REGISTRY))
+    rt_cb.pack(side="left", padx=4)
+    ttk.Label(bar, text="Model:").pack(side="left")
+    mdl_var = tk.StringVar()
+    # Populated from discover() on each refresh — the list used to be four
+    # hardcoded Ollama tags, stale the day they were written.
+    mdl_cb = ttk.Combobox(bar, textvariable=mdl_var, width=22, values=[])
+    mdl_cb.pack(side="left", padx=4)
+
+    def act(fn_name):
+        rt = rt_var.get().strip().lower()
+        if not rt:
+            messagebox.showwarning("LMM", "select a runtime first")
+            return
+        model = mdl_var.get().strip() or "qwen2.5-coder:7b"
+
+        def work():
+            # `serve` shells out to `ollama pull`, which can run for minutes on
+            # a cold model. On the Tk thread that is an unresponsive window, so
+            # every action runs on a worker and reports back via root.after.
+            if fn_name == "hide":
+                msg = hide_taskbar(rt)
+            elif fn_name == "stop":
+                cmd_stop(rt, cfg)
+                msg = f"stopped {rt} (if running)"
+            elif fn_name == "serve":
+                cmd_serve(model)
+                msg = f"served {model}"
+            else:
+                msg = "?"
+            root.after(0, lambda: (messagebox.showinfo("LMM", msg), refresh()))
+        threading.Thread(target=work, daemon=True).start()
+
+    ttk.Button(bar, text="▶ Serve", command=lambda: act("serve")).pack(side="left", padx=2)
+    ttk.Button(bar, text="■ Stop", command=lambda: act("stop")).pack(side="left", padx=2)
+    ttk.Button(bar, text="⊟ Hide from taskbar", command=lambda: act("hide")).pack(side="left", padx=2)
+    ttk.Button(bar, text="⟳ Refresh", command=lambda: refresh()).pack(side="right", padx=2)
+
+    # --- live refresh ----------------------------------------------------
+    def gather():
+        """Everything slow: subprocesses, socket probes, and a full walk of the
+        session logs. Runs on a worker thread — doing it on the Tk thread froze
+        the window for the duration of every refresh."""
+        gpu = gpu_info()
+        try:
+            cost_line = cost_summary(cfg)
+        except Exception:
+            cost_line = ""
+        return gpu, cost_line, backend.discover(cfg)
+
+    def paint(data):
+        """Everything touching widgets. Tk is not thread-safe, so this only
+        ever runs on the main thread, marshalled back via root.after."""
+        gpu, cost_line, items = data
+        gpu_var.set(gpu_label(gpu))
+        if cost_line:
+            cost_label.config(text=cost_line)
+        for row in tree.get_children():
+            tree.delete(row)
+        for values, tag in gui_rows(items):
+            tree.insert("", "end", values=values, tags=(tag,))
+        # keep the user's typed value; only refresh the dropdown choices
+        choices = gui_model_choices(items)
+        if choices:
+            mdl_cb.configure(values=choices)
+        tree.tag_configure("on", foreground="#1b5e20")
+        tree.tag_configure("off", foreground="#9e9e9e")
+
+    busy = {"running": False}
+
+    def refresh():
+        if busy["running"]:
+            return               # a slow probe must not queue up behind itself
+        busy["running"] = True
+
+        def work():
+            try:
+                data = gather()
+            except Exception:
+                data = None
+            finally:
+                busy["running"] = False
+            if data is not None:
+                root.after(0, lambda: paint(data))
+        threading.Thread(target=work, daemon=True).start()
+
+    refresh()
+    # auto-refresh every 5s (visibility of system status, continuously)
+    def loop():
+        refresh()
+        root.after(5000, loop)
+    root.after(5000, loop)
+    root.mainloop()
+
+
+def cmd_hide(runtime):
+
+    print(hide_taskbar(runtime), flush=True)
+
+
+def cmd_examples():
+    print(json.dumps({
+        "pricing": {"my-model": {"in": 1.0, "out": 2.0, "cw": 1.0, "cr": 0.1}},
+        "route": {"private": ["secret", "社内"], "heavy": ["code", "設計"]},
+        "providers": {
+            "openai": {"api_key": "sk-...", "base_url": "https://api.openai.com/v1",
+                       "model": "gpt-4o", "kind": "remote",
+                       "price": "openai-gpt4o"},
+            "gemini": {"api_key": "AIza...", "base_url": "https://generativelanguage.googleapis.com/v1beta/openai/",
+                       "model": "gemini-1.5-pro", "kind": "remote",
+                       "price": {"in": 1.25, "out": 5.0}},
+            "my-local": {"api_key": "ollama", "base_url": "http://localhost:11434/v1",
+                         "model": "qwen2.5-coder:7b", "kind": "local"}
+        },
+        # Hub security. The hub calls your providers with the keys above, so
+        # anyone who can reach it can spend your budget. Loopback is open;
+        # binding wider is refused unless you set a token (recommended) or
+        # explicitly opt into an unauthenticated bind.
+        "hub": {"token": None, "allow_remote": False},
+        # Retry a TRANSIENT failure (429, 5xx, timeout) on the same provider,
+        # with full-jitter backoff. A 4xx is never retried — it would fail the
+        # same way. attempts=1 disables retrying.
+        "retry": {"attempts": 2, "base_ms": 250, "cap_ms": 8000},
+        # Stop paying a down provider's timeout on every request: after
+        # `threshold` consecutive failures it is skipped for `cooldown_s`.
+        "breaker": {"enabled": True, "threshold": 3, "cooldown_s": 30},
+        # Provider priority. Set it and lmm follows your order exactly;
+        # leave it out and route_threshold below decides.
+        "ask_order": ["my-local", "openai"],
+        # RouteLLM-style cost threshold (arXiv:2406.18665). Prompts scoring
+        # below it try the cheap providers first. null disables auto-routing.
+        "route_threshold": 0.5,
+        # FrugalGPT-style cascade (arXiv:2305.05176): run cheap models first,
+        # escalate only when the answer scores below `threshold`.
+        "cascade": {
+            "enabled": False, "rungs": ["my-local", "openai"],
+            "threshold": 0.6, "max_rungs": 3, "judge": None
+        },
+        # Prompt cache. The semantic tier needs a local embedding model and
+        # accepts fuzzy matches, so it is opt-in (see vCache, arXiv:2502.03771).
+        "cache": {
+            "enabled": True, "semantic": False, "similarity": 0.95,
+            "ttl_hours": 168, "max_entries": 2000,
+            "embed_model": "nomic-embed-text", "max_temp": 0.3,
+            # Set max_error_rate (vCache, arXiv:2502.03771) and each cached
+            # entry must earn the right to answer by accumulating evidence
+            # that it was correct; null keeps the static-threshold behaviour.
+            "max_error_rate": None, "confidence": 0.95,
+            "answer_match": 0.92, "min_observations": 3
+        },
+        # Optional: hand-entered cloud spend, added on top of what lmm
+        # measures itself in ~/.lmm/usage.jsonl.
+        "usage": {
+            "openai": 12.50,
+            "gemini": {"in": 1000000, "out": 2000000}
+        },
+        "extra_runtimes": [
+            {
+                "name": "vLLM",
+                "type": "local",
+                "paid": False,
+                "procs": ["vllm", "vllm.entrypoints"],
+                "installed_paths": ["~/.vllm"],
+                "endpoint": "http://localhost:8000/v1",
+                "models_cmd": "curl -s http://localhost:8000/v1/models"
+            },
+            {
+                "name": "My Remote Agent",
+                "type": "remote",
+                "paid": True,
+                "procs": ["myagent"],
+                "installed_paths": ["~/myagent"],
+                "endpoint": "https://api.myagent.example"
+            }
+        ]
+    }, indent=2, ensure_ascii=False))
+
+
+def cmd_ask(prompt, provider, cfg, cascade=False, no_cache=False,
+            explain=False, verify=False):
+    """Unified inference over every backend: cache, threshold routing, optional
+    cheap-first cascade, and metering - all of it the same code path the hub
+    serves, so `lmm ask` and an app pointed at `lmm serve --hub` behave alike.
+
+    --verify measures the reply after the call and falls through to the next
+    backend if it is unusable — the complement of routing, which can only
+    guess before the call. Both orderings come from the same router.
+    """
+    if not (prompt or "").strip():
+        print("usage: lmm ask \"your question\" [--provider NAME] [--cascade]")
+        return
+    effective = provider
+    if verify and not provider:
+        name, vreason, reply = route_and_verify(prompt, cfg, cfg.get("ask_order"))
+        if name and reply is not None:
+            print(f"[ask] verified-route: {name} -> {vreason}")
+            print(reply)
+        else:
+            print("[ask] verified-route: no backend passed the quality gate "
+                  f"({vreason})")
+        return
+    targets = resolve_ask_targets(cfg, prompt, effective)
+    if not targets:
+        if provider:
+            # Naming a provider that does not exist is a typo, not an outage.
+            # Saying which names *are* known turns a dead end into a fix.
+            known = sorted(set(
+                list((cfg.get("providers") or {}).keys())
+                + [it["name"] for it in backend.discover(cfg) if it["running"]]
+                + ["local-ollama(implicit)", "local-lmstudio(implicit)"]))
+            print(f"[ask] unknown provider '{provider}'.")
+            print(f"[ask] known providers: {', '.join(known)}")
+            print("[ask] or omit --provider to use ask_order / auto routing.")
+        else:
+            print("[ask] no provider available. Start Ollama (`lmm serve <model>`) "
+                  "or add 'providers' to lmm config (see `lmm examples`).")
+        return
+    if explain:
+        score, feats = prompt_strength(cfg, prompt)
+        thr = cfg.get("route_threshold", DEFAULT_ROUTE_THRESHOLD)
+        print(f"[route] strength={score:.2f} threshold={thr} -> "
+              + ", ".join(n for n, _ in backend.order_targets(cfg, prompt, targets)))
+    res, trace = hub_complete(cfg, prompt, targets,
+                              {"cascade": cascade, "cache": not no_cache,
+                               "source": "ask"})
+    for line in trace:               # warnings are never hidden behind --explain
+        if explain or line.startswith("[warn]"):
+            print(line)
+    if isinstance(res, dict) and res.get("error"):
+        log_hub({"event": "ask", "provider": effective or "(routed)",
+                 "ok": False, "error": res["error"], "prompt": prompt})
+        print(f"[ask] all providers failed. last error: {res['error']}")
+        return
+    try:
+        answer = res["choices"][0]["message"]["content"]
+    except (KeyError, IndexError, TypeError):
+        print("[ask] unexpected response shape from provider")
+        return
+    log_hub({"event": "ask", "provider": effective or "(routed)", "ok": True,
+             "prompt": prompt, "reply": (answer or "")[:200], "trace": trace})
+    print(answer)
+
+
+def cmd_bench(cfg, provider=None, runs=3, prompt=None, max_tokens=128):
+    """Measure TTFT / TPOT / throughput per provider so the local-vs-cloud
+    decision has latency data, not just price."""
+    prompt = prompt or "Count from 1 to 40, separated by commas."
+    provs = merged_providers(cfg)
+    if provider:
+        targets = [(provider, provs[provider])] if provider in provs else []
+        if not targets:
+            lo = backend.local_ollama_provider()
+            if lo and provider in ("local", "ollama", "local-ollama"):
+                targets = [("local-ollama(implicit)", lo)]
+    else:
+        targets = list(provs.items())
+        lo = backend.local_ollama_provider()
+        if lo:
+            targets.append(("local-ollama(implicit)", lo))
+    if not targets:
+        print("[bench] no provider available. Start Ollama or add 'providers' "
+              "to lmm config (see `lmm examples`).")
+        return
+
+    print(f'prompt: "{prompt}"   runs: {runs} (+1 discarded warm-up)   '
+          f"max_tokens: {max_tokens}")
+    print("-" * 78)
+    print(f"  {'provider':<26} {'TTFT':>9} {'TPOT':>9} {'tok/s':>9} {'e2e':>9}")
+    print("-" * 78)
+    pricing = merged_pricing(cfg)
+    for name, prov in targets:
+        # The first call pays for model load, connection setup and any cold
+        # cache. Including it would measure the machine's startup, not its
+        # steady-state serving speed, so it is discarded.
+        warm = bench_once(prov, prompt, max_tokens)
+        if warm.get("error"):
+            print(f"  {name:<26} failed: {warm['error']}")
+            continue
+        samples = []
+        for i in range(max(1, runs)):
+            # Vary the prefix per run. Repeating an identical prompt would hit
+            # the server's prefix cache (Ollama and vLLM both keep one) and
+            # report a cache-hit TTFT instead of a real prefill — the run would
+            # measure the cache, not the model.
+            r = bench_once(prov, "(%d) %s" % (i, prompt), max_tokens)
+            if not r.get("error"):
+                samples.append(r)
+        if not samples:
+            print(f"  {name:<26} warm-up ok but every measured run failed")
+            continue
+        ttft = median([s["ttft_ms"] for s in samples])
+        tpot = median([s["tpot_ms"] for s in samples])
+        tps = median([s["tok_per_s"] for s in samples])
+        e2e = median([s["e2e_ms"] for s in samples])
+        note = " (tokens estimated)" if samples[0]["estimated"] else ""
+        print(f"  {name:<26} {ttft:8.0f}ms {tpot:8.1f}ms {tps:9.1f} {e2e:8.0f}ms{note}")
+        if len(samples) > 1:
+            lo_t = min(s["ttft_ms"] for s in samples)
+            hi_t = max(s["ttft_ms"] for s in samples)
+            print(f"  {'':<26} TTFT range {lo_t:.0f}-{hi_t:.0f}ms over "
+                  f"{len(samples)} runs")
+        rate = price_for(prov, prov.get("model"), pricing)
+        if rate["out"]:
+            per_1k = rate["out"] / 1000.0
+            print(f"  {'':<26} ${per_1k:.5f} per 1k output tokens")
+    print("-" * 78)
+    print("TTFT = time to first token (prefill). TPOT = time per output token "
+          "after the first\n(decode). e2e = TTFT + TPOT x (tokens-1). Medians "
+          "over the measured runs.")
+
+
+def cmd_cache(cfg=None, clear=False):
+    """Inspect or drop the prompt cache. The near-miss similarities are the
+    evidence for tuning cache.similarity — vCache (arXiv:2502.03771) makes the
+    case that a static threshold picked blind is not safe.
+
+    It reads the EFFECTIVE config, not the defaults: showing `threshold 0.95` to
+    someone who set 0.85 gave them the wrong evidence for the one decision this
+    command exists to support, and expiry was judged against the default TTL
+    rather than theirs.
+    """
+    conf = merged_cache(cfg or {})
+    if clear:
+        try:
+            if os.path.isfile(backend.CACHE_LOG):
+                os.remove(backend.CACHE_LOG)
+            print("[cache] cleared")
+        except OSError as e:
+            print(f"[cache] could not clear: {e}")
+        return
+    entries = cache_entries(conf)
+    print(f"[cache] {backend.CACHE_LOG}")
+    print(f"[cache] enabled={conf.get('enabled')} semantic={conf.get('semantic')} "
+          f"similarity={conf.get('similarity')} ttl_hours={conf.get('ttl_hours')} "
+          f"max_entries={conf.get('max_entries')}")
+    if conf.get("semantic"):
+        print(f"[cache] embed model: {conf.get('embed_model')} (local Ollama)")
+    delta = conf.get("max_error_rate")
+    if delta is None:
+        print("[cache] mode: static threshold — every neighbour above "
+              f"{conf.get('similarity')} is served")
+    else:
+        print(f"[cache] mode: verified (vCache) — max_error_rate={delta}, "
+              f"confidence={conf.get('confidence')}, "
+              f"min_observations={conf.get('min_observations')}")
+    print(f"[cache] {len(entries)} live entries, "
+          f"{sum(1 for e in entries if e.get('emb'))} with embeddings")
+    if delta is not None and entries:
+        # Per-entry state is the whole point of the verified mode, so show it.
+        certified_n = 0
+        for e in entries:
+            obs = e.get("obs") or []
+            if obs and certified(e, max(o[0] for o in obs), conf)[0]:
+                certified_n += 1
+        observed = sum(len(e.get("obs") or []) for e in entries)
+        print(f"[cache] {certified_n} entr(ies) certified to answer, "
+              f"{observed} observation(s) recorded")
+    if entries:
+        oldest = min(e.get("at", 0) for e in entries)
+        print("[cache] oldest: "
+              + datetime.datetime.fromtimestamp(oldest).strftime("%Y-%m-%d %H:%M"))
+        print(f"[cache] value stored: ${sum(float(e.get('usd', 0) or 0) for e in entries):,.4f}")
+    hits = {"exact": 0, "semantic": 0, "near-miss": 0}
+    sims = []
+    for ev in read_usage():
+        if ev.get("rollup"):
+            for k in hits:
+                hits[k] += (ev.get("hits") or {}).get(k, 0)
+            continue                     # sims stay tail-only: recency matters
+        h = ev.get("cache")
+        if h in hits:
+            hits[h] += 1
+        if h == "near-miss":
+            sims.append(ev.get("similarity", 0.0))
+    print(f"[cache] hits: exact={hits['exact']} semantic={hits['semantic']} "
+          f"near-miss={hits['near-miss']}")
+    if sims:
+        print(f"[cache] near-miss similarity: max={max(sims):.3f} "
+              f"avg={sum(sims) / len(sims):.3f} "
+              f"(threshold {conf.get('similarity')})")
 
 
 def cmd_priority(cfg, show=False, optimize=False):
@@ -251,7 +1217,7 @@ def cmd_priority(cfg, show=False, optimize=False):
             for i, n in enumerate(order, 1):
                 print(f"  {i}. {n}")
         return
-    items = discover(cfg)
+    items = backend.discover(cfg)
     running = [it["name"] for it in items
                if it["running"] and it["name"] != "-"]
     if not running:
@@ -301,41 +1267,6 @@ def cmd_priority(cfg, show=False, optimize=False):
     print("[priority] now use `lmm ask` / `lmm chat` — they route by this order.")
 
 
-def cmd_status(cfg):
-    gpu = gpu_info()
-    print("GPU:", gpu["name"] if gpu else "n/a",
-          f"({gpu['used']}/{gpu['total']} MiB, {gpu['pct']}%)" if gpu else "")
-    print("-" * 64)
-    for it in discover(cfg):
-        print(f"{it['name']:<32} running={it['running']!s:<5} "
-              f"procs={it.get('procs', 0)}")
-
-
-
-
-def cmd_models(cfg):
-    """Unified model registry: list models across every detected provider
-    (local Ollama + configured cloud backends). Measures each, does not assume."""
-    provs = merged_providers(cfg)
-    if not provs:
-        ms = detect_ollama()["models"]
-        if ms:
-            print("Ollama local models:")
-            for m in ms:
-                print("  -", m)
-        else:
-            print("no providers detected (no Ollama, no config)")
-        return
-    for name, prov in provs.items():
-        models = fetch_models(prov)
-        if models:
-            print(f"{name} ({prov.get('kind', '?')}):")
-            for m in models:
-                print("  -", m)
-        else:
-            print(f"{name} ({prov.get('kind', '?')}): unreachable / no models")
-
-
 def cmd_pull(model):
     """Pull a model into the local Ollama base (the unified local model store).
     The hub's default backend is Ollama, so `lmm pull` keeps it stocked."""
@@ -343,14 +1274,14 @@ def cmd_pull(model):
         print("usage: lmm pull <ollama-model>  e.g. lmm pull qwen2.5-coder:7b")
         return
     print(f"pulling {model} into local Ollama ...")
-    r = run(f"ollama pull {model}", timeout=900)
+    r = backend.run(f"ollama pull {model}", timeout=900)
     if r is None or r.returncode != 0:
         # command itself failed/exceptioned
         err = (r.stderr.strip() if r and r.stderr else "(pull failed/timeout)")
         print(err)
     else:
         # success: ollama pull prints progress; confirm presence via list
-        confirm = run(f"ollama list", timeout=30)
+        confirm = backend.run(f"ollama list", timeout=30)
         ok = confirm and model.split(":")[0] in (confirm.stdout or "") \
             and (model.split(":")[1] if ":" in model else "") in (confirm.stdout or "")
         print((r.stdout.strip() if r.stdout else "") or "pull complete.")
@@ -359,866 +1290,17 @@ def cmd_pull(model):
     print("done. Use `lmm models` to confirm, `lmm ask` to route to it.")
 
 
-def cmd_serve(model):
-    if not model:
-        print("usage: lmm serve <ollama-model>  e.g. lmm serve qwen2.5-coder:7b")
-        return
-    print(f"pulling {model} ...")
-    r = run(f"ollama pull {model}", timeout=900)
-    if r is None or r.returncode != 0:
-        err = (r.stderr.strip() if r and r.stderr else "(pull failed/timeout)")
-        print(err)
-    else:
-        print((r.stdout.strip() if r.stdout else "") or "pull complete.")
-    print("endpoint ready: http://localhost:11434  (OpenAI-compatible)")
-
-
-
-
-def cmd_serve_hub(cfg, host, port):
-    """Start an OpenAI-compatible proxy that fans out to every configured
-    provider (cloud + local). Apps point at this one endpoint; `lmm` routes
-    each request. This is the hub: one endpoint, many backends."""
-    import http.server, socketserver, threading
-    provs = merged_providers(cfg)
-    # zero-config: if no providers configured but Ollama is running, expose it
-    targets = resolve_ask_targets(cfg, "", None) if "resolve_ask_targets" in globals() else [(n, p) for n, p in provs.items()]
-    if not targets and not provs:
-        # final safety net: implicit running Ollama even without config
-        lo = local_ollama_provider()
-        if lo:
-            targets = [("local-ollama(implicit)", lo)]
-    if not targets:
-        print("[hub] no providers configured and no Ollama running. Add "
-              "'providers' to lmm config (see `lmm examples`), or start Ollama.")
-        return
-    provs = dict(targets)
-
-    class Handler(http.server.BaseHTTPRequestHandler):
-        def _send(self, code, obj):
-            body = json.dumps(obj, ensure_ascii=False).encode("utf-8")
-            self.send_response(code)
-            self.send_header("Content-Type", "application/json")
-            self.send_header("Content-Length", str(len(body)))
-            self.end_headers()
-            self.wfile.write(body)
-
-        def do_GET(self):
-            if self.path.rstrip("/").endswith("/v1/models"):
-                # Real model IDs from every backend (not stubs). An OpenAI
-                # client calling models.list() must see actual selectable models.
-                data = []
-                for n, p in provs.items():
-                    for mid in fetch_models(p):
-                        data.append({
-                            "id": mid,
-                            "object": "model",
-                            "owned_by": p.get("kind", "unknown"),
-                            "lmm_provider": n,
-                        })
-                if not data:
-                    data = [{"id": n, "object": "model",
-                             "owned_by": p.get("kind", "unknown")}
-                            for n, p in provs.items()]
-                self._send(200, {"object": "list", "data": data})
-            else:
-                self._send(404, {"error": "not found"})
-
-        def do_POST(self):
-            if not self.path.rstrip("/").endswith("/v1/chat/completions"):
-                self._send(404, {"error": "only /v1/chat/completions supported"})
-                return
-            length = int(self.headers.get("Content-Length", 0))
-            try:
-                req = json.loads(self.rfile.read(length).decode("utf-8", "ignore"))
-            except Exception as e:
-                self._send(400, {"error": f"bad json: {e}"})
-                return
-            # routing: reuse the SAME intelligence as `lmm ask` —
-            # cfg['ask_order'] + auto-routing + implicit-Ollama fallback.
-            msgs = req.get("messages", [])
-            prompt = msgs[0].get("content", "") if msgs else ""
-            explicit = req.get("model", "")  # may be a provider name OR a real model id
-            requested_model = explicit  # remember what the client asked for
-            if explicit and explicit not in provs:
-                # client picked a real model id from /v1/models — map it back
-                mapped = resolve_provider_by_model(provs, explicit)
-                explicit = mapped if mapped else None
-            targets = resolve_ask_targets(cfg, prompt, explicit if explicit in provs else None)
-            if not targets:
-                self._send(400, {"error": "no provider available for model '%s'" % requested_model})
-                return
-            last_err = None
-            want_stream = bool(req.get("stream"))
-            for name, prov in targets:
-                fwd = dict(req)
-                # honor the client's requested model id if it resolved to this
-                # provider (otherwise fall back to the provider's default model)
-                use_model = requested_model if (requested_model and requested_model in fetch_models(prov)) else prov["model"]
-                fwd["model"] = use_model
-                prov = dict(prov)  # don't mutate the shared provider dict
-                prov["model"] = use_model
-                gen = call_provider(prov, prompt,
-                                    temperature=fwd.get("temperature", 0.7),
-                                    messages=fwd.get("messages"),
-                                    stream=want_stream)
-                if isinstance(gen, dict) and gen.get("error"):
-                    last_err = gen["error"]
-                    log_hub({"event": "serve", "provider": name, "ok": False,
-                             "error": last_err, "prompt": prompt})
-                    continue
-                if want_stream:
-                    # SSE pass-through: forward each chunk as it arrives
-                    full = []
-                    try:
-                        self.send_response(200)
-                        self.send_header("Content-Type", "text/event-stream")
-                        self.send_header("Cache-Control", "no-cache")
-                        self.end_headers()
-                        for piece in gen:
-                            if piece.startswith("[stream error:"):
-                                self.wfile.write(
-                                    ("data: " + json.dumps({"error": piece})
-                                     + chr(10) + chr(10)).encode("utf-8"))
-                                break
-                            full.append(piece)
-                            self.wfile.write(
-                                ("data: " + json.dumps({"choices": [
-                                    {"delta": {"content": piece}}]})
-                                 + chr(10) + chr(10)).encode("utf-8"))
-                            self.wfile.flush()
-                        self.wfile.write(
-                            ("data: [DONE]" + chr(10) + chr(10)).encode("utf-8"))
-                    except (BrokenPipeError, ConnectionAbortedError, OSError):
-                        pass  # client disconnected mid-stream
-                    log_hub({"event": "serve", "provider": name, "ok": True,
-                             "prompt": prompt, "reply": "".join(full)[:200]})
-                    return
-                log_hub({"event": "serve", "provider": name, "ok": True,
-                         "prompt": prompt})
-                self._send(200, gen)
-                return
-            self._send(502, {"error": "all providers failed: %s" % last_err})
-            log_hub({"event": "serve", "provider": "(all)", "ok": False,
-                     "error": last_err, "prompt": prompt})
-
-        def log_message(self, *a):
-            pass
-
-    class S(socketserver.ThreadingMixIn, http.server.HTTPServer):
-        daemon_threads = True
-
-    httpd = S((host, port), Handler)
-    print(f"[hub] OpenAI-compatible endpoint: http://{host}:{port}/v1")
-    print(f"[hub] backends: {', '.join(provs)}")
-    print("[hub] Ctrl+C to stop.")
-    try:
-        httpd.serve_forever()
-    except KeyboardInterrupt:
-        print("")
-        print("[hub] stopped.")
-
-
-
-def cmd_hub_status(cfg):
-    """Measure hub health: list every backend lmm would route to, and probe
-    each one for liveness (zero-config Ollama included). The hub is only as
-    trustworthy as what this reports — measure, don't assume."""
-    targets = resolve_ask_targets(cfg, "", None)
-    if not targets:
-        lo = local_ollama_provider()
-        if lo:
-            targets = [("local-ollama(implicit)", lo)]
-    if not targets:
-        print("[hub-status] no backends available (no config, no Ollama).")
-        return
-    print(f"HUB STATUS — {len(targets)} backend(s):")
-    print("-" * 68)
-    for name, prov in targets:
-        # probe: a tiny completion request, or a models fetch for local
-        ok = False
-        detail = ""
-        try:
-            if prov.get("kind") == "local" and "11434" in prov["base_url"]:
-                r = run("ollama list")
-                ok = bool(r and r.returncode == 0)
-                detail = "ollama reachable" if ok else "ollama not responding"
-            else:
-                # cloud: lightweight models list (GET) to test connectivity/auth
-                import urllib.request
-                url = prov["base_url"].rstrip("/") + "/models"
-                req = urllib.request.Request(
-                    url, headers={"Authorization": f"Bearer {prov.get('api_key','')}"})
-                with urllib.request.urlopen(req, timeout=8) as resp:
-                    ok = resp.status == 200
-                    detail = f"HTTP {resp.status}"
-        except Exception as e:
-            detail = str(e)[:60]
-        flag = "OK " if ok else "DOWN"
-        print(f"  [{flag}] {name:24} {prov['model'] or '(no model)'}")
-        print(f"         {prov['base_url']}  -> {detail}")
-    print("-" * 68)
-    live = sum(1 for n, p in targets
-               if (p.get("kind") == "local" and "11434" in p["base_url"]
-                    and bool(run("ollama list"))) or False)
-    print("Tip: `lmm serve --hub` exposes these as one OpenAI-compatible endpoint.")
-
-
-
-def cmd_stop(runtime, cfg):
-    table = dict(STOP_TABLE)
-    for e in cfg.get("extra_runtimes", []):
-        table[e["name"].lower()] = e.get("procs", [])
-    names = table.get((runtime or "").lower())
-    if not names:
-        print("unknown runtime. choices:", ", ".join(sorted(table)))
-        return
-    for n in names:
-        if os.name == "nt":
-            r = run(f'taskkill.exe /IM "{n}" /F')
-        else:
-            r = run(f"pkill -f '{n}' || true")
-        ok = (r and r.returncode == 0) if r else False
-        print(f"stop {n}: {'ok' if ok else 'no-process-or-failed'}")
-
-
-def cmd_dash(cfg):
-    out = os.path.join(HOME, ".lmm_dashboard.html")
-    with open(out, "w", encoding="utf-8") as f:
-        f.write(build_dash(cfg))
-    print("dashboard ->", out)
-    try:
-        webbrowser.open(out)
-    except Exception:
-        pass
-
-
-def cmd_watch(cfg, interval=3.0):
-    """Background daemon: automatically strip the taskbar button from any
-    newly-spawned LLM-runtime window. This is the root-cause fix (not a
-    per-app band-aid): the user never has to click 'hide' — it happens the
-    moment an app launches. Idempotent; safe to leave running.
-    Press Ctrl-C to stop."""
-    if os.name != "nt":
-        print("watch is currently Windows-only (taskbar is a Windows concept).")
-        return
-    print(f"[lmm watch] auto-hiding new LLM windows every {interval}s. Ctrl-C to stop.")
-    seen = set()
-    try:
-        while True:
-            for rt, entry in RUNTIME_REGISTRY.items():
-                for hwnd, title in _enum_windows_by_title(entry.get("titles", [])):
-                    if hwnd in seen:
-                        continue
-                    seen.add(hwnd)
-                    try:
-                        user32 = ctypes.windll.user32
-                        ex = user32.GetWindowLongW(hwnd, GWL_EXSTYLE)
-                        new_ex = (ex | WS_EX_TOOLWINDOW) & ~WS_EX_APPWINDOW
-                        if new_ex != ex:
-                            user32.SetWindowLongW(hwnd, GWL_EXSTYLE, new_ex)
-                            print(f"  auto-hidden '{rt}' window: {title!r}")
-                    except Exception:
-                        pass
-            import time
-            time.sleep(interval)
-    except KeyboardInterrupt:
-        print("\n[lmm watch] stopped.")
-
-
-def cmd_autostart():
-    """Register `lmm watch` to start automatically with the OS, so the
-    taskbar stays clean with zero user action (root-cause fix, not a band-aid).
-    Prefers USER-level mechanisms that need no admin rights:
-      Win  -> Startup folder shortcut (no UAC)
-      mac  -> launchd agent (RunAtLoad)
-      Linux-> systemd --user
-    Falls back to Task Scheduler only on Windows if the Startup shortcut fails.
-    """
-    me = os.path.abspath(__file__)
-    python_exe = sys.executable
-    if os.name == "nt":
-        # 1) Startup folder shortcut — user-level, no admin needed
-        startup = os.path.join(os.environ.get("APPDATA", HOME),
-                               "Microsoft", "Windows", "Start Menu",
-                               "Programs", "Startup")
-        try:
-            os.makedirs(startup, exist_ok=True)
-            lnk = os.path.join(startup, "lmm-watch.lnk")
-            ps = (
-                f'$s=(New-Object -ComObject WScript.Shell).CreateShortcut('
-                f"'{lnk}');"
-                f"$s.TargetPath='{python_exe}';"
-                f"$s.Arguments='\"{me}\" watch';"
-                f"$s.WindowStyle=7;"  # 7 = minimized
-                f"$s.Save()"
-            )
-            r = run(f'powershell -NoProfile -Command "{ps}"')
-            if r and r.returncode == 0 and os.path.exists(lnk):
-                print(f"registered lmm watch via Startup folder (no admin needed): {lnk}")
-                return
-        except Exception as e:
-            pass
-        # 2) fallback: Task Scheduler (may need admin)
-        cmd = (f'schtasks /Create /TN "lmm-watch" /TR '
-               f'"{python_exe} \"{me}\" watch" /SC ONLOGON /F')
-        r = run(cmd)
-        if r and r.returncode == 0:
-            print("registered lmm watch with Windows Task Scheduler (runs at logon).")
-        else:
-            print("autostart registration failed. Manual option: copy this to your "
-                  "Startup folder as a shortcut:\n"
-                  f'  {python_exe} "{me}" watch')
-    elif sys.platform == "darwin":
-        plist = os.path.join(HOME, "Library", "LaunchAgents",
-                             "com.lmm.watch.plist")
-        content = f"""<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0"><dict>
-  <key>Label</key><string>com.lmm.watch</string>
-  <key>ProgramArguments</key><array>
-    <string>{python_exe}</string><string>{me}</string><string>watch</string>
-  </array>
-  <key>RunAtLoad</key><true/>
-  <key>KeepAlive</key><true/>
-</dict></plist>"""
-        try:
-            os.makedirs(os.path.dirname(plist), exist_ok=True)
-            with open(plist, "w") as f:
-                f.write(content)
-            run(f"launchctl load {plist}")
-            print(f"registered lmm watch with launchd: {plist}")
-        except Exception as e:
-            print("launchd registration failed:", e)
-    else:
-        # Linux systemd --user
-        unit = os.path.join(HOME, ".config", "systemd", "user", "lmm-watch.service")
-        content = f"""[Unit]
-Description=lmm watch - auto-hide LLM taskbar windows
-[Service]
-ExecStart={python_exe} {me} watch
-Restart=always
-[Install]
-WantedBy=default.target
-"""
-        try:
-            os.makedirs(os.path.dirname(unit), exist_ok=True)
-            with open(unit, "w") as f:
-                f.write(content)
-            run("systemctl --user daemon-reload")
-            run("systemctl --user enable --now lmm-watch.service")
-            print(f"registered lmm watch with systemd --user: {unit}")
-        except Exception as e:
-            print("systemd registration failed:", e)
-
-
-
-def setup_tray(root, tooltip="LMM Dashboard"):
-    """Add a Windows system-tray icon so minimizing keeps lmm running in the
-    background (zero-dep: pure ctypes / Win32). On non-Windows this is a no-op.
-    Returns a cleanup callable, or None."""
-    if os.name != "nt":
-        return None
-    try:
-        import ctypes
-        from ctypes import wintypes
-        user = ctypes.windll.user32
-        shell = ctypes.windll.shell32
-        user.LoadIconW.argtypes = [ctypes.c_void_p, ctypes.c_uint]
-        user.LoadIconW.restype = ctypes.c_void_p
-        shell.Shell_NotifyIconW.argtypes = [ctypes.c_uint, ctypes.c_void_p]
-        user.SetWindowLongPtrW.argtypes = [ctypes.c_void_p, ctypes.c_int,
-                                           ctypes.c_void_p]
-        user.DefWindowProcW.argtypes = [ctypes.c_void_p, ctypes.c_uint,
-                                        wintypes.WPARAM, wintypes.LPARAM]
-        user.DefWindowProcW.restype = ctypes.c_long
-    except Exception:
-        return None
-
-    WM_TRAYMSG = 0x401
-    hwnd = int(root.winfo_id())
-
-    class NOTIFYICONDATA(ctypes.Structure):
-        _fields_ = [
-            ("cbSize", ctypes.c_ulong),
-            ("hWnd", ctypes.c_void_p),
-            ("uID", ctypes.c_uint),
-            ("uFlags", ctypes.c_uint),
-            ("uCallbackMessage", ctypes.c_uint),
-            ("hIcon", ctypes.c_void_p),
-            ("szTip", ctypes.c_wchar * 128),
-        ]
-    nid = NOTIFYICONDATA()
-    nid.cbSize = ctypes.sizeof(NOTIFYICONDATA)
-    nid.hWnd = hwnd
-    nid.uID = 1
-    nid.uFlags = 0x1 | 0x2 | 0x4
-    nid.uCallbackMessage = WM_TRAYMSG
-    nid.hIcon = user.LoadIconW(0, 32512)
-    nid.szTip = tooltip[:127]   # ctypes assigns str into c_wchar array
-    shell.Shell_NotifyIconW(0x0, ctypes.byref(nid))
-
-    def restore():
-        root.deiconify()
-        root.lift()
-        root.focus_force()
-
-    def wndproc(h, msg, w, l):
-        if msg == WM_TRAYMSG and l == 0x205:   # right-click
-            m = user.CreatePopupMenu()
-            user.AppendMenuW(m, 0, 1001, "Open")
-            user.AppendMenuW(m, 0, 1002, "Quit")
-            pt = wintypes.POINT()
-            user.GetCursorPos(ctypes.byref(pt))
-            cmd = user.TrackPopupMenu(m, 0x100, pt.x, pt.y, 0, hwnd, None)
-            if cmd == 1001:
-                restore()
-            elif cmd == 1002:
-                cleanup()
-                root.destroy()
-            return 0
-        if msg == WM_TRAYMSG and l == 0x203:   # double-click
-            restore()
-            return 0
-        return user.DefWindowProcW(ctypes.c_void_p(h), msg, w, l)
-
-    wp = ctypes.WINFUNCTYPE(ctypes.c_long, ctypes.c_void_p, ctypes.c_uint,
-                            wintypes.WPARAM, wintypes.LPARAM)(wndproc)
-    user.SetWindowLongPtrW(ctypes.c_void_p(hwnd), -4,
-                           ctypes.cast(wp, ctypes.c_void_p))
-    root.protocol("WM_DELETE_WINDOW", lambda: root.withdraw())  # X -> tray
-
-    def cleanup():
-        shell.Shell_NotifyIconW(0x2, ctypes.byref(nid))
-
-    return cleanup
-
-
-
-def launch_gui(cfg):
-    """Zero-dependency live dashboard (tkinter). Implements the UX principles
-    gathered from the research:
-      * Nielsen #1 Visibility of System Status — live status, always informed
-      * Norman's Gulf of Evaluation — one glance shows state -> next action
-      * Backstage vs Frontstage (NN/g) — show cost/VRAM only when it matters
-      * Direct manipulation — buttons do the action immediately
-      * Trust = Communication — never stores secrets; states are honest
-    """
-    try:
-        import tkinter as tk
-        from tkinter import ttk, messagebox
-    except Exception as e:
-        print("tkinter unavailable on this system:", e)
-        return
-    import threading
-
-    root = tk.Tk()
-    root.title("LMM — Local/remote Model Manager")
-    root.geometry("920x560")
-    _tray_cleanup = setup_tray(root)  # minimize -> stay in system tray
-    root.bind("<Map>", lambda e: None)  # restored from tray -> no-op
-
-    style = ttk.Style()
-    try:
-        style.theme_use("clam")
-    except Exception:
-        pass
-
-    # --- top bar ---------------------------------------------------------
-    top = ttk.Frame(root)
-    top.pack(fill="x", padx=8, pady=6)
-    ttk.Label(top, text="🧠 LMM Dashboard", font=("Segoe UI", 14, "bold")).pack(side="left")
-    gpu_var = tk.StringVar(value="GPU: …")
-    ttk.Label(top, textvariable=gpu_var, foreground="#2e7d32").pack(side="right")
-    cost_label = ttk.Label(top, text="", foreground="#1565c0")
-    cost_label.pack(side="right", padx=12)
-
-    # --- runtime table ---------------------------------------------------
-    cols = ("Runtime", "Type", "Cost", "Running", "Procs", "Models", "Endpoint")
-    tree = ttk.Treeview(root, columns=cols, show="headings", height=12)
-    widths = (170, 70, 60, 70, 60, 220, 200)
-    for c, w in zip(cols, widths):
-        tree.heading(c, text=c)
-        tree.column(c, width=w, anchor="w")
-    tree.pack(fill="both", expand=True, padx=8, pady=4)
-
-    # --- action bar ------------------------------------------------------
-    bar = ttk.Frame(root)
-    bar.pack(fill="x", padx=8, pady=6)
-    ttk.Label(bar, text="Runtime:").pack(side="left")
-    rt_var = tk.StringVar()
-    rt_cb = ttk.Combobox(bar, textvariable=rt_var, width=18,
-                         values=sorted(RUNTIME_REGISTRY))
-    rt_cb.pack(side="left", padx=4)
-    ttk.Label(bar, text="Model:").pack(side="left")
-    mdl_var = tk.StringVar()
-    mdl_cb = ttk.Combobox(bar, textvariable=mdl_var, width=22,
-                          values=["qwen2.5-coder:7b", "qwen2.5-coder:14b",
-                                  "llama3.1:8b", "mistral:7b"])
-    mdl_cb.pack(side="left", padx=4)
-
-    def act(fn_name):
-        rt = rt_var.get().strip().lower()
-        if not rt:
-            messagebox.showwarning("LMM", "select a runtime first")
-            return
-        if fn_name == "hide":
-            msg = hide_taskbar(rt)
-        elif fn_name == "stop":
-            cmd_stop(rt, cfg)
-            msg = f"stopped {rt} (if running)"
-        elif fn_name == "serve":
-            cmd_serve(mdl_var.get().strip() or "qwen2.5-coder:7b")
-            msg = f"served {mdl_var.get().strip() or 'qwen2.5-coder:7b'}"
-        else:
-            msg = "?"
-        messagebox.showinfo("LMM", msg)
-        refresh()
-
-    ttk.Button(bar, text="▶ Serve", command=lambda: act("serve")).pack(side="left", padx=2)
-    ttk.Button(bar, text="■ Stop", command=lambda: act("stop")).pack(side="left", padx=2)
-    ttk.Button(bar, text="⊟ Hide from taskbar", command=lambda: act("hide")).pack(side="left", padx=2)
-    ttk.Button(bar, text="⟳ Refresh", command=lambda: refresh()).pack(side="right", padx=2)
-
-    # --- first-run onboarding: auto-detect priority if none is set ---------
-    # (so a fresh user lands in a working "managed software" without knowing
-    #  the CLI. Visibility of system status + zero-config entry point.)
-    if not cfg.get("ask_order"):
-        _running = [it["name"] for it in discover(cfg)
-                    if it["running"] and it["name"] != "-"]
-        if _running:
-            cfg["ask_order"] = _running
-            save_config(cfg)
-
-    # --- priority panel (manage routing priority: discover -> set -> use) ----
-    prio = ttk.LabelFrame(root, text="Routing priority (ask_order)", padding=6)
-    prio.pack(fill="x", padx=8, pady=4)
-    prio_list = tk.Listbox(prio, height=4, selectmode="single")
-    prio_list.pack(side="left", fill="x", expand=True, padx=(0, 6))
-
-    def prio_load():
-        prio_list.delete(0, "end")
-        for n in (cfg.get("ask_order") or []):
-            prio_list.insert("end", n)
-        if prio_list.size() == 0:
-            prio_list.insert("end", "(empty — run `discover --save`)")
-
-    def prio_move(delta):
-        idx = prio_list.curselection()
-        if not idx:
-            return
-        i = idx[0]
-        j = i + delta
-        if j < 0 or j >= prio_list.size():
-            return
-        items = list(prio_list.get(0, "end"))
-        items[i], items[j] = items[j], items[i]
-        prio_list.delete(0, "end")
-        for n in items:
-            prio_list.insert("end", n)
-
-    def prio_save():
-        items = [prio_list.get(i) for i in range(prio_list.size())
-                 if prio_list.get(i) != "(empty — run `discover --save`)"]
-        cfg["ask_order"] = items
-        save_config(cfg)
-        messagebox.showinfo("LMM", f"saved {len(items)} backend(s) to ask_order")
-        refresh()
-
-    pbtn = ttk.Frame(prio)
-    pbtn.pack(side="right", fill="y")
-    ttk.Button(pbtn, text="▲ Up", width=8, command=lambda: prio_move(-1)).pack(pady=1)
-    ttk.Button(pbtn, text="▼ Down", width=8, command=lambda: prio_move(1)).pack(pady=1)
-    ttk.Button(pbtn, text="💾 Save", width=8, command=prio_save).pack(pady=1)
-
-    # --- ask panel (real use: route by priority, show reply) ----------------
-    askf = ttk.LabelFrame(root, text="Ask (routes by priority)", padding=6)
-    askf.pack(fill="both", expand=True, padx=8, pady=4)
-
-    # backend selector (pin a backend, or leave "auto" to follow ask_order)
-    sel_row = ttk.Frame(askf)
-    sel_row.pack(fill="x", pady=(0, 4))
-    ttk.Label(sel_row, text="Backend:").pack(side="left")
-    prov_var = tk.StringVar(value="auto (priority order)")
-    prov_cb = ttk.Combobox(sel_row, textvariable=prov_var, width=30,
-                           state="readonly")
-    prov_cb.pack(side="left", padx=4)
-
-    def prov_reload():
-        running = [it["name"] for it in discover(cfg)
-                   if it["running"] and it["name"] != "-"]
-        prov_cb["values"] = ["auto (priority order)"] + running
-
-    auto_var = tk.BooleanVar(value=True)
-    auto_chk = ttk.Checkbutton(sel_row, text="auto-route (measure task)",
-                               variable=auto_var)
-    auto_chk.pack(side="left", padx=8)
-
-    ask_in = ttk.Entry(askf)
-    ask_in.pack(fill="x", pady=(0, 4))
-
-    ask_out = tk.Text(askf, height=6, wrap="word", state="disabled",
-                      font=("Consolas", 10))
-    ask_out.pack(fill="both", expand=True)
-
-    def ask_run():
-        prompt = ask_in.get().strip()
-        if not prompt:
-            return
-        sel = prov_var.get()
-        explicit = None if sel.startswith("auto") else sel
-        use_auto = auto_var.get() and sel.startswith("auto")
-        ask_out.config(state="normal")
-        ask_out.insert("end", f"you> {prompt}\n")
-        ask_out.config(state="disabled")
-        ask_in.delete(0, "end")
-
-        def worker():
-            reply = gui_ask(prompt, cfg, explicit=explicit, auto=use_auto)
-            ask_out.config(state="normal")
-            ask_out.insert("end", f"{reply}\n\n")
-            ask_out.see("end")
-            ask_out.config(state="disabled")
-        threading.Thread(target=worker, daemon=True).start()
-
-    ttk.Button(askf, text="➤ Send", command=ask_run).pack(anchor="e", pady=(2, 0))
-    ask_in.bind("<Return>", lambda e: ask_run())
-
-    # --- live refresh ----------------------------------------------------
-    def refresh():
-        # GPU + cost
-        gpu = gpu_info()
-        gpu_var.set(f"GPU: {gpu['name']} {gpu['used']}/{gpu['total']} MiB ({gpu['pct']}%)"
-                    if gpu else "GPU: n/a")
-        # color the GPU red when VRAM is tight (backstage->frontstage on exception)
-        if gpu and gpu["pct"] >= 85:
-            gpu_var.set(gpu_var.get() + "  ⚠")
-        try:
-            cost_label.config(text=cost_report(cfg).splitlines()[-1])
-        except Exception:
-            pass
-        # table
-        for row in tree.get_children():
-            tree.delete(row)
-        for it in discover(cfg):
-            tag = "on" if it["running"] else "off"
-            tree.insert("", "end", values=(
-                it["name"], it["type"],
-                "PAID" if it.get("paid") else "free",
-                "YES" if it["running"] else "no",
-                it.get("procs", 0),
-                ", ".join(it.get("models", [])) or "-",
-                str(it.get("endpoint", "-")),
-            ), tags=(tag,))
-        tree.tag_configure("on", foreground="#1b5e20")
-        tree.tag_configure("off", foreground="#9e9e9e")
-        prio_load()
-        prov_reload()
-
-    refresh()
-    # auto-refresh every 5s (visibility of system status, continuously)
-    def loop():
-        refresh()
-        root.after(5000, loop)
-    root.after(5000, loop)
-    root.mainloop()
-
-
-def cmd_hide(runtime):
-
-    print(hide_taskbar(runtime), flush=True)
-
-
-def cmd_examples():
-    print(json.dumps({
-        "pricing": {"my-model": {"in": 1.0, "out": 2.0, "cw": 1.0, "cr": 0.1}},
-        "route": {"private": ["secret", "社内"], "heavy": ["code", "設計"]},
-        "providers": {
-            "openai": {"api_key": "sk-...", "base_url": "https://api.openai.com/v1",
-                       "model": "gpt-4o", "kind": "remote"},
-            "gemini": {"api_key": "AIza...", "base_url": "https://generativelanguage.googleapis.com/v1beta/openai/",
-                       "model": "gemini-1.5-pro", "kind": "remote"},
-            "my-local": {"api_key": "ollama", "base_url": "http://localhost:11434/v1",
-                         "model": "qwen2.5-coder:7b", "kind": "local"}
-        },
-        "usage": {
-            "openai": 12.50,
-            "gemini": {"in": 1000000, "out": 2000000}
-        },
-        "extra_runtimes": [
-            {
-                "name": "vLLM",
-                "type": "local",
-                "paid": False,
-                "procs": ["vllm", "vllm.entrypoints"],
-                "installed_paths": ["~/.vllm"],
-                "endpoint": "http://localhost:8000/v1",
-                "models_cmd": "curl -s http://localhost:8000/v1/models"
-            },
-            {
-                "name": "My Remote Agent",
-                "type": "remote",
-                "paid": True,
-                "procs": ["myagent"],
-                "installed_paths": ["~/myagent"],
-                "endpoint": "https://api.myagent.example"
-            }
-        ]
-    }, indent=2, ensure_ascii=False))
-
-
-
-
-
-
-
-
-
-def cmd_ask(prompt, provider, cfg, auto=False, verify=False):
-    """Unified inference with auto-routing + fallback: tries providers in order
-    (explicit > auto-score > private/local > configured > implicit running Ollama)
-    and falls through to the next on error. This is the hub's intelligence.
-    With auto=True, the FIRST target is chosen by MEASURED task-vs-backend fit
-    (first-principles routing). With verify=True, each candidate's reply is
-    MEASURED by verify_reply and fallen back if unfit (closed loop).
-    Responses stream token-by-token."""
-    effective = provider
-    if auto and not provider:
-        best, reason = score_and_route(prompt, cfg, cfg.get("ask_order"))
-        if best:
-            print(f"[ask] auto-routed: {reason}")
-            effective = best
-        else:
-            print(f"[ask] auto-routing skipped: {reason}")
-    if verify and not provider:
-        name, vreason, reply = route_and_verify(
-            prompt, cfg, cfg.get("ask_order"))
-        if name and reply is not None:
-            print(f"[ask] verified-route: {name} -> {vreason}")
-            print(reply)
-            return
-        else:
-            print(f"[ask] verified-route: no backend passed the quality gate "
-                  f"({vreason})")
-            return
-    targets = resolve_ask_targets(cfg, prompt, effective)
-    if not targets:
-        if provider:
-            known = sorted(set(
-                list((cfg.get("providers") or {}).keys())
-                + [it["name"] for it in discover(cfg) if it["running"]]
-                + ["local-ollama(implicit)", "local-lmstudio(implicit)"]))
-            print(f"[ask] unknown provider '{provider}'.")
-            print(f"[ask] known providers: {', '.join(known)}")
-            print(f"[ask] or omit --provider to use ask_order / auto routing.")
-        else:
-            print("[ask] no provider available. Start Ollama (`lmm serve <model>`) "
-                  "or add 'providers' to lmm config (see `lmm examples`).")
-        return
-    last_err = None
-    for name, prov in targets:
-        print(f"[ask] -> trying {name} ({prov['model'] or 'no model set'})")
-        t0 = time.time()
-        gen = call_provider(prov, prompt, stream=True)
-        if isinstance(gen, dict) and gen.get("error"):
-            last_err = gen["error"]
-            log_hub({"event": "ask_attempt", "provider": name, "ok": False,
-                     "latency_ms": int((time.time() - t0) * 1000),
-                     "prompt": prompt, "error": last_err,
-                     "reason": "pre-check error"})
-            log_hub({"event": "ask", "provider": name, "ok": False,
-                     "error": last_err, "prompt": prompt})
-            print(f"[ask]    {name} failed: {last_err} -- fallback")
-            continue
-        try:
-            full = []
-            for piece in gen:
-                if piece.startswith("[stream error:"):
-                    raise RuntimeError(piece)
-                full.append(piece)
-                print(piece, end="", flush=True)
-            print("")
-            latency = int((time.time() - t0) * 1000)
-            reply_text = "".join(full)
-            tokens = len(reply_text) // 4  # rough token estimate
-            # measure REAL cost: $/1M tok * actual tokens (FrugalGPT: measure, don't
-            # trust a static table). Local backends cost $0.
-            in_tok = len(prompt) // 4
-            out_tok = tokens
-            pricing = merged_pricing(cfg)
-            if "local-" in name or name.endswith("(implicit)"):
-                cost_usd = 0.0
-            else:
-                fam = name.split(":")[0].lower()
-                pr = pricing.get(fam, pricing.get("default", {"in": 3.0, "out": 15.0}))
-                cost_usd = (in_tok * float(pr.get("in", 3.0))
-                            + out_tok * float(pr.get("out", 15.0))) / 1_000_000.0
-            cost_usd = round(cost_usd, 6)
-            log_hub({"event": "ask_attempt", "provider": name, "ok": True,
-                     "latency_ms": latency, "prompt": prompt,
-                     "reply_tokens": tokens, "cost_usd": cost_usd,
-                     "reason": "success"})
-            log_hub({"event": "ask", "provider": name, "ok": True,
-                     "prompt": prompt, "reply": reply_text[:200]})
-            return
-        except (KeyError, IndexError, TypeError, RuntimeError) as e:
-            last_err = f"stream failed: {e}"
-            log_hub({"event": "ask_attempt", "provider": name, "ok": False,
-                     "latency_ms": int((time.time() - t0) * 1000),
-                     "prompt": prompt, "error": last_err,
-                     "reason": "stream failure"})
-            log_hub({"event": "ask", "provider": name, "ok": False,
-                     "error": last_err, "prompt": prompt})
-            print(f"[ask]    {name} stream error -- fallback")
-            continue
-    log_hub({"event": "ask", "provider": "(all)", "ok": False,
-             "error": last_err, "prompt": prompt})
-    print(f"[ask] all providers failed. last error: {last_err}")
-
-
-def gui_ask(prompt, cfg, explicit=None, auto=False):
-    """Non-streaming ask for the GUI: routes by ask_order (priority), returns
-    the first successful reply text, or an error string. Never prints; the GUI
-    owns the display. If `explicit` (a backend name) is given, that backend is
-    used directly (user pinned it in the GUI). If `auto` is True and no
-    explicit backend is pinned, the backend is chosen by measured task fit."""
-    effective = explicit
-    if auto and not explicit:
-        best, reason = score_and_route(prompt, cfg, cfg.get("ask_order"))
-        if best:
-            effective = best
-            prompt = f"[auto: {reason}]\n{prompt}"
-    targets = resolve_ask_targets(cfg, prompt, effective)
-    if not targets:
-        return "[ask] no provider available. Run `lmm discover --save` first."
-    last_err = None
-    for name, prov in targets:
-        r = call_provider(prov, prompt, stream=False)
-        if isinstance(r, dict) and r.get("error"):
-            last_err = r["error"]
-            log_hub({"event": "ask", "provider": name, "ok": False,
-                     "error": last_err, "prompt": prompt, "via": "gui"})
-            continue
-        try:
-            reply = r["choices"][0]["message"]["content"]
-            log_hub({"event": "ask", "provider": name, "ok": True,
-                     "prompt": prompt, "reply": reply[:200], "via": "gui"})
-            return f"[{name}] {reply}"
-        except (KeyError, IndexError, TypeError) as e:
-            last_err = f"bad response: {e}"
-            log_hub({"event": "ask", "provider": name, "ok": False,
-                     "error": last_err, "prompt": prompt, "via": "gui"})
-            continue
-    return f"[ask] all providers failed. last error: {last_err}"
-
-
 def cmd_chat(provider, cfg):
-    """Interactive chat REPL over the hub. Keeps conversation history
-    (messages) across turns and routes every user turn through the SAME
-    unified routing (ask_order + fallback) as `lmm ask`. Each turn is logged
-    to hub.log. Local OR cloud, one interface. Type 'exit'/'quit'/'/exit' to
-    leave."""
+    """Interactive chat REPL over the hub. Keeps conversation history across
+    turns and routes every turn through hub_stream — the SAME path `lmm ask`
+    and `lmm serve --hub` use, which is what makes the README's "one path"
+    claim true rather than aspirational. That buys chat the cache, the
+    routing, retry/breaker, and metering; its old private fallback loop had
+    none of those, so chat turns were invisible to `lmm cost`.
+    Type 'exit'/'quit'/'/exit' to leave."""
     print("lmm chat — type 'exit' to quit. Routes every turn via the hub.")
+    brk = merged_breaker(cfg)
+    breaker = HUB_BREAKER if brk.get("enabled", True) else None
     messages = []
     try:
         while True:
@@ -1237,67 +1319,53 @@ def cmd_chat(provider, cfg):
                 print("[chat] no provider available.")
                 messages.pop()  # drop the unsendable turn
                 continue
-            last_err = None
-            replied = False
-            for name, prov in targets:
-                gen = call_provider(prov, line,
-                                    messages=messages[:-1] + [{"role": "user",
-                                                               "content": line}],
-                                    stream=True)
-                if isinstance(gen, dict) and gen.get("error"):
-                    last_err = gen["error"]
-                    log_hub({"event": "chat", "provider": name, "ok": False,
-                             "error": last_err, "prompt": line})
-                    continue
-                try:
-                    print("hub> ", end="", flush=True)
-                    full = []
-                    for piece in gen:
-                        if piece.startswith("[stream error:"):
-                            raise RuntimeError(piece)
-                        full.append(piece)
+            print("hub> ", end="", flush=True)
+            parts, err = [], None
+            for frame in hub_stream(cfg, list(messages), targets,
+                                    {"source": "chat", "breaker": breaker}):
+                for raw in frame.split(b"\n"):
+                    if not raw.startswith(b"data: "):
+                        continue
+                    payload = raw[6:].strip()
+                    if not payload or payload == b"[DONE]":
+                        continue
+                    try:
+                        obj = json.loads(payload.decode("utf-8", "ignore"))
+                    except ValueError:
+                        continue
+                    if isinstance(obj.get("error"), dict):
+                        err = obj["error"].get("message", "unknown error")
+                        continue
+                    piece = chunk_text(obj)
+                    if piece:
+                        parts.append(piece)
                         print(piece, end="", flush=True)
-                    print("")
-                    log_hub({"event": "chat", "provider": name, "ok": True,
-                             "prompt": line, "reply": "".join(full)[:200]})
-                    messages.append({"role": "assistant",
-                                     "content": "".join(full)})
-                    replied = True
-                    break
-                except (KeyError, IndexError, TypeError, RuntimeError) as e:
-                    last_err = f"stream failed: {e}"
-                    log_hub({"event": "chat", "provider": name, "ok": False,
-                             "error": last_err, "prompt": line})
-                    continue
-            if not replied:
-                print(f"[chat] all providers failed: {last_err}")
+            print("")
+            if parts:
+                messages.append({"role": "assistant",
+                                 "content": "".join(parts)})
+                if err:
+                    print(f"[chat] stream ended early: {err}")
+            else:
+                print(f"[chat] all providers failed: {err or 'no reply'}")
                 messages.pop()  # drop the turn we couldn't send
     except Exception as e:
         print(f"[chat] stopped: {e}")
 
 
-
-
-
-
-
 def cmd_log(n, cfg):
-    """Show the last n hub events from ~/.lmm/hub.log (proof of what the hub
-    actually routed/served). Defaults to 20."""
-    p = os.path.join(HOME, ".lmm", "hub.log")
-    if not os.path.exists(p):
-        print("[log] no hub.log yet. Run `lmm ask` or `lmm serve --hub` first.")
-        return
+    """Show the last n hub-trail events (proof of what the hub actually
+    routed/served). Defaults to 20. The trail lives in the metering log —
+    trail entries are the ones carrying an "event" key."""
     try:
         n = int(n)
     except Exception:
         n = 20
-    lines = [l for l in open(p, encoding="utf-8").read().splitlines() if l.strip()]
-    for l in lines[-n:]:
-        try:
-            e = json.loads(l)
-        except Exception:
-            print(l); continue
+    events = [e for e in backend.read_usage() if e.get("event")]
+    if not events:
+        print("[log] no hub events yet. Run `lmm ask` or `lmm serve --hub` first.")
+        return
+    for e in events[-n:]:
         ts = e.get("ts", "?")
         kind = e.get("event", "?")
         prov = e.get("provider", "-")
@@ -1311,197 +1379,6 @@ def cmd_log(n, cfg):
         print(f"  [{st}] {ts} {kind:8} -> {prov}{extra}")
 
 
-
-def cmd_selftest(cfg):
-    """Self-prove the hub works. Runs real measurements (not trust):
-    syntax, command surface, implicit-Ollama reachability, a live `ask`
-    routing that must return a real reply, and hub.log observability.
-    Each check is pass/fail; a non-zero failure count means `lmm` is broken."""
-    import subprocess as _sp
-    checks = []
-
-    def chk(name, ok, detail=""):
-        checks.append((name, ok, detail))
-        mark = "PASS" if ok else "FAIL"
-        print(f"  [{mark}] {name}" + (f" -- {detail}" if detail else ""))
-
-    print("lmm selftest — measuring, not trusting:")
-    # 1) syntax of this very file
-    selfp = os.path.abspath(__file__)
-    r = _sp.run([sys.executable, "-m", "py_compile", selfp],
-                stdout=_sp.DEVNULL, stderr=_sp.DEVNULL)
-    chk("self syntax (py_compile)", r.returncode == 0)
-
-    # 2) command surface present
-    import re as _re
-    with open(os.path.abspath(__file__), encoding="utf-8") as _f:
-        src = _f.read()
-    cmds = _re.findall(r"add_parser\(['\"]([\w-]+)['\"]", src)
-    needed = ["discover", "status", "models", "cost", "route", "serve",
-              "ask", "chat", "hub-status", "config", "log", "selftest",
-              "stop", "dash", "gui", "watch", "autostart", "hide", "examples"]
-    missing = [c for c in needed if c not in cmds]
-    chk("command surface complete", not missing,
-        ("missing: " + ",".join(missing)) if missing else "")
-
-    # 3) implicit Ollama reachable
-    skip_live = os.environ.get("LMM_SELFTEST_SKIP_LIVE", "") in ("1", "true", "yes")
-    if skip_live:
-        print("  [SKIP] implicit Ollama reachable -- LMM_SELFTEST_SKIP_LIVE=1")
-        lo = None
-    else:
-        lo = local_ollama_provider()
-        chk("implicit Ollama reachable", bool(lo),
-            (lo["model"] if lo else "ollama not running"))
-
-    # 4) live ask routing returns a real reply
-    if skip_live:
-        print("  [SKIP] live ask routing returns reply -- LMM_SELFTEST_SKIP_LIVE=1")
-    elif lo:
-        try:
-            gen = call_provider(lo, "Reply with exactly: SELFTEST_OK",
-                                stream=True)
-            reply = "".join(gen) if not isinstance(gen, dict) else ""
-            ok_reply = "SELFTEST_OK" in reply
-            chk("live ask routing returns reply", ok_reply,
-                (reply[:40] if reply else "no reply"))
-        except Exception as e:
-            chk("live ask routing returns reply", False, str(e))
-    else:
-        chk("live ask routing returns reply", False, "no provider")
-
-    # 5) observability: hub.log gets written
-    before = os.path.exists(os.path.join(HOME, ".lmm", "hub.log"))
-    log_hub({"event": "selftest", "provider": "(self)", "ok": True,
-             "prompt": "selftest probe"})
-    after = os.path.exists(os.path.join(HOME, ".lmm", "hub.log"))
-    chk("observability (hub.log writable)", after,
-        ("created" if not before else "appended"))
-
-    # 6) closed-loop verify routing — the hub must PROVE its own core claim
-    #    ("measure the answer, don't just trust the pick"). Two deterministic
-    #    checks that need NO live backend:
-    #    6a) verify_reply rejects a hallucinated token
-    bad_ok, bad_reason = verify_reply(
-        "explain quantum mechanics",
-        "The wavefunction propagレーション describes everything.")
-    chk("verify_reply detects hallucination", (not bad_ok), bad_reason)
-    #    6b) route_and_verify falls through a bad backend to a good one.
-    #        We monkey-patch call_provider with two mock backends so the test
-    #        is deterministic and offline (measure, don't trust — even the test).
-    #        NOTE: route_and_verify lives in backend.py and references
-    #        backend.call_provider, so we must patch the backend module's symbol,
-    #        not frontend's globals (after the file split, they are separate).
-    real_call = backend.call_provider
-    try:
-        def _mock(prov, prompt, stream=False):
-            if "bad" in prov.get("model", ""):
-                return {"choices": [{"message": {
-                    "content": "wavefunction is propagレーション thing."}}]}
-            return {"choices": [{"message": {
-                "content": "The Schrodinger equation iħ∂ψ/∂t=Hψ governs "
-                           "quantum state evolution via the Hamiltonian H. "
-                           "It describes how the quantum state of a physical "
-                           "system changes with time and underlies all of "
-                           "quantum mechanics including superposition."}}]}
-        backend.call_provider = _mock
-        _cfg = dict(cfg)
-        _cfg["providers"] = {
-            "bad":  {"api_key": "x", "base_url": "http://127.0.0.1:9/v1",
-                     "model": "bad-model", "kind": "local"},
-            "good": {"api_key": "x", "base_url": "http://127.0.0.1:8/v1",
-                     "model": "good-model", "kind": "local"}}
-        _cfg["ask_order"] = ["bad", "good"]
-        _name, _reason, _reply = route_and_verify(
-            "explain quantum mechanics", _cfg, _cfg["ask_order"])
-        chk("route_and_verify falls back bad->good",
-            _name == "good" and _reply is not None,
-            (_reason if _reason else str(_name)))
-    except Exception as e:
-        chk("route_and_verify falls back bad->good", False, str(e))
-    finally:
-        backend.call_provider = real_call
-
-    # 7) doctor + config validate + secrets commands are wired & run
-    try:
-        import io as _io
-        _buf = _io.StringIO()
-        import contextlib as _cl
-        with _cl.redirect_stdout(_buf):
-            cmd_doctor(cfg)
-        doc_out = _buf.getvalue()
-        chk("doctor command runs", "doctor: HEALTHY" in doc_out,
-            doc_out.strip().splitlines()[-1] if doc_out.strip() else "")
-    except SystemExit as e:
-        chk("doctor command runs", e.code in (0, None),
-            f"exit={e.code}")
-    except Exception as e:
-        chk("doctor command runs", False, str(e))
-
-    try:
-        _buf = _io.StringIO()
-        with _cl.redirect_stdout(_buf):
-            cmd_validate_config(cfg)
-        val_out = _buf.getvalue()
-        chk("config validate command runs", "config: VALID" in val_out,
-            val_out.strip().splitlines()[-1] if val_out.strip() else "")
-    except SystemExit as e:
-        chk("config validate command runs", e.code in (0, None),
-            f"exit={e.code}")
-    except Exception as e:
-        chk("config validate command runs", False, str(e))
-
-    try:
-        _buf = _io.StringIO()
-        with _cl.redirect_stdout(_buf):
-            cmd_secrets(cfg)
-        sec_out = _buf.getvalue()
-        # secrets must either be CLEAN or report a finding; never crash
-        chk("secrets command runs",
-            ("secrets: CLEAN" in sec_out) or ("FINDINGS" in sec_out),
-            sec_out.strip().splitlines()[0] if sec_out.strip() else "")
-    except SystemExit as e:
-        # secrets exits 2 on finding, 0 on clean — both are "ran"
-        chk("secrets command runs", e.code in (0, 2), f"exit={e.code}")
-    except Exception as e:
-        chk("secrets command runs", False, str(e))
-
-    # 8) stats command runs (reads the structured hub log without crashing)
-    try:
-        _buf = _io.StringIO()
-        with _cl.redirect_stdout(_buf):
-            cmd_stats(cfg)
-        st_out = _buf.getvalue()
-        chk("stats command runs", "lmm stats" in st_out,
-            st_out.strip().splitlines()[0] if st_out.strip() else "")
-    except SystemExit as e:
-        chk("stats command runs", e.code in (0, None), f"exit={e.code}")
-    except Exception as e:
-        chk("stats command runs", False, str(e))
-
-    # 9) priority --optimize runs (closed-loop: measurement -> re-prioritize)
-    try:
-        _buf = _io.StringIO()
-        with _cl.redirect_stdout(_buf):
-            cmd_priority(cfg, optimize=True)
-        po_out = _buf.getvalue()
-        chk("priority --optimize runs", "optimized ask_order" in po_out,
-            po_out.strip().splitlines()[0] if po_out.strip() else "")
-    except SystemExit as e:
-        chk("priority --optimize runs", e.code in (0, None), f"exit={e.code}")
-    except Exception as e:
-        chk("priority --optimize runs", False, str(e))
-
-    fails = sum(1 for _, ok, _ in checks if not ok)
-    print("")
-    if fails == 0:
-        print("SELFTEST PASS — the hub measures and proves itself.")
-    else:
-        print(f"SELFTEST FAIL — {fails} check(s) failed. Fix before trusting the hub.")
-    return 1 if fails else 0
-
-
-
 def cmd_config(args, cfg):
     """Manage lmm config: init / list / get / set / unset.
     Lets the user freely control hub priority (ask_order) and providers
@@ -1510,7 +1387,7 @@ def cmd_config(args, cfg):
     if act == "validate":
         return cmd_validate_config(cfg)
     if act == "init":
-        if os.path.exists(os.path.join(HOME, ".lmm", "config.json")):
+        if os.path.exists(os.path.join(backend.HOME, ".lmm", "config.json")):
             print("[config] ~/.lmm/config.json already exists; not overwriting.")
             return
         save_config({})
@@ -1571,8 +1448,6 @@ def cmd_config(args, cfg):
             print(f"[config] key '{key}' not found")
         return
     print("[config] usage: lmm config <init|list|get|set|unset>")
-
-
 
 
 def cmd_validate_config(cfg):
@@ -1666,7 +1541,7 @@ def cmd_validate_config(cfg):
                 known.add(k.lower())
             running = []
             try:
-                for it in discover(cfg):
+                for it in backend.discover(cfg):
                     nm = (it.get("name") or "")
                     if it.get("running"):
                         running.append(nm)
@@ -1765,7 +1640,8 @@ def cmd_secrets(cfg):
 def cmd_doctor(cfg):
     """First-principles health check: don't trust that lmm works — MEASURE it.
     Runs real probes (config loads, Ollama reachable, a backend is running,
-    ask_order resolves, hub.log writable) and exits non-zero if any FAILs."""
+    ask_order resolves, each provider answers, trail writable) and exits
+    non-zero if any FAILs."""
     fails = []
 
     def chk(name, ok, detail=""):
@@ -1784,14 +1660,14 @@ def cmd_doctor(cfg):
     chk("config loads", ok_cfg, "" if ok_cfg else detail_cfg)
 
     # 2) implicit Ollama reachable
-    lo = local_ollama_provider()
+    lo = backend.local_ollama_provider()
     chk("implicit Ollama reachable",
         bool(lo) and bool(lo.get("model")),
         (lo.get("model") if lo else "ollama not running"))
 
     # 3) at least one backend running
     try:
-        disc = discover(cfg)
+        disc = backend.discover(cfg)
         running = [d["name"] for d in disc if d.get("running")]
         chk("at least one backend running",
             len(running) > 0,
@@ -1806,7 +1682,7 @@ def cmd_doctor(cfg):
     else:
         known = set(n.lower() for n in merged_providers(cfg))
         try:
-            run_names = [d["name"] for d in discover(cfg) if d.get("running")]
+            run_names = [d["name"] for d in backend.discover(cfg) if d.get("running")]
         except Exception:
             run_names = []
         unresolved = [n for n in order
@@ -1816,13 +1692,33 @@ def cmd_doctor(cfg):
             ("unresolved: " + ", ".join(unresolved)) if unresolved else
             f"{len(order)} entr(ies) OK")
 
-    # 5) hub.log writable
+    # 5) each configured provider answers (was `lmm hub-status`, folded in:
+    #    the machine checks above see local processes, but a cloud provider
+    #    has no process to see — only a probe can grade it)
+    provs = (cfg.get("providers") or {}) if isinstance(cfg, dict) else {}
+    for name, prov in provs.items():
+        ok = False
+        detail = ""
+        try:
+            import urllib.request
+            url = (prov.get("base_url", "").rstrip("/")) + "/models"
+            req = urllib.request.Request(
+                url, headers={"Authorization":
+                              f"Bearer {prov.get('api_key', '')}"})
+            with urllib.request.urlopen(req, timeout=5) as resp:
+                ok = resp.status == 200
+                detail = f"HTTP {resp.status}"
+        except Exception as e:
+            detail = str(e)[:60]
+        chk(f"provider '{name}' answers", ok, detail)
+
+    # 6) the trail is writable (observability is part of health)
     try:
         log_hub({"event": "doctor", "provider": "(self)", "ok": True,
                  "prompt": "doctor probe"})
-        chk("hub.log writable", True)
+        chk("usage trail writable", True)
     except Exception as e:
-        chk("hub.log writable", False, str(e))
+        chk("usage trail writable", False, str(e))
 
     print("")
     if fails:
@@ -1832,47 +1728,47 @@ def cmd_doctor(cfg):
 
 
 def cmd_stats(cfg):
-    """Aggregate the structured hub log into measured routing statistics.
+    """Aggregate the hub trail into measured routing statistics.
     Proves (don't trust — measure) HOW well the routing actually performs:
     per-backend success rate, average latency, total attempts, and how often
     the first tried backend succeeded. Zero-dep: pure JSONL scan."""
-    p = os.path.join(HOME, ".lmm", "hub.log")
-    if not os.path.exists(p):
-        print("[stats] no hub.log yet. Run `lmm ask` first.")
-        sys.exit(0)
-    attempts = []
-    with open(p, encoding="utf-8") as f:
-        for line in f:
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                e = json.loads(line)
-            except Exception:
-                continue
-            if e.get("event") == "ask_attempt":
-                attempts.append(e)
-    if not attempts:
-        print("[stats] no ask_attempt events yet. Run `lmm ask` first.")
-        sys.exit(0)
-
+    # One writer per fact: successes are the metering events meter_call wrote
+    # (cache=="miss" — an actual provider call, not a cache answer); failures
+    # are the ask_attempt trail entries, which exist because a failure has no
+    # usage to meter. Joining them here is what makes this a measurement of
+    # every path — ask, chat, cascade and the hub server alike.
     by_provider = {}
-    first_try_ok = 0
-    total = len(attempts)
-    for i, e in enumerate(attempts):
-        name = e.get("provider", "?")
-        rec = by_provider.setdefault(name, {"ok": 0, "fail": 0, "lat": [], "cost": 0.0})
-        if e.get("ok"):
-            rec["ok"] += 1
-            # first attempt of a session = index 0 or right after an all-fail
-            if i == 0 or (attempts[i - 1].get("provider") == "(all)"):
-                first_try_ok += 1
-        else:
+    first_rung = {"ok": 0, "fail": 0}
+    total = 0
+    for e in backend.read_usage():
+        if e.get("rollup"):
+            continue
+        if e.get("event") == "ask_attempt" and not e.get("ok"):
+            name = e.get("provider", "?")
+            rec = by_provider.setdefault(
+                name, {"ok": 0, "fail": 0, "lat": [], "cost": 0.0})
             rec["fail"] += 1
-        if isinstance(e.get("latency_ms"), int):
-            rec["lat"].append(e["latency_ms"])
-        if isinstance(e.get("cost_usd"), (int, float)):
-            rec["cost"] += e["cost_usd"]
+            total += 1
+            if isinstance(e.get("latency_ms"), int):
+                rec["lat"].append(e["latency_ms"])
+            if e.get("rung") == 0:
+                first_rung["fail"] += 1
+        elif not e.get("event") and e.get("cache") == "miss" \
+                and e.get("provider"):
+            name = e["provider"]
+            rec = by_provider.setdefault(
+                name, {"ok": 0, "fail": 0, "lat": [], "cost": 0.0})
+            rec["ok"] += 1
+            total += 1
+            if isinstance(e.get("ms"), int):
+                rec["lat"].append(e["ms"])
+            if isinstance(e.get("usd"), (int, float)):
+                rec["cost"] += e["usd"]
+            if e.get("rung") == 0:
+                first_rung["ok"] += 1
+    if not total:
+        print("[stats] no routing attempts measured yet. Run `lmm ask` first.")
+        sys.exit(0)
 
     print(f"lmm stats — {total} routing attempt(s) measured:")
     print(f"{'backend':<32}{'success':>9}{'fail':>6}{'succ%':>8}{'avg_ms':>9}{'cost$':>10}")
@@ -1889,10 +1785,311 @@ def cmd_stats(cfg):
     overall_pct = (overall_ok / total * 100) if total else 0
     print("-" * 74)
     print(f"{'TOTAL':<32}{overall_ok:>9}{total - overall_ok:>6}{overall_pct:>7.0f}%{'':>9}{total_cost:>10.4f}")
-    print(f"first-try success rate: {first_try_ok}/{total} "
-          f"({first_try_ok / total * 100:.0f}%)")
+    ft_total = first_rung["ok"] + first_rung["fail"]
+    if ft_total:
+        print(f"first-try success rate: {first_rung['ok']}/{ft_total} "
+              f"({first_rung['ok'] / ft_total * 100:.0f}%)")
     print(f"total estimated cost: ${total_cost:.4f} "
           f"(local backends are free; cloud costs are measured per actual tokens)")
+
+
+def cmd_selftest(cfg, guard=False):
+    """Self-prove the hub works. Runs real measurements (not trust):
+    syntax, command surface, implicit-Ollama reachability, a live `ask`
+    routing that must return a real reply, and trail observability.
+    Each check is pass/fail; a non-zero failure count means `lmm` is broken.
+
+    guard=True is for callers that only read the exit code (guard.sh, CI).
+    It drops the passing lines, because a green run has nothing to say — but
+    it keeps the failures, since an exit code alone cannot tell you what
+    broke."""
+    import subprocess as _sp
+    checks = []
+
+    def chk(name, ok, detail=""):
+        checks.append((name, ok, detail))
+        if guard and ok:
+            return
+        mark = "PASS" if ok else "FAIL"
+        print(f"  [{mark}] {name}" + (f" -- {detail}" if detail else ""))
+
+    def note(msg):
+        if not guard:
+            print(msg)
+
+    if not guard:
+        print("lmm selftest — measuring, not trusting:")
+    # 1) syntax of this very file
+    selfp = os.path.abspath(__file__)
+    r = _sp.run([sys.executable, "-m", "py_compile", selfp],
+                stdout=_sp.DEVNULL, stderr=_sp.DEVNULL)
+    chk("self syntax (py_compile)", r.returncode == 0)
+
+    # 2) command surface present
+    import re as _re
+    with open(os.path.abspath(__file__), encoding="utf-8") as _f:
+        src = _f.read()
+    cmds = _re.findall(r"add_parser\(['\"]([\w-]+)['\"]", src)
+    needed = ["discover", "status", "models", "cost", "route", "serve",
+              "ask", "chat", "config", "log", "selftest", "doctor",
+              "stop", "dash", "gui", "watch", "autostart", "hide", "examples"]
+    missing = [c for c in needed if c not in cmds]
+    chk("command surface complete", not missing,
+        ("missing: " + ",".join(missing)) if missing else "")
+
+    # 3) implicit Ollama reachable
+    skip_live = os.environ.get("LMM_SELFTEST_SKIP_LIVE", "") in ("1", "true", "yes")
+    if skip_live:
+        note("  [SKIP] implicit Ollama reachable -- LMM_SELFTEST_SKIP_LIVE=1")
+        lo = None
+    else:
+        lo = backend.local_ollama_provider()
+        chk("implicit Ollama reachable", bool(lo),
+            (lo["model"] if lo else "ollama not running"))
+
+    # 4) live ask routing returns a real reply
+    if skip_live:
+        note("  [SKIP] live ask routing returns reply -- LMM_SELFTEST_SKIP_LIVE=1")
+    elif lo:
+        try:
+            gen = call_provider(lo, "Reply with exactly: SELFTEST_OK",
+                                stream=True)
+            reply = "".join(gen) if not isinstance(gen, dict) else ""
+            ok_reply = "SELFTEST_OK" in reply
+            chk("live ask routing returns reply", ok_reply,
+                (reply[:40] if reply else "no reply"))
+        except Exception as e:
+            chk("live ask routing returns reply", False, str(e))
+    else:
+        chk("live ask routing returns reply", False, "no provider")
+
+    # 5) observability: the trail gets written, and lands in the ONE log
+    #    (hub.log used to be a second file with no cap, no compaction and no
+    #    lock — the bugs already fixed for usage.jsonl, alive under another
+    #    name)
+    log_hub({"event": "selftest", "provider": "(self)", "ok": True,
+             "prompt": "selftest probe"})
+    seen = any(e.get("event") == "selftest" for e in backend.read_usage())
+    chk("observability (trail writable)", seen)
+
+    # 6) closed-loop verify routing — the hub must PROVE its own core claim
+    #    ("measure the answer, don't just trust the pick"). Two deterministic
+    #    checks that need NO live backend:
+    #    6a) verify_reply rejects a hallucinated token
+    bad_ok, bad_reason = verify_reply(
+        "explain quantum mechanics",
+        "The wavefunction propagレーション describes everything.")
+    chk("verify_reply detects hallucination", (not bad_ok), bad_reason)
+    #    6b) route_and_verify falls through a bad backend to a good one.
+    #        We monkey-patch call_provider with two mock backends so the test
+    #        is deterministic and offline (measure, don't trust — even the test).
+    #        NOTE: route_and_verify lives in backend.py and references
+    #        backend.call_provider, so we must patch the backend module's symbol,
+    #        not frontend's globals (after the file split, they are separate).
+    real_call = backend.call_provider
+    try:
+        def _mock(prov, prompt, stream=False):
+            if "bad" in prov.get("model", ""):
+                return {"choices": [{"message": {
+                    "content": "wavefunction is propagレーション thing."}}]}
+            return {"choices": [{"message": {
+                "content": "The Schrodinger equation iħ∂ψ/∂t=Hψ governs "
+                           "quantum state evolution via the Hamiltonian H. "
+                           "It describes how the quantum state of a physical "
+                           "system changes with time and underlies all of "
+                           "quantum mechanics including superposition."}}]}
+        backend.call_provider = _mock
+        _cfg = dict(cfg)
+        _cfg["providers"] = {
+            "bad":  {"api_key": "x", "base_url": "http://127.0.0.1:9/v1",
+                     "model": "bad-model", "kind": "local"},
+            "good": {"api_key": "x", "base_url": "http://127.0.0.1:8/v1",
+                     "model": "good-model", "kind": "local"}}
+        _cfg["ask_order"] = ["bad", "good"]
+        _name, _reason, _reply = route_and_verify(
+            "explain quantum mechanics", _cfg, _cfg["ask_order"])
+        chk("route_and_verify falls back bad->good",
+            _name == "good" and _reply is not None,
+            (_reason if _reason else str(_name)))
+    except Exception as e:
+        chk("route_and_verify falls back bad->good", False, str(e))
+    finally:
+        backend.call_provider = real_call
+
+    # 7) doctor + config validate + secrets commands are wired & run
+    #
+    # `doctor` diagnoses the MACHINE; `selftest` proves LMM. A box with no
+    # Ollama running is an unhealthy machine and a working lmm, so requiring
+    # "doctor: HEALTHY" here made the suite unpassable anywhere without a live
+    # backend — including this project's own CI runner, where checks 3 and 4
+    # are skipped for exactly that reason. What proves lmm is that doctor runs
+    # and reaches a verdict; the verdict itself is reported as the detail so an
+    # unhealthy machine is still visible in the output.
+    import io as _io
+    import contextlib as _cl
+
+    def _run_cmd(fn, *a, **kw):
+        """Call a cmd_* handler, capturing stdout and its exit code."""
+        buf = _io.StringIO()
+        try:
+            with _cl.redirect_stdout(buf):
+                fn(*a, **kw)
+            return buf.getvalue(), 0
+        except SystemExit as e:
+            return buf.getvalue(), (e.code if isinstance(e.code, int) else 0)
+
+    try:
+        doc_out, doc_code = _run_cmd(cmd_doctor, cfg)
+        verdict = next((l for l in reversed(doc_out.strip().splitlines())
+                        if l.startswith("doctor:")), "")
+        chk("doctor command runs", bool(verdict), verdict or f"exit={doc_code}")
+    except Exception as e:
+        chk("doctor command runs", False, str(e))
+
+    try:
+        _buf = _io.StringIO()
+        with _cl.redirect_stdout(_buf):
+            cmd_validate_config(cfg)
+        val_out = _buf.getvalue()
+        chk("config validate command runs", "config: VALID" in val_out,
+            val_out.strip().splitlines()[-1] if val_out.strip() else "")
+    except SystemExit as e:
+        chk("config validate command runs", e.code in (0, None),
+            f"exit={e.code}")
+    except Exception as e:
+        chk("config validate command runs", False, str(e))
+
+    try:
+        _buf = _io.StringIO()
+        with _cl.redirect_stdout(_buf):
+            cmd_secrets(cfg)
+        sec_out = _buf.getvalue()
+        # secrets must either be CLEAN or report a finding; never crash
+        chk("secrets command runs",
+            ("secrets: CLEAN" in sec_out) or ("FINDINGS" in sec_out),
+            sec_out.strip().splitlines()[0] if sec_out.strip() else "")
+    except SystemExit as e:
+        # secrets exits 2 on finding, 0 on clean — both are "ran"
+        chk("secrets command runs", e.code in (0, 2), f"exit={e.code}")
+    except Exception as e:
+        chk("secrets command runs", False, str(e))
+
+    # 8) stats command runs (reads the structured hub log without crashing)
+    try:
+        _buf = _io.StringIO()
+        with _cl.redirect_stdout(_buf):
+            cmd_stats(cfg)
+        st_out = _buf.getvalue()
+        chk("stats command runs", "lmm stats" in st_out,
+            st_out.strip().splitlines()[0] if st_out.strip() else "")
+    except SystemExit as e:
+        chk("stats command runs", e.code in (0, None), f"exit={e.code}")
+    except Exception as e:
+        chk("stats command runs", False, str(e))
+
+    # 9) priority --optimize runs (closed-loop: measurement -> re-prioritize)
+    try:
+        _buf = _io.StringIO()
+        with _cl.redirect_stdout(_buf):
+            cmd_priority(cfg, optimize=True)
+        po_out = _buf.getvalue()
+        chk("priority --optimize runs", "optimized ask_order" in po_out,
+            po_out.strip().splitlines()[0] if po_out.strip() else "")
+    except SystemExit as e:
+        chk("priority --optimize runs", e.code in (0, None), f"exit={e.code}")
+    except Exception as e:
+        chk("priority --optimize runs", False, str(e))
+
+    fails = sum(1 for _, ok, _ in checks if not ok)
+    if fails == 0:
+        note("")
+        note(f"SELFTEST PASS — {len(checks)} checks, the hub proves itself.")
+    else:
+        print("")
+        print(f"SELFTEST FAIL — {fails} of {len(checks)} check(s) failed. "
+              "Fix before trusting the hub.")
+    return 1 if fails else 0
+
+
+def setup_tray(root, tooltip="LMM Dashboard"):
+    """Add a Windows system-tray icon so minimizing keeps lmm running in the
+    background (zero-dep: pure ctypes / Win32). On non-Windows this is a no-op.
+    Returns a cleanup callable, or None."""
+    if os.name != "nt":
+        return None
+    try:
+        import ctypes
+        from ctypes import wintypes
+        user = ctypes.windll.user32
+        shell = ctypes.windll.shell32
+        user.LoadIconW.argtypes = [ctypes.c_void_p, ctypes.c_uint]
+        user.LoadIconW.restype = ctypes.c_void_p
+        shell.Shell_NotifyIconW.argtypes = [ctypes.c_uint, ctypes.c_void_p]
+        user.SetWindowLongPtrW.argtypes = [ctypes.c_void_p, ctypes.c_int,
+                                           ctypes.c_void_p]
+        user.DefWindowProcW.argtypes = [ctypes.c_void_p, ctypes.c_uint,
+                                        wintypes.WPARAM, wintypes.LPARAM]
+        user.DefWindowProcW.restype = ctypes.c_long
+    except Exception:
+        return None
+
+    WM_TRAYMSG = 0x401
+    hwnd = int(root.winfo_id())
+
+    class NOTIFYICONDATA(ctypes.Structure):
+        _fields_ = [
+            ("cbSize", ctypes.c_ulong),
+            ("hWnd", ctypes.c_void_p),
+            ("uID", ctypes.c_uint),
+            ("uFlags", ctypes.c_uint),
+            ("uCallbackMessage", ctypes.c_uint),
+            ("hIcon", ctypes.c_void_p),
+            ("szTip", ctypes.c_wchar * 128),
+        ]
+    nid = NOTIFYICONDATA()
+    nid.cbSize = ctypes.sizeof(NOTIFYICONDATA)
+    nid.hWnd = hwnd
+    nid.uID = 1
+    nid.uFlags = 0x1 | 0x2 | 0x4
+    nid.uCallbackMessage = WM_TRAYMSG
+    nid.hIcon = user.LoadIconW(0, 32512)
+    nid.szTip = tooltip[:127]   # ctypes assigns str into c_wchar array
+    shell.Shell_NotifyIconW(0x0, ctypes.byref(nid))
+
+    def restore():
+        root.deiconify()
+        root.lift()
+        root.focus_force()
+
+    def wndproc(h, msg, w, l):
+        if msg == WM_TRAYMSG and l == 0x205:   # right-click
+            m = user.CreatePopupMenu()
+            user.AppendMenuW(m, 0, 1001, "Open")
+            user.AppendMenuW(m, 0, 1002, "Quit")
+            pt = wintypes.POINT()
+            user.GetCursorPos(ctypes.byref(pt))
+            cmd = user.TrackPopupMenu(m, 0x100, pt.x, pt.y, 0, hwnd, None)
+            if cmd == 1001:
+                restore()
+            elif cmd == 1002:
+                cleanup()
+                root.destroy()
+            return 0
+        if msg == WM_TRAYMSG and l == 0x203:   # double-click
+            restore()
+            return 0
+        return user.DefWindowProcW(ctypes.c_void_p(h), msg, w, l)
+
+    wp = ctypes.WINFUNCTYPE(ctypes.c_long, ctypes.c_void_p, ctypes.c_uint,
+                            wintypes.WPARAM, wintypes.LPARAM)(wndproc)
+    user.SetWindowLongPtrW(ctypes.c_void_p(hwnd), -4,
+                           ctypes.cast(wp, ctypes.c_void_p))
+    root.protocol("WM_DELETE_WINDOW", lambda: root.withdraw())  # X -> tray
+
+    def cleanup():
+        shell.Shell_NotifyIconW(0x2, ctypes.byref(nid))
+
+    return cleanup
 
 
 def main():
@@ -1900,62 +2097,95 @@ def main():
         description="LMM - Local/remote Model Manager (cross-platform, zero-dep)")
     ap.add_argument("-v", "--version", action="store_true", help="show version")
     sub = ap.add_subparsers(dest="cmd")
+
+    # --- inspecting the machine -------------------------------------------
     p = sub.add_parser("discover")
     p.add_argument("--json", action="store_true")
     p.add_argument("--save", action="store_true",
-                   help="save detected backends to ask_order (initial priority)")
+                   help="seed ask_order from the backends that are running")
+    sub.add_parser("status")
+    sub.add_parser("models")
+    p = sub.add_parser("pull", help="pull a model into local Ollama")
+    p.add_argument("model", nargs="?")
+    p = sub.add_parser("fit", help="will this model fit in your GPU, and at what context?")
+    p.add_argument("model", nargs="?", help="model tag; omit to check every installed one")
+    p.add_argument("--ctx", type=int, default=None, help="context length in tokens")
+    p.add_argument("--vram", type=float, default=None, help="override detected free VRAM (GiB)")
+    p.add_argument("--kv", default="f16", choices=sorted(set(KV_BYTES)),
+                   help="KV cache dtype (llama.cpp --cache-type-k/v)")
+    p.add_argument("--json", action="store_true")
+
+    # --- spending and routing ---------------------------------------------
+    p = sub.add_parser("cost")
+    p.add_argument("--days", type=int, default=30,
+                   help="only count the last N days (0 = all-time)")
+    p = sub.add_parser("route")
+    p.add_argument("task", nargs="?")
+    p.add_argument("--explain", action="store_true",
+                   help="show the strength-score breakdown and provider order")
     p = sub.add_parser("priority", help="manage routing priority (discover -> set -> use)")
     p.add_argument("--show", action="store_true", help="show current ask_order only")
     p.add_argument("--optimize", action="store_true",
                    help="re-rank ask_order by MEASURED performance (closed loop)")
-    sub.add_parser("status")
-    sub.add_parser("models")
-    p = sub.add_parser("pull", help="pull a model into local Ollama (unified model store)")
-    p.add_argument("model", nargs="?")
-    p = sub.add_parser("cost")
-    p.add_argument("--days", type=int, default=30)
-    p = sub.add_parser("route")
-    p.add_argument("task", nargs="?")
+    p = sub.add_parser("bench", help="measure TTFT / TPOT / throughput per provider")
+    p.add_argument("--provider", default=None, help="provider name from config")
+    p.add_argument("--runs", type=int, default=3, help="measured runs after the warm-up")
+    p.add_argument("--prompt", default=None)
+    p.add_argument("--max-tokens", type=int, default=128)
+
+    # --- asking things ------------------------------------------------------
+    p = sub.add_parser("ask")
+    p.add_argument("prompt", nargs="*")
+    p.add_argument("--provider", default=None, help="provider name from config")
+    p.add_argument("--cascade", action="store_true",
+                   help="cheap-first cascade: escalate only on a low-scoring answer")
+    p.add_argument("--no-cache", action="store_true", help="bypass the prompt cache")
+    p.add_argument("--explain", action="store_true",
+                   help="show routing score, rung scores and per-call cost")
+    p.add_argument("--verify", action="store_true",
+                   help="closed loop: measure each reply, fall back if unfit")
+    p = sub.add_parser("chat", help="interactive hub chat REPL (keeps history)")
+    p.add_argument("--provider", default=None, help="force a provider")
+
+    # --- serving ------------------------------------------------------------
     p = sub.add_parser("serve")
     p.add_argument("model", nargs="?")
     p.add_argument("--hub", action="store_true",
                    help="start OpenAI-compatible proxy over all configured providers")
     p.add_argument("--host", default="127.0.0.1")
     p.add_argument("--port", type=int, default=8080)
-    sub.add_parser("hub-status")
+    p = sub.add_parser("stop")
+    p.add_argument("runtime", nargs="?")
+    p = sub.add_parser("cache")
+    p.add_argument("--clear", action="store_true", help="delete all cached answers")
+    p.add_argument("--stats", action="store_true", help="show cache stats (default)")
+
+    # --- proving it works ---------------------------------------------------
+    p = sub.add_parser("selftest", help="self-prove the hub works (measure, don't trust)")
+    p.add_argument("--guard", action="store_true",
+                   help="machine-readable mode: report failures only, exit code is the answer")
+    sub.add_parser("doctor")
+    sub.add_parser("secrets")
+    sub.add_parser("stats")
+    p = sub.add_parser("log", help="show recent hub events (proof of routing)")
+    p.add_argument("n", nargs="?", default=20)
     p = sub.add_parser("config", help="manage lmm config (init/list/get/set/unset)")
     p.add_argument("config_action", nargs="?", default="list")
     p.add_argument("key", nargs="?", default=None)
     p.add_argument("value", nargs="?", default=None)
-    p = sub.add_parser("log", help="show recent hub events (proof of routing)")
-    p.add_argument("n", nargs="?", default=20)
-    p = sub.add_parser("selftest", help="self-prove the hub works (measure, don't trust)")
-    p.add_argument("--guard", action="store_true",
-                   help="machine-readable mode: no banner, exit code only (for external verifiers)")
-    p = sub.add_parser("chat", help="interactive hub chat REPL (keeps history)")
-    p.add_argument("--provider", default=None, help="force a provider")
-    p = sub.add_parser("stop")
-    p.add_argument("runtime", nargs="?")
+
+    # --- desktop ------------------------------------------------------------
     sub.add_parser("dash")
     sub.add_parser("gui")
     p = sub.add_parser("watch")
     p.add_argument("--interval", type=float, default=3.0)
     sub.add_parser("autostart")
     sub.add_parser("hide").add_argument("runtime", nargs="?")
-    p = sub.add_parser("ask")
-    p.add_argument("prompt", nargs="*")
-    p.add_argument("--provider", default=None, help="provider name from config")
-    p.add_argument("--auto", action="store_true",
-                   help="route by measured task fit (first-principles), not static ask_order")
-    p.add_argument("--verify", action="store_true",
-                   help="closed-loop: measure each reply, fallback if unfit (measure, don't trust)")
     sub.add_parser("examples")
-    sub.add_parser("doctor")
-    sub.add_parser("secrets")
-    sub.add_parser("stats")
+
     args = ap.parse_args()
     if args.version:
-        print("lmm 1.0.0")
+        print(f"lmm {VERSION}")
         return
     cfg = load_config()
     # No subcommand -> launch the live GUI dashboard. Visibility of system
@@ -1963,56 +2193,53 @@ def main():
     # the visual dashboard, not a text dump. Use `lmm discover` for CLI output.
     cmd = args.cmd or "gui"
     if cmd == "discover":
-        cmd_discover(cfg, getattr(args, "json", False),
-                     getattr(args, "save", False))
-    elif cmd == "priority":
-        cmd_priority(cfg, getattr(args, "show", False),
-                    getattr(args, "optimize", False))
-    elif cmd == "cli":
-        cmd_discover(cfg, False)
+        cmd_discover(cfg, getattr(args, "json", False), getattr(args, "save", False))
     elif cmd == "status":
         cmd_status(cfg)
     elif cmd == "models":
         cmd_models(cfg)
     elif cmd == "pull":
         cmd_pull(args.model)
+    elif cmd == "fit":
+        cmd_fit(args.model, args.ctx, args.vram, args.kv, getattr(args, "json", False))
     elif cmd == "cost":
-        print(cost_report(cfg, args.days))
+        print(cost_report(cfg, args.days or None))
     elif cmd == "route":
-        rec = route_task(cfg, args.task)
-        best, reason = score_and_route(args.task, cfg, cfg.get("ask_order"))
-        print(f"task: {args.task}")
-        print(f"=> keyword recommend: {rec}")
-        print(f"=> measured best-fit : {best}")
-        print(f"   reason: {reason}")
-        # cost-awareness: show what the chosen backend costs vs local (free)
-        pricing = merged_pricing(cfg)
-        def _cost(key):
-            if "local-" in key or key.endswith("(implicit)"):
-                return 0.0
-            fam = key.split(":")[0].lower()
-            p = pricing.get(fam, pricing.get("default", {"out": 15.0}))
-            return float(p.get("out", 15.0))
-        c = _cost(best)
-        print(f"   cost: {'free (local)' if c == 0 else f'${c:g}/1M out tokens'}"
-              f"  -- FrugalGPT lesson: keep it local unless quality demands cloud")
+        cmd_route(cfg, args.task, getattr(args, "explain", False))
+    elif cmd == "priority":
+        cmd_priority(cfg, getattr(args, "show", False), getattr(args, "optimize", False))
+    elif cmd == "bench":
+        cmd_bench(cfg, args.provider, args.runs, args.prompt, args.max_tokens)
+    elif cmd == "ask":
+        cmd_ask(" ".join(getattr(args, "prompt", [])),
+                getattr(args, "provider", None), cfg,
+                cascade=getattr(args, "cascade", False),
+                no_cache=getattr(args, "no_cache", False),
+                explain=getattr(args, "explain", False),
+                verify=getattr(args, "verify", False))
+    elif cmd == "chat":
+        cmd_chat(args.provider, cfg)
     elif cmd == "serve":
         if getattr(args, "hub", False):
             cmd_serve_hub(cfg, args.host, args.port)
         else:
             cmd_serve(args.model)
-    elif cmd == "hub-status":
-        cmd_hub_status(cfg)
-    elif cmd == "config":
-        cmd_config(args, cfg)
-    elif cmd == "log":
-        cmd_log(args.n, cfg)
-    elif cmd == "selftest":
-        sys.exit(cmd_selftest(cfg))
-    elif cmd == "chat":
-        cmd_chat(args.provider, cfg)
     elif cmd == "stop":
         cmd_stop(args.runtime, cfg)
+    elif cmd == "cache":
+        cmd_cache(cfg, getattr(args, "clear", False))
+    elif cmd == "selftest":
+        sys.exit(cmd_selftest(cfg, guard=getattr(args, "guard", False)))
+    elif cmd == "doctor":
+        cmd_doctor(cfg)
+    elif cmd == "secrets":
+        cmd_secrets(cfg)
+    elif cmd == "stats":
+        cmd_stats(cfg)
+    elif cmd == "log":
+        cmd_log(args.n, cfg)
+    elif cmd == "config":
+        cmd_config(args, cfg)
     elif cmd == "dash":
         cmd_dash(cfg)
     elif cmd == "gui":
@@ -2021,20 +2248,7 @@ def main():
         cmd_watch(cfg, args.interval)
     elif cmd == "autostart":
         cmd_autostart()
-    elif cmd == "ask":
-        cmd_ask(" ".join(getattr(args, "prompt", [])), getattr(args, "provider", None),
-                cfg, auto=getattr(args, "auto", False),
-                verify=getattr(args, "verify", False))
+    elif cmd == "hide":
+        cmd_hide(args.runtime)
     elif cmd == "examples":
         cmd_examples()
-    elif cmd == "doctor":
-        cmd_doctor(cfg)
-    elif cmd == "secrets":
-        cmd_secrets(cfg)
-    elif cmd == "stats":
-        cmd_stats(cfg)
-
-
-if __name__ == "__main__":
-    main()
-
