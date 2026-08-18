@@ -76,7 +76,7 @@ lmm bench           -> measure TTFT / TPOT / throughput per provider
 # --- asking ---
 lmm ask "prompt"    -> one question, cached, routed, optionally cascaded
                        (--cascade, --verify, --explain, --no-cache)
-lmm chat            -> interactive REPL that keeps conversation history
+lmm chat            -> interactive REPL; same hub path, so turns are cached+metered
 lmm serve <model>   -> pull + expose a local model endpoint (Ollama)
 lmm serve --hub     -> OpenAI-compatible proxy over every configured provider
 lmm cache           -> prompt-cache stats (--clear to drop it)
@@ -681,7 +681,7 @@ git add .github && git commit -m "ci: enable GitHub Actions" && git push
 | Verification   | The reply is scored, not just the pick — `--verify` falls through a backend that answered badly |
 | Cache          | sha256 of the normalized conversation; optional local-embedding similarity tier |
 | Streaming      | SSE pass-through, stdlib only — token-by-token to the CLI and to proxy clients |
-| Observability  | Every routed turn recorded in `~/.lmm/usage.jsonl` alongside the metering — one log, one lock, one size cap; `lmm log` and `lmm stats` read it back |
+| Observability  | Successes are the metering events themselves; only failures get a trail entry (one writer per fact) — `lmm log`, `lmm stats` and `priority --optimize` join the two |
 | Health         | `doctor` grades the machine — including a live probe of each configured provider — and `selftest` grades the tool |
 | Taskbar hide   | `WS_EX_TOOLWINDOW` on visible windows (Win); headless launch advised for servers |
 | Auto mode      | `watch` daemon hides new LLM windows every few seconds          |

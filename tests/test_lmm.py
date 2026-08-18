@@ -3561,16 +3561,26 @@ class TestOneOfEach(unittest.TestCase):
                              "trail events were counted as billable calls")
             self.assertAlmostEqual(st["measured"], 0.01)
 
-    def test_measure_performance_reads_the_shared_trail(self):
+    def test_measure_performance_joins_metering_and_failures(self):
+        """One writer per fact: a success IS the metering event meter_call
+        wrote (cache=="miss"); only failures get an ask_attempt entry, since
+        a failure has nothing to meter. The reader joins the two."""
         with temp_state():
-            lmm.log_hub({"event": "ask_attempt", "provider": "p", "ok": True,
-                         "latency_ms": 10})
+            lmm.log_usage({"provider": "p", "model": "m", "kind": "local",
+                           "in": 10, "out": 20, "usd": 0.0,
+                           "cache": "miss", "ms": 10})
             lmm.log_hub({"event": "ask_attempt", "provider": "p", "ok": False,
                          "latency_ms": 30})
+            lmm.log_usage({"provider": "p", "model": "m", "kind": "local",
+                           "in": 0, "out": 0, "usd": 0.0,
+                           "cache": "exact", "saved_usd": 0.01})
             st = lmm.measure_performance()
-            self.assertEqual(st["p"]["ok"], 1)
+            self.assertEqual(st["p"]["ok"], 1,
+                             "the metered call was not counted as a success")
             self.assertEqual(st["p"]["fail"], 1)
             self.assertEqual(st["p"]["avg_ms"], 20)
+            # the cache hit is an answer, not an attempt — neither ok nor fail
+            self.assertEqual(st["p"]["ok"] + st["p"]["fail"], 2)
 
     def test_the_trail_is_bounded(self):
         """The reason the second log had to die: unbounded growth."""
@@ -3607,6 +3617,123 @@ class TestOneOfEach(unittest.TestCase):
             self.assertIn("provider 'stub' answers", out)
         finally:
             stub.stop()
+
+
+class TestClosedLoop(unittest.TestCase):
+    """The product's core claim: routing outcomes are measured, and the
+    measurements are readable. The merge silently broke this — the readers
+    (`lmm stats`, `priority --optimize`) survived while their writer did not,
+    so the closed loop was open and nothing noticed. These are round-trips
+    through the real path, not unit checks on either half.
+    """
+
+    def test_a_real_ask_is_visible_to_measure_performance(self):
+        stub = StubBackend()
+        try:
+            with temp_state():
+                cfg = {"providers": {"stub": {
+                    "api_key": "k", "base_url": stub.base_url,
+                    "model": "m", "kind": "local"}},
+                    "ask_order": ["stub"]}
+                targets = lmm.resolve_ask_targets(cfg, "hello", None)
+                res, trace = lmm.hub_complete(cfg, "hello", targets,
+                                              {"cache": False, "source": "ask"})
+                self.assertNotIn("error", res)
+                st = lmm.measure_performance()
+                self.assertEqual(st["stub"]["ok"], 1,
+                                 "a successful ask left no measurable trace")
+        finally:
+            stub.stop()
+
+    def test_a_failed_attempt_is_visible_too(self):
+        with temp_state():
+            cfg = {"providers": {"dead": {
+                "api_key": "k", "base_url": "http://127.0.0.1:9/v1",
+                "model": "m", "kind": "local"}},
+                "ask_order": ["dead"],
+                "retry": {"attempts": 1}}
+            targets = lmm.resolve_ask_targets(cfg, "hello", None)
+            res, trace = lmm.hub_complete(cfg, "hello", targets,
+                                          {"cache": False, "source": "ask"})
+            self.assertIn("error", res)
+            st = lmm.measure_performance()
+            self.assertEqual(st["dead"]["fail"], 1,
+                             "a failed attempt left no measurable trace")
+
+    def test_chat_turns_are_metered(self):
+        """chat used to bypass metering entirely — its spend was invisible
+        to `lmm cost`, falsifying the "bill you can actually see" claim."""
+        stub = StubBackend()
+        try:
+            with temp_state():
+                cfg = {"providers": {"stub": {
+                    "api_key": "k", "base_url": stub.base_url,
+                    "model": "m", "kind": "local"}},
+                    "ask_order": ["stub"]}
+                targets = lmm.resolve_ask_targets(cfg, "hi", None)
+                frames = list(lmm.hub_stream(
+                    cfg, [{"role": "user", "content": "hi"}], targets,
+                    {"source": "chat", "cache": False}))
+                self.assertTrue(frames)
+                metered = [e for e in lmm.read_usage()
+                           if not e.get("event") and e.get("provider") == "stub"]
+                self.assertEqual(len(metered), 1,
+                                 "a chat turn produced no metering event")
+                self.assertEqual(metered[0].get("source"), "chat")
+        finally:
+            stub.stop()
+
+
+class TestOneGrader(unittest.TestCase):
+    """verify_reply is a gate over verify_answer — the same grader the
+    cascade reads as a score. Two independent graders disagreed exactly the
+    way the two routers did: the cascade accepted script-fused hallucinations
+    that only the gate could see.
+    """
+
+    def test_cascade_scores_a_fused_script_hallucination_low(self):
+        score, why = lmm.verify_answer(
+            "explain quantum mechanics",
+            "The wavefunction propag\u30ec\u30fc\u30b7\u30e7\u30f3 describes "
+            "everything about the system and its future evolution over time.")
+        self.assertLess(score, 0.75,
+                        "the cascade would accept a garbled hallucination")
+        self.assertTrue(any("script-fused" in w for w in why), why)
+
+    def test_normal_japanese_is_not_taxed(self):
+        """'Python\u30b3\u30fc\u30c9' and 'API\u30ad\u30fc' are ordinary
+        Japanese technical writing. The old gate rejected every reply that
+        fused latin to kana, which taxed correct Japanese answers; the check
+        only means "hallucination" when the conversation is not Japanese."""
+        score, why = lmm.verify_answer(
+            "\u3053\u306ePython\u30b3\u30fc\u30c9\u306e\u30d0\u30b0\u3092"
+            "\u76f4\u3057\u3066",
+            "\u3053\u306e\u30d0\u30b0\u306fAPI\u30ad\u30fc\u306e\u691c"
+            "\u8a3c\u6f0f\u308c\u3067\u3059\u3002`validate()`\u3092\u547c"
+            "\u3093\u3067\u304f\u3060\u3055\u3044\u3002")
+        self.assertFalse(any("script-fused" in w for w in why),
+                         "normal Japanese was flagged as hallucination: %s" % why)
+
+    def test_verify_reply_is_the_gate_over_verify_answer(self):
+        cases = [
+            "Short.",
+            "The Schrodinger equation governs how the quantum state of a "
+            "physical system evolves over time via the Hamiltonian, and it "
+            "underlies superposition and interference throughout physics.",
+            "I cannot help with that request.",
+        ]
+        for reply in cases:
+            score, _ = lmm.verify_answer("explain quantum mechanics", reply)
+            ok, _ = lmm.verify_reply("explain quantum mechanics", reply)
+            self.assertEqual(ok, score >= lmm.VERIFY_GATE,
+                             "gate and grader disagree on: %r" % reply)
+
+    def test_the_gate_still_catches_the_selftest_canary(self):
+        ok, reason = lmm.verify_reply(
+            "explain quantum mechanics",
+            "The wavefunction propag\u30ec\u30fc\u30b7\u30e7\u30f3 "
+            "describes everything.")
+        self.assertFalse(ok)
 
 
 class TestSelftestGate(unittest.TestCase):

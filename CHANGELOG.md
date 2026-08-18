@@ -80,6 +80,26 @@ the merge of the managed-routing line of work into the same tool.
   suite stays zero-dependency.
 
 ### Fixed
+- **The measurement loop was open.** `lmm stats` and `priority --optimize`
+  read per-attempt routing outcomes that, after the merge, nothing wrote —
+  the readers survived their writer. Failed attempts (which have no usage to
+  meter) now get a trail entry from the hub itself, successes are read from
+  the metering events that already existed, and the loop is proven by a
+  round-trip test: a real `ask` against a live stub must show up in
+  `measure_performance()`.
+- **`lmm chat` was invisible to `lmm cost`.** It called providers through its
+  own private fallback loop — no cache, no metering, no retry, no breaker —
+  while the README claimed one path for ask/chat/hub. Chat now streams
+  through `hub_stream`, the same generator the hub server uses, and a test
+  asserts a chat turn produces a metering event.
+- **The cascade accepted hallucinations only the verify gate could see.**
+  Script-fused tokens ('propagレーション') were detected
+  by `verify_reply` but not by the cascade's scorer, so the cost path could
+  accept an answer the quality path rejected. One grader now serves both —
+  `verify_reply` is a threshold gate over `verify_answer` — and the fusion
+  check applies only to non-Japanese conversations: the old version rejected
+  ordinary Japanese technical writing ('APIキー',
+  'Pythonコード') as garbage.
 - **Splitting the file broke every install.** `install.sh` and `install.ps1`
   still copied `lmm.py` alone, and the README still told you to `curl` it on
   its own, so a fresh install died on `from backend import *` before printing

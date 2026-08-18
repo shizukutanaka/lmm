@@ -2512,6 +2512,26 @@ def verify_answer(prompt, answer, cfg=None, judge=None, tool_calls=None):
     if len(text) < len(ptext) * 0.1 and ptext.count(".") + ptext.count("?") > 1:
         score -= 0.20; why.append("answer far shorter than a multi-part prompt")
 
+    # Hallucination canary: a latin fragment fused to kana/kanji mid-word
+    # ('propagレーション'). Only anomalous when the CONVERSATION isn't
+    # Japanese — in a Japanese exchange, fusions like 'APIキー' and
+    # 'Pythonコード' are ordinary technical writing, and penalising them
+    # would tax every correct Japanese answer.
+    import re as _re
+    prompt_is_jp = any('\u3040' <= c <= '\u9fff' for c in ptext)
+    if not prompt_is_jp and _re.search(
+            r"[A-Za-z][\u3040-\u30ff\u4e00-\u9fff]"
+            r"|[\u3040-\u30ff\u4e00-\u9fff][A-Za-z]", text):
+        score -= 0.60; why.append("script-fused token in a non-Japanese conversation")
+    # A reasoning request answered in one breath is under-delivery — but only
+    # for English replies; Japanese can be correct and terse.
+    answer_is_jp = any('\u3040' <= c <= '\u9fff' for c in text)
+    wants_reasoning = any(k in ptext.lower() for k in
+                          ("explain", "derive", "proof", "why",
+                           "理由", "説明", "証明", "導出"))
+    if wants_reasoning and not answer_is_jp and len(text) < 120:
+        score -= 0.30; why.append("reasoning task answered in one breath")
+
     score = max(0.0, min(1.0, score))
     if judge:
         js = judge_answer(judge, ptext, text)
@@ -3005,6 +3025,14 @@ def hub_complete(cfg, messages, targets, opts=None):
             last_err = res["error"]
             if breaker:
                 breaker.record_failure(name)
+            # Failures never reach meter_call (there is no usage to price), so
+            # this is the only record that the attempt happened. `lmm stats`
+            # and `priority --optimize` need it to measure real reliability;
+            # successes they read from the metering events instead — one
+            # writer per fact.
+            log_hub({"event": "ask_attempt", "provider": name, "ok": False,
+                     "latency_ms": elapsed_ms, "rung": i, "source": source,
+                     "error": str(last_err)[:120]})
             trace.append(f"[{'cascade' if use_cascade else 'ask'}] "
                          f"rung{i} {name} failed: {last_err} -> next")
             continue
@@ -3017,6 +3045,9 @@ def hub_complete(cfg, messages, targets, opts=None):
             last_err = "unexpected response shape"
             if breaker:
                 breaker.record_failure(name)
+            log_hub({"event": "ask_attempt", "provider": name, "ok": False,
+                     "latency_ms": elapsed_ms, "rung": i, "source": source,
+                     "error": last_err})
             trace.append(f"[ask] rung{i} {name} returned an unexpected shape -> next")
             continue
         if breaker:
@@ -3166,7 +3197,7 @@ def hub_stream(cfg, messages, targets, opts=None):
         live = [(n, p) for n, p in targets if breaker.available(n)]
         if live:
             targets = live       # keep at least one candidate even if all open
-    for name, prov in targets:
+    for rung_i, (name, prov) in enumerate(targets):
         t0 = time.time()
         started = False        # any byte written -> failover is no longer possible
         completed = False      # saw the end-of-stream sentinel
@@ -3240,6 +3271,10 @@ def hub_stream(cfg, messages, targets, opts=None):
                 breaker.record_failure(name)
         if failed and not started:
             last_err = failed                          # nothing written: fail over
+            log_hub({"event": "ask_attempt", "provider": name, "ok": False,
+                     "latency_ms": int((time.time() - t0) * 1000),
+                     "rung": rung_i, "source": source,
+                     "error": str(failed)[:120]})
             continue
         if failed:
             # Bytes are already on the wire; the only honest move is to say so.
@@ -3472,40 +3507,25 @@ def resolve_provider_by_model(provs, model_id):
     return None
 
 
-def verify_reply(task, reply):
-    """First-principles QUALITY GATE: don't trust that a backend answered well
-    — MEASURE it. Returns (ok, reason). This closes the routing loop: a backend
-    is only 'good' if its reply actually satisfies the task, measured by
-    proxy signals (we cannot grade meaning, but we can detect failure modes).
+VERIFY_GATE = 0.75      # verify_reply's pass mark over verify_answer's score
 
-    Proxy failure modes (all MEASURED, not assumed):
-      - empty / error / refusal
-      - hallucinated tokens (mojibake / non-word ASCII-Japanese mixes)
-      - task-specific under-delivery (code task with no code block, etc.)
+
+def verify_reply(task, reply):
+    """Binary fitness gate for closed-loop routing: (ok, reason).
+
+    A thin threshold over verify_answer — the same grader the cascade uses to
+    decide escalation. It used to be a second, independent set of checks, and
+    the two disagreed the same way the two routers did: the cascade would
+    accept a script-fused hallucination this gate rejected, because only this
+    gate looked for one. One grader, two views: the cascade reads the score,
+    the verify loop reads pass/fail.
     """
     if not reply or not reply.strip():
         return False, "empty reply"
-    t = (task or "").lower()
-    r = reply.strip()
-    # hallucination / mojibake proxy: latin letter immediately fused to a
-    # Japanese kana/kanji with no separator, e.g. 'propagレーション'
-    import re
-    if re.search(r"[A-Za-z][\u3040-\u30ff\u4e00-\u9fff]|[\u3040-\u30ff\u4e00-\u9fff][A-Za-z]", r):
-        return False, "hallucinated token (latin+script fused)"
-    # code task must contain a code block or def/class
-    if any(k in t for k in ["code", "function", "実装", "クラス", "関数",
-                             "def ", "write a", "```"]):
-        if "```" not in r and "def " not in r and "class " not in r and "function" not in r:
-            return False, "code task but no code block produced"
-    # heavy reasoning task: a one-liner is under-delivery — but ONLY for
-    # English tasks. Japanese answers can be correct and concise (e.g.
-    # "シュレーディンガー方程式です"), so we must not punish short JP replies.
-    has_jp = any('\u3040' <= c <= '\u9fff' for c in r)
-    if (not has_jp) and any(k in t for k in
-                            ["explain", "derive", "proof", "理由", "why"]):
-        if len(r) < 120:
-            return False, f"reasoning task but reply too short ({len(r)} chars)"
-    return True, "ok"
+    score, why = verify_answer(task, reply)
+    if score >= VERIFY_GATE:
+        return True, "ok"
+    return False, (why[0] if why else f"score {score:.2f} below gate")
 
 
 def route_and_verify(task, cfg, ask_order=None, max_tries=3):
@@ -3545,23 +3565,33 @@ def route_and_verify(task, cfg, ask_order=None, max_tries=3):
 
 
 def measure_performance():
-    """Aggregate ask_attempt trail events into {provider: {ok, fail, avg_ms}}.
-    This is the REAL observed routing outcome, not a guess — and reading it
-    through read_usage means compaction and the fold's lock discipline apply
-    here too. Old attempts fold away with the rest of the tail; recency is the
-    point of a performance measurement."""
+    """Aggregate observed routing outcomes into {provider: {ok, fail, avg_ms}}.
+
+    One writer per fact: a successful attempt is already a metering event
+    (provider, ms, cost — written by meter_call with cache=="miss"), and only
+    failures get a dedicated ask_attempt trail entry, because there is nothing
+    to meter. This reader joins the two. Cache hits are answers, not attempts,
+    so they do not count either way; old events fold away with the rollup,
+    which is fine — recency is the point of a performance measurement.
+    """
     from collections import defaultdict
     stat = defaultdict(lambda: {"ok": 0, "fail": 0, "lat": []})
     for e in read_usage():
-        if e.get("event") != "ask_attempt":
+        if e.get("rollup"):
             continue
-        n = e.get("provider", "?")
-        if e.get("ok"):
-            stat[n]["ok"] += 1
-        else:
+        if e.get("event") == "ask_attempt":
+            if e.get("ok"):
+                continue      # legacy success entries; meter events own these
+            n = e.get("provider", "?")
             stat[n]["fail"] += 1
-        if isinstance(e.get("latency_ms"), int):
-            stat[n]["lat"].append(e["latency_ms"])
+            if isinstance(e.get("latency_ms"), int):
+                stat[n]["lat"].append(e["latency_ms"])
+        elif not e.get("event") and e.get("cache") == "miss" \
+                and e.get("provider"):
+            n = e["provider"]
+            stat[n]["ok"] += 1
+            if isinstance(e.get("ms"), int):
+                stat[n]["lat"].append(e["ms"])
     for v in stat.values():
         v["avg_ms"] = int(sum(v["lat"]) / len(v["lat"])) if v["lat"] else 0
     return stat

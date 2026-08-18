@@ -1291,12 +1291,16 @@ def cmd_pull(model):
 
 
 def cmd_chat(provider, cfg):
-    """Interactive chat REPL over the hub. Keeps conversation history
-    (messages) across turns and routes every user turn through the SAME
-    unified routing (ask_order + fallback) as `lmm ask`. Each turn is logged
-    to the trail. Local OR cloud, one interface. Type 'exit'/'quit'/'/exit' to
-    leave."""
+    """Interactive chat REPL over the hub. Keeps conversation history across
+    turns and routes every turn through hub_stream — the SAME path `lmm ask`
+    and `lmm serve --hub` use, which is what makes the README's "one path"
+    claim true rather than aspirational. That buys chat the cache, the
+    routing, retry/breaker, and metering; its old private fallback loop had
+    none of those, so chat turns were invisible to `lmm cost`.
+    Type 'exit'/'quit'/'/exit' to leave."""
     print("lmm chat — type 'exit' to quit. Routes every turn via the hub.")
+    brk = merged_breaker(cfg)
+    breaker = HUB_BREAKER if brk.get("enabled", True) else None
     messages = []
     try:
         while True:
@@ -1315,40 +1319,35 @@ def cmd_chat(provider, cfg):
                 print("[chat] no provider available.")
                 messages.pop()  # drop the unsendable turn
                 continue
-            last_err = None
-            replied = False
-            for name, prov in targets:
-                gen = call_provider(prov, line,
-                                    messages=messages[:-1] + [{"role": "user",
-                                                               "content": line}],
-                                    stream=True)
-                if isinstance(gen, dict) and gen.get("error"):
-                    last_err = gen["error"]
-                    log_hub({"event": "chat", "provider": name, "ok": False,
-                             "error": last_err, "prompt": line})
-                    continue
-                try:
-                    print("hub> ", end="", flush=True)
-                    full = []
-                    for piece in gen:
-                        if piece.startswith("[stream error:"):
-                            raise RuntimeError(piece)
-                        full.append(piece)
+            print("hub> ", end="", flush=True)
+            parts, err = [], None
+            for frame in hub_stream(cfg, list(messages), targets,
+                                    {"source": "chat", "breaker": breaker}):
+                for raw in frame.split(b"\n"):
+                    if not raw.startswith(b"data: "):
+                        continue
+                    payload = raw[6:].strip()
+                    if not payload or payload == b"[DONE]":
+                        continue
+                    try:
+                        obj = json.loads(payload.decode("utf-8", "ignore"))
+                    except ValueError:
+                        continue
+                    if isinstance(obj.get("error"), dict):
+                        err = obj["error"].get("message", "unknown error")
+                        continue
+                    piece = chunk_text(obj)
+                    if piece:
+                        parts.append(piece)
                         print(piece, end="", flush=True)
-                    print("")
-                    log_hub({"event": "chat", "provider": name, "ok": True,
-                             "prompt": line, "reply": "".join(full)[:200]})
-                    messages.append({"role": "assistant",
-                                     "content": "".join(full)})
-                    replied = True
-                    break
-                except (KeyError, IndexError, TypeError, RuntimeError) as e:
-                    last_err = f"stream failed: {e}"
-                    log_hub({"event": "chat", "provider": name, "ok": False,
-                             "error": last_err, "prompt": line})
-                    continue
-            if not replied:
-                print(f"[chat] all providers failed: {last_err}")
+            print("")
+            if parts:
+                messages.append({"role": "assistant",
+                                 "content": "".join(parts)})
+                if err:
+                    print(f"[chat] stream ended early: {err}")
+            else:
+                print(f"[chat] all providers failed: {err or 'no reply'}")
                 messages.pop()  # drop the turn we couldn't send
     except Exception as e:
         print(f"[chat] stopped: {e}")
@@ -1733,29 +1732,43 @@ def cmd_stats(cfg):
     Proves (don't trust — measure) HOW well the routing actually performs:
     per-backend success rate, average latency, total attempts, and how often
     the first tried backend succeeded. Zero-dep: pure JSONL scan."""
-    attempts = [e for e in backend.read_usage()
-                if e.get("event") == "ask_attempt"]
-    if not attempts:
-        print("[stats] no ask_attempt events yet. Run `lmm ask` first.")
-        sys.exit(0)
-
+    # One writer per fact: successes are the metering events meter_call wrote
+    # (cache=="miss" — an actual provider call, not a cache answer); failures
+    # are the ask_attempt trail entries, which exist because a failure has no
+    # usage to meter. Joining them here is what makes this a measurement of
+    # every path — ask, chat, cascade and the hub server alike.
     by_provider = {}
-    first_try_ok = 0
-    total = len(attempts)
-    for i, e in enumerate(attempts):
-        name = e.get("provider", "?")
-        rec = by_provider.setdefault(name, {"ok": 0, "fail": 0, "lat": [], "cost": 0.0})
-        if e.get("ok"):
-            rec["ok"] += 1
-            # first attempt of a session = index 0 or right after an all-fail
-            if i == 0 or (attempts[i - 1].get("provider") == "(all)"):
-                first_try_ok += 1
-        else:
+    first_rung = {"ok": 0, "fail": 0}
+    total = 0
+    for e in backend.read_usage():
+        if e.get("rollup"):
+            continue
+        if e.get("event") == "ask_attempt" and not e.get("ok"):
+            name = e.get("provider", "?")
+            rec = by_provider.setdefault(
+                name, {"ok": 0, "fail": 0, "lat": [], "cost": 0.0})
             rec["fail"] += 1
-        if isinstance(e.get("latency_ms"), int):
-            rec["lat"].append(e["latency_ms"])
-        if isinstance(e.get("cost_usd"), (int, float)):
-            rec["cost"] += e["cost_usd"]
+            total += 1
+            if isinstance(e.get("latency_ms"), int):
+                rec["lat"].append(e["latency_ms"])
+            if e.get("rung") == 0:
+                first_rung["fail"] += 1
+        elif not e.get("event") and e.get("cache") == "miss" \
+                and e.get("provider"):
+            name = e["provider"]
+            rec = by_provider.setdefault(
+                name, {"ok": 0, "fail": 0, "lat": [], "cost": 0.0})
+            rec["ok"] += 1
+            total += 1
+            if isinstance(e.get("ms"), int):
+                rec["lat"].append(e["ms"])
+            if isinstance(e.get("usd"), (int, float)):
+                rec["cost"] += e["usd"]
+            if e.get("rung") == 0:
+                first_rung["ok"] += 1
+    if not total:
+        print("[stats] no routing attempts measured yet. Run `lmm ask` first.")
+        sys.exit(0)
 
     print(f"lmm stats — {total} routing attempt(s) measured:")
     print(f"{'backend':<32}{'success':>9}{'fail':>6}{'succ%':>8}{'avg_ms':>9}{'cost$':>10}")
@@ -1772,8 +1785,10 @@ def cmd_stats(cfg):
     overall_pct = (overall_ok / total * 100) if total else 0
     print("-" * 74)
     print(f"{'TOTAL':<32}{overall_ok:>9}{total - overall_ok:>6}{overall_pct:>7.0f}%{'':>9}{total_cost:>10.4f}")
-    print(f"first-try success rate: {first_try_ok}/{total} "
-          f"({first_try_ok / total * 100:.0f}%)")
+    ft_total = first_rung["ok"] + first_rung["fail"]
+    if ft_total:
+        print(f"first-try success rate: {first_rung['ok']}/{ft_total} "
+              f"({first_rung['ok'] / ft_total * 100:.0f}%)")
     print(f"total estimated cost: ${total_cost:.4f} "
           f"(local backends are free; cloud costs are measured per actual tokens)")
 
