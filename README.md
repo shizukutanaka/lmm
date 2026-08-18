@@ -500,7 +500,9 @@ mkdir -p .github/workflows && cp ci/github-actions-ci.yml .github/workflows/ci.y
 git add .github && git commit -m "ci: enable GitHub Actions" && git push
 ```
 
-It runs the full suite on Python 3.8 through 3.13 (3.8 being the floor this
+It runs the full suite (which itself includes the zero-config smoke test of
+every command and the `config.example.json` sync check) on Python 3.8 through
+3.13 (3.8 being the floor this
 README promises), a zero-config smoke test of every command, a check that
 `config.example.json` matches `lmm examples` output, and a mechanical
 assertion that every import in `lmm.py` resolves to the standard library — so

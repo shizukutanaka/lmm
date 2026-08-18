@@ -38,42 +38,9 @@ jobs:
       - name: Unit tests
         run: python -m unittest discover -s tests -v
 
-      - name: Zero-config smoke test
-        # Every command must exit 0 with no config file present. This is the
-        # promise that `lmm` works before you have configured anything, and it
-        # is the regression that a unit test cannot catch.
-        env:
-          HOME: ${{ runner.temp }}/lmm-empty
-        run: |
-          mkdir -p "$HOME"
-          set -e
-          for cmd in "--version" "discover" "discover --json" "cli" "status" \
-                     "models" "cost" "cost --days 7" "route hi" \
-                     "route --explain hi" "fit --vram 8" "bench" "cache" \
-                     "examples"; do
-            echo "--- lmm $cmd"
-            python lmm.py $cmd > /dev/null
-          done
-
-      - name: Config example is in sync with `lmm examples`
-        # cmd_examples() is the source of truth; config.example.json is
-        # generated from it. They drifted once already.
-        env:
-          HOME: ${{ runner.temp }}/lmm-empty
-        run: |
-          python lmm.py examples > /tmp/generated.json
-          python -c "import json; json.load(open('/tmp/generated.json'))"
-          diff -u config.example.json /tmp/generated.json
-
-  no-dependencies:
-    # The headline claim is "zero dependencies". Assert it mechanically rather
-    # than trusting the README.
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.12"
+      # The zero-config smoke test and the config.example.json sync check used
+      # to live here as separate steps. They are now TestCliSmoke in the suite
+      # above, so they run for developers too instead of only in CI.
       - name: Every import resolves to the standard library
         run: |
           python - <<'PY'
