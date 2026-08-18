@@ -250,6 +250,130 @@ class TestCache(unittest.TestCase):
             self.assertIsNone(entry)
 
 
+class TestToolCalls(unittest.TestCase):
+    """A tool-calling reply leaves `content` null and puts its payload in
+    `tool_calls`. Treating that as an empty answer turned the cascade from a
+    cost reducer into a cost multiplier on exactly the agent traffic a hub
+    proxies most."""
+
+    CALL = {"id": "c1", "type": "function",
+            "function": {"name": "get_weather",
+                         "arguments": '{"location":"Tokyo"}'}}
+
+    def response(self, calls=None, content=None):
+        return {"choices": [{"message": {"role": "assistant", "content": content,
+                                         "tool_calls": calls},
+                             "finish_reason": "tool_calls" if calls else "stop"}],
+                "usage": {"prompt_tokens": 50, "completion_tokens": 20}}
+
+    def test_a_valid_tool_call_scores_as_a_complete_answer(self):
+        score, why = lmm.verify_tool_calls([self.CALL])
+        self.assertGreaterEqual(score, lmm.DEFAULT_CASCADE["threshold"])
+        self.assertEqual(why, [])
+
+    def test_verify_answer_dispatches_on_tool_calls(self):
+        score, _ = lmm.verify_answer("weather?", None, tool_calls=[self.CALL])
+        self.assertGreaterEqual(score, lmm.DEFAULT_CASCADE["threshold"])
+
+    def test_unparseable_arguments_still_escalate(self):
+        # The tool-call analogue of an unclosed code fence, and the documented
+        # failure mode of small models emitting structured output.
+        bad = {"function": {"name": "get_weather", "arguments": '{"location":"Tok'}}
+        score, why = lmm.verify_tool_calls([bad])
+        self.assertLess(score, lmm.DEFAULT_CASCADE["threshold"])
+        self.assertTrue(any("JSON" in w for w in why))
+
+    def test_a_nameless_tool_call_is_a_total_failure(self):
+        self.assertEqual(lmm.verify_tool_calls([{"function": {"arguments": "{}"}}])[0],
+                         0.0)
+
+    def test_a_no_argument_tool_is_legitimate(self):
+        score, why = lmm.verify_tool_calls([{"function": {"name": "now",
+                                                          "arguments": ""}}])
+        self.assertGreaterEqual(score, lmm.DEFAULT_CASCADE["threshold"])
+        self.assertEqual(why, [])
+
+    def test_empty_tool_calls_is_not_an_answer(self):
+        self.assertEqual(lmm.verify_tool_calls([])[0], 0.0)
+
+    def test_helpers_tolerate_junk(self):
+        self.assertEqual(lmm.tool_calls_of({}), [])
+        self.assertEqual(lmm.tool_calls_of({"choices": []}), [])
+        self.assertEqual(lmm.message_of(None), {})
+        self.assertEqual(lmm.tool_calls_text(None), "")
+
+    def test_cascade_accepts_a_tool_call_at_the_cheapest_rung(self):
+        calls = []
+
+        def fake(prov, prompt, temperature=0.7, extra=None, **kw):
+            calls.append(prov.get("model"))
+            return self.response([self.CALL])
+        saved = lmm.call_provider
+        lmm.call_provider = fake
+        targets = [("cheap", {"kind": "remote", "model": "cheap",
+                              "price": {"in": 0.1, "out": 0.2}}),
+                   ("strong", {"kind": "remote", "model": "strong",
+                               "price": {"in": 15.0, "out": 75.0}})]
+        try:
+            with temp_state():
+                res, trace = lmm.hub_complete({}, "weather in Tokyo?", targets,
+                                              {"cascade": True, "cache": False})
+        finally:
+            lmm.call_provider = saved
+        self.assertEqual(calls, ["cheap"])          # no needless escalation
+        self.assertTrue(lmm.tool_calls_of(res))     # the tool call is returned
+        self.assertTrue(any("accept" in t for t in trace))
+
+    def test_a_response_with_neither_content_nor_tool_calls_is_still_rejected(self):
+        saved = lmm.call_provider
+        lmm.call_provider = lambda p, m, temperature=0.7, extra=None, **kw: {
+            "choices": [{"message": {"role": "assistant"}}]}
+        targets = [("p", {"kind": "remote", "model": "p"})]
+        try:
+            with temp_state():
+                res, _ = lmm.hub_complete({}, "hi", targets,
+                                          {"cascade": False, "cache": False})
+        finally:
+            lmm.call_provider = saved
+        self.assertIn("error", res)
+
+    def test_chunk_tool_text_extracts_streamed_arguments(self):
+        chunk = {"choices": [{"delta": {"tool_calls": [
+            {"function": {"name": "f", "arguments": '{"a":1}'}}]}}]}
+        self.assertEqual(lmm.chunk_tool_text(chunk), 'f\n{"a":1}')
+        self.assertEqual(lmm.chunk_tool_text({"choices": [{"delta": {}}]}), "")
+        self.assertEqual(lmm.chunk_tool_text({}), "")
+
+    def test_a_streamed_tool_call_is_not_metered_as_zero_output(self):
+        def stream(prov, prompt, temperature=0.7, extra=None, **kw):
+            frames = [
+                {"choices": [{"delta": {"role": "assistant"}}]},
+                {"choices": [{"delta": {"tool_calls": [
+                    {"index": 0, "function": {"name": "get_weather",
+                                              "arguments": ""}}]}}]},
+                {"choices": [{"delta": {"tool_calls": [
+                    {"index": 0, "function": {
+                        "arguments": '{"location":"Tokyo"}'}}]}}]},
+                {"choices": [{"delta": {}, "finish_reason": "tool_calls"}]},
+            ]
+            for f in frames:
+                yield ("data: " + json.dumps(f) + "\n").encode(), f
+            yield None, None
+        saved = lmm.call_provider_stream
+        lmm.call_provider_stream = stream
+        targets = [("p", {"kind": "remote", "model": "p",
+                          "price": {"in": 1.0, "out": 2.0}})]
+        try:
+            with temp_state():
+                b"".join(lmm.hub_stream({}, "weather?", targets, {"cache": False}))
+                events = lmm.read_usage()
+        finally:
+            lmm.call_provider_stream = saved
+        self.assertGreater(events[0]["out"], 0)     # was 0 before
+        self.assertTrue(events[0]["estimated"])
+        self.assertIsNotNone(events[0]["ttft_ms"])  # was None before
+
+
 class TestVerifiedCache(unittest.TestCase):
     """vCache (arXiv:2502.03771): one static similarity threshold cannot bound
     the false-hit rate, so an entry has to EARN the right to answer."""

@@ -1133,14 +1133,32 @@ def http_stream_sse(url, payload, api_key, timeout=300):
     yield None, None                          # clean end of stream
 
 
+def chunk_delta(chunk):
+    """The delta object from one streamed chunk, or {}."""
+    try:
+        return (chunk.get("choices") or [{}])[0].get("delta") or {}
+    except (AttributeError, IndexError, TypeError):
+        return {}
+
+
 def chunk_text(chunk):
     """Extract the content delta from one streamed chunk, '' if it carries none."""
-    try:
-        d = (chunk.get("choices") or [{}])[0].get("delta") or {}
-    except (AttributeError, IndexError, TypeError):
-        return ""
-    c = d.get("content")
+    c = chunk_delta(chunk).get("content")
     return c if isinstance(c, str) else ""
+
+
+def chunk_tool_text(chunk):
+    """Extract tool-call text from one streamed chunk.
+
+    Tool arguments stream through `delta.tool_calls[].function`, not
+    `delta.content`. They are billed output tokens like any other, so a stream
+    that only calls a tool would otherwise be metered as zero output whenever
+    the provider omits a usage chunk.
+    """
+    calls = chunk_delta(chunk).get("tool_calls")
+    if not isinstance(calls, list):
+        return ""
+    return tool_calls_text(calls)
 
 
 # Request fields we hand straight to the backend. Anything else in an incoming
@@ -3057,9 +3075,72 @@ def order_targets(cfg, prompt, targets):
 # trained DistilBERT regressor. With stdlib-only as a hard constraint we
 # instead penalise the failure modes small models actually exhibit, and let the
 # user bolt on a real LLM judge via cascade.judge when they want one.
-def verify_answer(prompt, answer, cfg=None, judge=None):
+def message_of(res):
+    """The assistant message from an OpenAI-shaped response, or {}."""
+    try:
+        return res["choices"][0]["message"] or {}
+    except (KeyError, IndexError, TypeError):
+        return {}
+
+
+def tool_calls_of(res):
+    """Tool calls on a response, or []. A tool-calling reply carries its
+    payload here and leaves `content` null."""
+    tc = message_of(res).get("tool_calls")
+    return tc if isinstance(tc, list) else []
+
+
+def tool_calls_text(tool_calls):
+    """Flatten tool calls to text for token estimation. Their arguments are
+    real output tokens the provider billed for; ignoring them reported such a
+    call as zero output."""
+    parts = []
+    for c in tool_calls or []:
+        fn = (c or {}).get("function") or {}
+        if isinstance(fn.get("name"), str):
+            parts.append(fn["name"])
+        if isinstance(fn.get("arguments"), str):
+            parts.append(fn["arguments"])
+    return "\n".join(parts)
+
+
+def verify_tool_calls(tool_calls):
+    """Score a tool-calling reply. A well-formed call IS a complete answer —
+    the text verifier's checks (length, hedging, truncation) are meaningless
+    for one, and applying them scored every tool call as an empty failure.
+
+    What can actually go wrong is the analogue of an unclosed code fence:
+    small models emit a plausible name with truncated or invalid JSON
+    arguments. That is what constrained decoding exists to prevent, and it is
+    what is checked here.
+    """
+    if not tool_calls:
+        return 0.0, ["no tool calls"]
+    why = []
+    score = 1.0
+    for c in tool_calls:
+        fn = (c or {}).get("function") or {}
+        name = fn.get("name")
+        if not name or not isinstance(name, str):
+            return 0.0, ["tool call with no function name"]
+        args = fn.get("arguments")
+        if args is None or args == "":
+            continue                    # a no-argument tool is legitimate
+        if not isinstance(args, str):
+            continue                    # already-decoded object: nothing to parse
+        try:
+            json.loads(args)
+        except ValueError:
+            score -= 0.6
+            why.append("tool '%s' has unparseable JSON arguments" % name)
+    return max(0.0, score), why
+
+
+def verify_answer(prompt, answer, cfg=None, judge=None, tool_calls=None):
     """Score an answer in [0,1] and explain the deductions. Low means the
     cheap model probably failed and the request should escalate."""
+    if tool_calls:
+        return verify_tool_calls(tool_calls)
     text = (answer or "").strip()
     if not text or len(text.split()) < 3:
         return 0.0, ["empty or near-empty answer"]
@@ -3568,9 +3649,12 @@ def hub_complete(cfg, messages, targets, opts=None):
             trace.append(f"[{'cascade' if use_cascade else 'ask'}] "
                          f"rung{i} {name} failed: {last_err} -> next")
             continue
-        try:
-            answer = res["choices"][0]["message"]["content"]
-        except (KeyError, IndexError, TypeError):
+        msg = message_of(res)
+        calls = tool_calls_of(res)
+        answer = msg.get("content")
+        # A tool call is a complete reply that leaves `content` null, so the
+        # shape is only unexpected when NEITHER is present.
+        if answer is None and not calls:
             last_err = "unexpected response shape"
             if breaker:
                 breaker.record_failure(name)
@@ -3592,7 +3676,7 @@ def hub_complete(cfg, messages, targets, opts=None):
                 label_exploration(cfg, explore, sim, res, trace)
             return res, trace
 
-        score, why = verify_answer(messages, answer, cfg, judge)
+        score, why = verify_answer(messages, answer, cfg, judge, tool_calls=calls)
         accept = score >= threshold or i == len(rungs) - 1
         usd = meter_call(name, prov, prov.get("model"), res, pricing,
                          source=source, cache="miss", rung=i,
@@ -3728,6 +3812,7 @@ def hub_stream(cfg, messages, targets, opts=None):
         started = False        # any byte written -> failover is no longer possible
         completed = False      # saw the end-of-stream sentinel
         parts, usage, ttft_ms, failed = [], None, None, None
+        tool_parts = []          # billed output that never appears in `content`
         try:
             for raw, chunk in call_provider_stream(prov, messages,
                                                    temperature=temp, extra=extra):
@@ -3746,10 +3831,14 @@ def hub_stream(cfg, messages, targets, opts=None):
                         # parsers reject the empty `choices` it carries.
                         continue
                 piece = chunk_text(chunk) if isinstance(chunk, dict) else ""
-                if piece:
+                tool_piece = chunk_tool_text(chunk) if isinstance(chunk, dict) else ""
+                if piece or tool_piece:
                     if ttft_ms is None:
                         ttft_ms = int((time.time() - t0) * 1000)
+                if piece:
                     parts.append(piece)
+                if tool_piece:
+                    tool_parts.append(tool_piece)
                 started = True
                 yield sse_relay(raw) if raw is not None else sse_frame(chunk)
         finally:
@@ -3763,9 +3852,12 @@ def hub_stream(cfg, messages, targets, opts=None):
                     # Provider ignored stream_options.include_usage. Estimate,
                     # and flag it, so `lmm cost` never shows a guess as a
                     # measurement.
+                    # Tool arguments are billed output even though they never
+                    # reach `content`, so they count toward the estimate.
+                    billed = "\n".join([p for p in (text, "\n".join(tool_parts)) if p])
                     usage = {"prompt_tokens": estimate_tokens(
                         messages_text(as_messages(messages))),
-                        "completion_tokens": estimate_tokens(text)}
+                        "completion_tokens": estimate_tokens(billed)}
                 res = {"choices": [{"index": 0, "finish_reason": "stop",
                                     "message": {"role": "assistant",
                                                 "content": text}}],
@@ -3867,6 +3959,8 @@ def bench_once(prov, prompt, max_tokens=128):
         if isinstance(chunk, dict) and isinstance(chunk.get("usage"), dict):
             usage = chunk["usage"]
         piece = chunk_text(chunk) if isinstance(chunk, dict) else ""
+        if not piece and isinstance(chunk, dict):
+            piece = chunk_tool_text(chunk)     # tool arguments are tokens too
         if piece:
             if ttft is None:
                 ttft = time.time() - t0

@@ -115,6 +115,24 @@ guarantee is "there is statistical evidence the error rate is below δ", not the
 paper's tighter one. Wilson is used precisely because the naive estimate reads
 2-out-of-2 as 100% correct, which would certify an entry on two lucky draws.
 
+#### Tool calls are answers too
+
+A reply that calls a tool sets `content` to `null` and puts its payload in
+`tool_calls`. Scoring that as an empty answer made the cascade escalate through
+*every* rung on a request the cheapest model had already answered correctly —
+turning a cost reducer into a cost multiplier on exactly the agent traffic a hub
+proxies most. So a well-formed tool call is scored as the complete answer it is.
+
+The text checks (length, hedging, truncation) mean nothing for a tool call, so
+they aren't applied. What is checked is the real failure mode: a missing function
+name, or **arguments that don't parse as JSON** — small models emitting plausible
+names with truncated structured output is precisely what constrained decoding
+exists to prevent, and it's the tool-call analogue of an unclosed code fence.
+A malformed call still escalates; a valid one doesn't.
+
+Tool arguments are billed output tokens even though they never appear in
+`content`, so they count toward metering and toward `bench`'s TTFT.
+
 RouteLLM and FrugalGPT both learn their scorers from training data. lmm has
 neither the data nor the dependencies for that, so it approximates them with
 lexical features and a heuristic answer verifier. The thresholds — the part you
