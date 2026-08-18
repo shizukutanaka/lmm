@@ -2261,6 +2261,334 @@ class TestPresentationSurfaces(unittest.TestCase):
     def test_version_constant_is_wired(self):
         self.assertRegex(lmm.VERSION, r"^\d+\.\d+\.\d+$")
         self.assertNotEqual(lmm.VERSION, "1.0.0")
+        # bumped for GGUF reading, verified cache and the tool-call fix
+        self.assertEqual(lmm.VERSION, "1.2.0")
+
+
+class StubBackend(object):
+    """A real OpenAI-compatible server on localhost, speaking both streamed and
+    non-streamed replies.
+
+    The hub is the product's core and had zero test coverage, because testing a
+    proxy needs something real to proxy to. This is that something — it also
+    echoes back which roles and params it received, so the tests can assert the
+    hub forwarded them rather than trusting it did.
+    """
+
+    def __init__(self, answer="The answer is 4, because 2 plus 2 equals 4."):
+        import http.server
+        import socketserver
+        import threading
+        self.seen = []
+        answer_text = answer
+        seen = self.seen
+
+        class H(http.server.BaseHTTPRequestHandler):
+            def do_POST(self):
+                n = int(self.headers.get("Content-Length", 0))
+                req = json.loads(self.rfile.read(n).decode() or "{}")
+                seen.append(req)
+                roles = ",".join(m.get("role", "?") for m in req.get("messages", []))
+                text = "%s [roles=%s max_tokens=%s]" % (
+                    answer_text, roles, req.get("max_tokens"))
+                if req.get("stream"):
+                    return self._stream(req, text)
+                self._json({
+                    "id": "chatcmpl-stub", "object": "chat.completion",
+                    "model": req.get("model"),
+                    "choices": [{"index": 0, "finish_reason": "stop",
+                                 "message": {"role": "assistant", "content": text}}],
+                    "usage": {"prompt_tokens": 100, "completion_tokens": 200},
+                })
+
+            def _stream(self, req, text):
+                self.send_response(200)
+                self.send_header("Content-Type", "text/event-stream")
+                self.end_headers()
+                base = {"id": "chatcmpl-stub", "object": "chat.completion.chunk",
+                        "created": 0, "model": req.get("model")}
+
+                def frame(o):
+                    self.wfile.write(("data: " + json.dumps(o) + "\n\n").encode())
+                    self.wfile.flush()
+                frame(dict(base, choices=[{"index": 0,
+                                           "delta": {"role": "assistant"},
+                                           "finish_reason": None}]))
+                for w in text.split(" "):
+                    frame(dict(base, choices=[{"index": 0,
+                                               "delta": {"content": w + " "},
+                                               "finish_reason": None}]))
+                frame(dict(base, choices=[{"index": 0, "delta": {},
+                                           "finish_reason": "stop"}]))
+                if (req.get("stream_options") or {}).get("include_usage"):
+                    frame(dict(base, choices=[],
+                               usage={"prompt_tokens": 100,
+                                      "completion_tokens": 200}))
+                self.wfile.write(b"data: [DONE]\n\n")
+                self.wfile.flush()
+
+            def _json(self, obj):
+                body = json.dumps(obj).encode()
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def log_message(self, *a):
+                pass
+
+        class S(socketserver.ThreadingMixIn, http.server.HTTPServer):
+            daemon_threads = True
+            allow_reuse_address = True
+
+        self.httpd = S(("127.0.0.1", 0), H)
+        self.port = self.httpd.server_address[1]
+        self.thread = threading.Thread(target=self.httpd.serve_forever, daemon=True)
+        self.thread.start()
+
+    @property
+    def base_url(self):
+        return "http://127.0.0.1:%d/v1" % self.port
+
+    def stop(self):
+        self.httpd.shutdown()
+        self.httpd.server_close()
+
+
+class HubServer(object):
+    """Run lmm's own hub in a thread, against a stub backend."""
+
+    def __init__(self, cfg, host="127.0.0.1"):
+        import threading
+        import socket
+        s = socket.socket()
+        s.bind((host, 0))
+        self.port = s.getsockname()[1]
+        s.close()
+
+
+        def run():
+            # cmd_serve_hub prints a startup banner; a test suite is not its
+            # console, and the noise buries real failures.
+            import contextlib
+            import io
+            with contextlib.redirect_stdout(io.StringIO()):
+                lmm.cmd_serve_hub(cfg, host, self.port)
+        self.thread = threading.Thread(target=run, daemon=True)
+        self.thread.start()
+        for _ in range(100):                  # wait for the listener
+            try:
+                socket.create_connection((host, self.port), timeout=0.1).close()
+                return
+            except OSError:
+                time.sleep(0.02)
+
+    def request(self, path, body=None, headers=None, method=None):
+        import urllib.request
+        import urllib.error
+        url = "http://127.0.0.1:%d%s" % (self.port, path)
+        data = json.dumps(body).encode() if body is not None else None
+        req = urllib.request.Request(url, data=data, method=method,
+                                     headers=headers or {})
+        if data:
+            req.add_header("Content-Type", "application/json")
+        try:
+            with urllib.request.urlopen(req, timeout=10) as r:
+                return r.status, r.read().decode()
+        except urllib.error.HTTPError as e:
+            return e.code, e.read().decode()
+
+
+class TestHubServer(unittest.TestCase):
+    """End-to-end through the real HTTP server. `cmd_serve_hub` is the core of
+    the product and had no test at all — every hub bug in this repo's history
+    was found by hand, one at a time."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.backend = StubBackend()
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.backend.stop()
+
+    def cfg(self, **hub):
+        return {"providers": {"stub": {"api_key": "SECRET-KEY",
+                                       "base_url": self.backend.base_url,
+                                       "model": "m", "kind": "remote",
+                                       "price": {"in": 1.0, "out": 2.0}}},
+                "hub": hub, "cache": {"enabled": False}}
+
+    def test_models_endpoint_lists_providers(self):
+        with temp_state():
+            hub = HubServer(self.cfg())
+            status, body = hub.request("/v1/models")
+        self.assertEqual(status, 200)
+        self.assertIn("stub", body)
+
+    def test_full_conversation_reaches_the_backend(self):
+        # The hub used to forward only messages[0], silently dropping the
+        # system prompt and every prior turn.
+        del self.backend.seen[:]
+        with temp_state():
+            hub = HubServer(self.cfg())
+            status, body = hub.request("/v1/chat/completions", {
+                "model": "stub", "max_tokens": 128,
+                "messages": [{"role": "system", "content": "be terse"},
+                             {"role": "user", "content": "hi"},
+                             {"role": "assistant", "content": "hello"},
+                             {"role": "user", "content": "and now?"}]})
+        self.assertEqual(status, 200)
+        self.assertIn("roles=system,user,assistant,user", body)
+        self.assertIn("max_tokens=128", body)     # passthrough params too
+
+    def test_streaming_produces_well_formed_sse(self):
+        with temp_state():
+            hub = HubServer(self.cfg())
+            status, body = hub.request("/v1/chat/completions", {
+                "model": "stub", "stream": True,
+                "messages": [{"role": "user", "content": "hi"}]})
+        self.assertEqual(status, 200)
+        self.assertTrue(body.endswith("data: [DONE]\n\n"))
+        events = [e for e in body.split("\n\n") if e.strip()]
+        self.assertGreater(len(events), 2)
+        for e in events:
+            self.assertTrue(e.startswith("data: "), e[:40])
+            payload = e[len("data: "):]
+            if payload != "[DONE]":
+                json.loads(payload)               # every event is one object
+
+    def test_a_streamed_call_is_metered(self):
+        with temp_state():
+            hub = HubServer(self.cfg())
+            hub.request("/v1/chat/completions", {
+                "model": "stub", "stream": True,
+                "messages": [{"role": "user", "content": "meter me"}]})
+            time.sleep(0.2)                       # let the finally block land
+            events = lmm.read_usage()
+        self.assertTrue(events)
+        self.assertTrue(events[0]["stream"])
+        self.assertEqual(events[0]["out"], 200)   # real usage, not estimated
+
+    def test_token_gates_every_endpoint(self):
+        with temp_state():
+            hub = HubServer(self.cfg(token="tok_abc123"))
+            no_tok = hub.request("/v1/models")
+            bad = hub.request("/v1/models",
+                              headers={"Authorization": "Bearer nope"})
+            good = hub.request("/v1/models",
+                               headers={"Authorization": "Bearer tok_abc123"})
+            post = hub.request("/v1/chat/completions", {
+                "model": "stub",
+                "messages": [{"role": "user", "content": "hi"}]})
+        self.assertEqual(no_tok[0], 401)
+        self.assertEqual(bad[0], 401)
+        self.assertEqual(good[0], 200)
+        self.assertEqual(post[0], 401)            # POST is gated too
+
+    def test_a_denial_leaks_neither_token_nor_api_key(self):
+        with temp_state():
+            hub = HubServer(self.cfg(token="tok_abc123"))
+            status, body = hub.request("/v1/models")
+        self.assertEqual(status, 401)
+        self.assertNotIn("tok_abc123", body)
+        self.assertNotIn("SECRET-KEY", body)
+
+    def test_unknown_path_is_404(self):
+        with temp_state():
+            hub = HubServer(self.cfg())
+            self.assertEqual(hub.request("/nope")[0], 404)
+
+
+class TestCommandSurfaces(unittest.TestCase):
+    """The commands where drift went unnoticed longest, because nothing here
+    was covered: a silent no-op `hide`, a `cli` that exited 2, a GUI cost label
+    showing prose."""
+
+    def test_hide_returns_advice_off_windows_without_raising(self):
+        msg = lmm.hide_taskbar("claude")
+        self.assertIsInstance(msg, str)
+        self.assertTrue(msg.strip())
+
+    def test_hide_reports_an_unknown_runtime(self):
+        self.assertIn("unknown", lmm.hide_taskbar("definitely-not-a-runtime").lower())
+
+    def test_dash_writes_html_a_browser_could_open(self):
+        import io
+        import contextlib
+        saved_disc, saved_open = lmm.discover, lmm.webbrowser.open
+        lmm.discover = lambda cfg, with_models=True: [
+            {"name": "Ollama", "key": "ollama", "type": "local", "paid": False,
+             "running": True, "serving": True, "procs": 1, "models": ["m"],
+             "endpoint": "http://localhost:11434/v1", "installed": True}]
+        lmm.webbrowser.open = lambda *a, **k: True
+        try:
+            with temp_state():
+                d = tempfile.mkdtemp(prefix="lmm-dash-")
+                saved_home = lmm.HOME
+                lmm.HOME = d
+                try:
+                    with contextlib.redirect_stdout(io.StringIO()):
+                        lmm.cmd_dash({})
+                    path = os.path.join(d, ".lmm_dashboard.html")
+                    self.assertTrue(os.path.isfile(path))
+                    with open(path, encoding="utf-8") as fh:
+                        html = fh.read()
+                finally:
+                    lmm.HOME = saved_home
+        finally:
+            lmm.discover, lmm.webbrowser.open = saved_disc, saved_open
+        self.assertTrue(html.startswith("<!doctype"))
+        self.assertIn("<th>Serving</th>", html)
+        self.assertIn("Ollama", html)
+
+    def test_serve_builds_an_ollama_pull(self):
+        import io
+        import contextlib
+        ran = []
+        saved = lmm.run
+        lmm.run = lambda cmd: ran.append(cmd) or type(
+            "R", (), {"stdout": "ok", "stderr": "", "returncode": 0})()
+        try:
+            with contextlib.redirect_stdout(io.StringIO()):
+                lmm.cmd_serve("qwen2.5-coder:7b")
+        finally:
+            lmm.run = saved
+        self.assertIn("ollama pull qwen2.5-coder:7b", ran)
+
+    def test_serve_without_a_model_prints_usage_and_runs_nothing(self):
+        import io
+        import contextlib
+        ran = []
+        saved = lmm.run
+        lmm.run = lambda cmd: ran.append(cmd)
+        buf = io.StringIO()
+        try:
+            with contextlib.redirect_stdout(buf):
+                lmm.cmd_serve(None)
+        finally:
+            lmm.run = saved
+        self.assertEqual(ran, [])
+        self.assertIn("usage:", buf.getvalue())
+
+    def test_autostart_writes_nothing_off_windows(self):
+        # This command registers a login service. The test must confirm the
+        # non-Windows path is inert WITHOUT letting it install anything.
+        import io
+        import contextlib
+        ran = []
+        saved_run, saved_os = lmm.run, os.name
+        lmm.run = lambda cmd: ran.append(cmd)
+        buf = io.StringIO()
+        try:
+            with contextlib.redirect_stdout(buf):
+                lmm.cmd_autostart()
+        finally:
+            lmm.run = saved_run
+        if saved_os != "nt":
+            self.assertEqual(ran, [], "autostart shelled out on a non-Windows host")
+            self.assertTrue(buf.getvalue().strip())
 
 
 class temp_state(object):

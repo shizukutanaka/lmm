@@ -1,26 +1,34 @@
 # lmm — Local/remote Model Manager
 
 
-> One file. Zero dependencies. Every LLM app on your machine, in one place —
-> and it never clutters your taskbar.
+> One file. Zero dependencies. One endpoint in front of every LLM you use —
+> and a bill you can actually see.
 
 `lmm` is a tiny, cross-platform manager for **all** your LLM runtimes: local
 (Ollama, LM Studio, Jan, GPT4All, KoboldCPP, vLLM, llama.cpp, Open WebUI) and
 remote/desktop (Claude, ChatGPT, Cursor, Perplexity, AnythingLLM, Chatbox,
-Msty, Devin/Cua). It discovers what's running, shows live status + GPU + your
-real Anthropic spend, recommends local-vs-remote routing, and — the part that
-solves the actual pain — **keeps LLM app windows off your taskbar**
-automatically.
+Msty, Devin/Cua). It finds what's running, tells you which models actually fit
+in your GPU, and puts one OpenAI-compatible endpoint in front of all of them —
+caching, routing and cascading each request to the cheapest model that can
+handle it, and metering every call so the savings are measured rather than
+claimed. On Windows it also keeps those apps' windows off your taskbar.
 
 ## Why this exists (first principles)
 
-The real problem isn't "I need an LLM manager app." It's:
-1. **Multiple LLM apps each grab a taskbar button**, and you lose track of what
-   is actually running.
-2. **You shouldn't have to remember commands.** State must be *visible*
-   (Nielsen heuristic #1 — *Visibility of System Status*).
-3. **The fix should be a system, not a band-aid.** So `lmm` can auto-hide new
-   LLM windows the instant they launch — no clicking required.
+Running LLMs locally and remotely at the same time creates three problems, and
+`lmm` is organised around them:
+
+1. **You cannot see what you are spending.** Cloud spend arrives a month late
+   and local inference looks free until it isn't your GPU. So every call `lmm`
+   makes is metered to a file you can `cat`, and anything it could not measure
+   is labelled as an estimate rather than blended into a total.
+2. **The strongest model is the wrong default.** Most prompts do not need it.
+   `lmm` routes on a cost threshold, runs cheap models first and escalates only
+   on a bad answer, and reuses answers it already paid for.
+3. **State must be visible** (Nielsen heuristic #1 — *Visibility of System
+   Status*), so you should not have to remember commands to see it. Hence the
+   dashboard, and — on Windows, where each LLM app grabs its own taskbar
+   button — the ability to keep them out of your way automatically.
 
 ## Install
 
@@ -366,14 +374,39 @@ or `./lmm.config.json`) can add runtimes, override pricing, change routing
 keywords, or configure the hub. See `lmm examples` for the full shape —
 `config.example.json` is generated from it, so the two never drift.
 
+There are 35 settings in total. **You need five of them**, and only if you
+want the hub — everything else has a working default:
+
 | Key | Purpose |
 |-----|---------|
-| `providers` | Your backends. Optional `price` (a rate-table key or `{in,out}`) makes the cost numbers exact |
-| `ask_order` | Provider priority. Set it and lmm follows it exactly |
-| `route_threshold` | RouteLLM's `α`, default `0.5`. `null` disables auto-routing |
-| `cascade` | `{enabled, rungs, threshold, max_rungs, judge}` — omit `rungs` and they're built cheapest-first automatically |
-| `cache` | `{enabled, semantic, similarity, ttl_hours, max_entries, embed_model, max_temp}` |
-| `pricing` / `route` / `usage` / `extra_runtimes` | As before |
+| `providers` | Your backends. Without this, `lmm ask` still works against a running Ollama |
+| `ask_order` | Provider priority. Set it and lmm follows it exactly, disabling auto-routing |
+| `route_threshold` | RouteLLM's `α`, default `0.5`. Lower sends more to cheap models |
+| `cascade.enabled` | Run cheap models first and escalate only on a bad answer |
+| `cache.enabled` | Reuse answers you already paid for (on by default) |
+
+<details>
+<summary><b>The other 30 — reach for these only when you need them</b></summary>
+
+| Key | Purpose |
+|-----|---------|
+| `providers[].price` | A rate-table key (`"deepseek-chat"`) or `{in, out}`. Makes cost numbers exact instead of matched by model name |
+| `cascade.rungs` | Explicit rung order. Omit and they are built cheapest-first automatically |
+| `cascade.threshold` / `max_rungs` | Accept score and the ceiling on calls per prompt |
+| `cascade.judge` | A provider name to grade answers, on top of the built-in heuristic |
+| `cache.semantic` | Fuzzy matching via local embeddings. Off by default — see the verified-mode section for why |
+| `cache.max_error_rate` | Switches the semantic tier to vCache's per-entry learned thresholds |
+| `cache.confidence` / `min_observations` / `answer_match` | How much evidence certifies an entry |
+| `cache.similarity` / `ttl_hours` / `max_entries` / `embed_model` / `max_temp` | Static-threshold tuning, expiry and size |
+| `hub.token` / `allow_remote` | Required to bind beyond loopback — see Hub security |
+| `retry` | `{attempts, base_ms, cap_ms}` full-jitter backoff per provider |
+| `breaker` | `{enabled, threshold, cooldown_s}` circuit breaker for dead providers |
+| `pricing` | Override or add rate-table entries |
+| `route` | `{private, heavy}` keyword lists. `private` pins a prompt to local providers |
+| `usage` | Hand-entered cloud spend, added on top of what lmm measures itself |
+| `extra_runtimes` | Your own runtimes for `discover` and `stop` |
+
+</details>
 
 ### Failing over well
 

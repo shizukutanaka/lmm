@@ -68,7 +68,7 @@ import html
 import webbrowser
 import ctypes
 
-VERSION = "1.1.0"
+VERSION = "1.2.0"
 
 HOME = os.path.expanduser("~")
 
