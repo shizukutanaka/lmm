@@ -2381,6 +2381,129 @@ class TestCliSmoke(unittest.TestCase):
             shutil.rmtree(d, ignore_errors=True)
 
 
+class TestUsageCompaction(unittest.TestCase):
+    """usage.jsonl is append-only and every reader parses the whole file — the
+    GUI on a 5-second timer. Unbounded, the metering that exists to SHOW spend
+    makes showing spend linearly slower. Compaction folds old events into one
+    rollup line whose totals must be EXACT, or `lmm cost` changes its answer
+    just because the log got tidied."""
+
+    def seed(self, n=60):
+        import random
+        rng = random.Random(7)
+        for _ in range(n):
+            r = rng.random()
+            if r < 0.2:
+                lmm.log_usage({"provider": "cache", "kind": "local", "in": 0,
+                               "out": 0, "usd": 0.0,
+                               "cache": "exact" if r < 0.12 else "semantic",
+                               "saved_usd": 0.001})
+            elif r < 0.3:
+                lmm.log_usage({"provider": "cache", "kind": "local", "in": 0,
+                               "out": 0, "usd": 0.0, "cache": "near-miss",
+                               "similarity": 0.9})
+            else:
+                kind = "local" if r < 0.5 else "remote"
+                lmm.log_usage({"provider": "p-" + kind, "kind": kind,
+                               "in": 100, "out": 50,
+                               "usd": 0.0 if kind == "local" else 0.002,
+                               "cache": "miss", "stream": True, "ttft_ms": 40,
+                               "estimated": r < 0.4, "partial": r < 0.35})
+
+    def totals(self, st):
+        return (round(st["measured"], 9), st["calls"], st["hits"],
+                round(st["saved_cache"], 9), round(st["est_usd"], 9),
+                round(st["partial_usd"], 9), st["partial_calls"],
+                st["local_calls"], st["local_tokens"],
+                {n: (a["calls"], a["in"], a["out"], round(a["usd"], 9))
+                 for n, a in sorted(st["providers"].items())})
+
+    def test_totals_are_identical_across_compaction(self):
+        with temp_state():
+            self.seed()
+            before = self.totals(lmm.hub_cost_stats())
+            self.assertTrue(lmm.usage_compact(keep=10))
+            after = self.totals(lmm.hub_cost_stats())
+        self.assertEqual(before, after)
+
+    def test_the_tail_stays_raw_and_the_file_shrinks_to_keep_plus_one(self):
+        with temp_state():
+            self.seed()
+            lmm.usage_compact(keep=10)
+            with open(lmm.USAGE_LOG, encoding="utf-8") as fh:
+                lines = [json.loads(l) for l in fh if l.strip()]
+        self.assertEqual(len(lines), 11)              # rollup + 10 raw
+        self.assertTrue(lines[0]["rollup"])
+        self.assertTrue(all(not l.get("rollup") for l in lines[1:]))
+
+    def test_recompaction_converges_to_one_rollup_with_the_same_totals(self):
+        with temp_state():
+            self.seed()
+            before = self.totals(lmm.hub_cost_stats())
+            lmm.usage_compact(keep=20)
+            lmm.usage_compact(keep=5)
+            after = self.totals(lmm.hub_cost_stats())
+            with open(lmm.USAGE_LOG, encoding="utf-8") as fh:
+                rollups = [l for l in fh if json.loads(l).get("rollup")]
+            with open(lmm.USAGE_LOG, encoding="utf-8") as fh:
+                r = json.loads(next(fh))
+        self.assertEqual(before, after)
+        self.assertEqual(len(rollups), 1)
+        # and the fold count survives the merge
+        self.assertEqual(r["events"] + 5, 60)
+
+    def test_ttft_series_is_tail_only_by_design(self):
+        # Percentiles cannot be merged, so the rollup must not pretend to
+        # carry them; the STREAM TTFT line reads from the raw tail.
+        with temp_state():
+            self.seed()
+            lmm.usage_compact(keep=10)
+            st = lmm.hub_cost_stats()
+        self.assertLessEqual(len(st["ttfts"]), 10)
+
+    def test_cmd_cache_counts_hits_through_rollups(self):
+        import io
+        import contextlib
+        with temp_state():
+            self.seed()
+            before = io.StringIO()
+            with contextlib.redirect_stdout(before):
+                lmm.cmd_cache({})
+            lmm.usage_compact(keep=5)
+            after = io.StringIO()
+            with contextlib.redirect_stdout(after):
+                lmm.cmd_cache({})
+        line_b = [l for l in before.getvalue().splitlines() if "hits:" in l][0]
+        line_a = [l for l in after.getvalue().splitlines() if "hits:" in l][0]
+        self.assertEqual(line_b, line_a)
+
+    def test_log_usage_compacts_automatically_past_the_cap(self):
+        with temp_state():
+            saved = lmm.USAGE_MAX_BYTES
+            lmm.USAGE_MAX_BYTES = 2000        # tiny cap for the test
+            try:
+                self.seed(200)
+                with open(lmm.USAGE_LOG, encoding="utf-8") as fh:
+                    lines = fh.readlines()
+                self.assertLess(os.path.getsize(lmm.USAGE_LOG), 500_000)
+                self.assertTrue(any(json.loads(l).get("rollup") for l in lines))
+            finally:
+                lmm.USAGE_MAX_BYTES = saved
+
+    def test_nothing_to_fold_is_a_clean_no(self):
+        with temp_state():
+            lmm.log_usage({"provider": "p", "kind": "remote", "in": 1, "out": 1,
+                           "usd": 0.1, "cache": "miss"})
+            self.assertFalse(lmm.usage_compact(keep=10))
+
+    def test_report_names_the_rollup(self):
+        with temp_state():
+            self.seed()
+            lmm.usage_compact(keep=5)
+            block = "\n".join(lmm.hub_cost_block({}, lmm.merged_pricing({})))
+        self.assertIn("includes a rollup of older events", block)
+
+
 class TestGuiLogic(unittest.TestCase):
     """tkinter is not installed everywhere, and that was the standing excuse
     for this layer having no coverage while it drifted. The logic never needed

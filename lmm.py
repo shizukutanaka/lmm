@@ -77,6 +77,13 @@ HOME = os.path.expanduser("~")
 # never need a database.
 LMM_DIR   = os.path.join(HOME, ".lmm")
 USAGE_LOG = os.path.join(LMM_DIR, "usage.jsonl")
+# The usage log is append-only, and every reader parses the whole file — the
+# GUI does so on a 5-second timer. Without a cap, a long-lived hub makes the
+# tool that exists to SHOW spend linearly slower the more it is used. Past
+# this size the old events are folded into one exact-total rollup line and the
+# recent tail stays raw. ~4MB is roughly 20k events.
+USAGE_MAX_BYTES = 4_000_000
+USAGE_KEEP_TAIL = 2000
 CACHE_LOG = os.path.join(LMM_DIR, "cache.jsonl")
 
 # ---- Public pricing (USD per 1M tokens) — approximate, editable ----
@@ -1671,8 +1678,65 @@ def log_usage(event):
         event.setdefault("ts", datetime.datetime.now().isoformat(timespec="seconds"))
         with open(USAGE_LOG, "a", encoding="utf-8") as fh:
             fh.write(json.dumps(event, ensure_ascii=False) + "\n")
+        # O(1) size check per append; the O(n) fold runs only past the cap,
+        # so its cost is amortised over the ~20k appends that grew the file.
+        if os.path.getsize(USAGE_LOG) > USAGE_MAX_BYTES:
+            usage_compact()
     except Exception:
         pass
+
+
+def usage_compact(keep=None):
+    """Fold everything but the newest `keep` events into one rollup line.
+
+    The rollup preserves the TOTALS exactly — spend, tokens, calls, hits,
+    savings, and the estimated/partial breakdowns — so `lmm cost` reports the
+    same numbers before and after. What it gives up is per-event detail for
+    old events, which no reader uses: TTFT percentiles and near-miss
+    similarities are computed from the raw tail, where recency is the point.
+    """
+    keep = USAGE_KEEP_TAIL if keep is None else keep
+    events = read_usage()
+    if len(events) <= keep + 1:
+        # Fewer events than the tail we'd keep, yet the caller decided the
+        # file needs folding (oversized events can blow the byte cap long
+        # before the event cap). Shrink the tail rather than declining —
+        # declining here would make every subsequent append re-read the whole
+        # file just to conclude "nothing to do" again.
+        keep = len(events) // 2
+    if len(events) - keep < 2:
+        return False
+    old_evs, tail = events[:-keep], events[-keep:]
+    st = hub_cost_stats(events=old_evs)
+    near = sum(1 for e in old_evs if e.get("cache") == "near-miss")
+    near += sum((e.get("hits") or {}).get("near-miss", 0)
+                for e in old_evs if e.get("rollup"))
+    n_folded = sum(e.get("events", 1) if e.get("rollup") else 1 for e in old_evs)
+    first = next((e for e in old_evs if e.get("ts") or e.get("from_ts")), {})
+    rollup = {"rollup": True,
+              "ts": old_evs[-1].get("ts", ""),
+              "from_ts": first.get("from_ts") or first.get("ts", ""),
+              "events": n_folded,
+              "providers": st["providers"],
+              "hits": {"exact": st["hits"]["exact"],
+                       "semantic": st["hits"]["semantic"],
+                       "near-miss": near},
+              "saved_usd": round(st["saved_cache"], 6),
+              "est_usd": round(st["est_usd"], 6),
+              "partial_usd": round(st["partial_usd"], 6),
+              "partial_calls": st["partial_calls"],
+              "local_calls": st["local_calls"],
+              "local_tokens": st["local_tokens"]}
+    try:
+        tmp = USAGE_LOG + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as fh:
+            fh.write(json.dumps(rollup, ensure_ascii=False) + "\n")
+            for e in tail:
+                fh.write(json.dumps(e, ensure_ascii=False) + "\n")
+        os.replace(tmp, USAGE_LOG)
+        return True
+    except OSError:
+        return False
 
 
 def read_usage(days=None):
@@ -1856,6 +1920,31 @@ def hub_cost_stats(days=None, events=None):
           "local_calls": 0, "local_tokens": 0, "est_usd": 0.0, "partial_usd": 0.0,
           "partial_calls": 0, "ttfts": [], "measured": 0.0, "calls": 0}
     for ev in events or []:
+        if ev.get("rollup"):
+            # An exact-total fold of older events (see usage_compact). Totals
+            # merge losslessly; the TTFT series deliberately does not — it
+            # cannot be reconstructed from percentiles, so it stays tail-only.
+            for name, a in (ev.get("providers") or {}).items():
+                t = st["providers"].setdefault(
+                    name, {"calls": 0, "in": 0, "out": 0, "usd": 0.0,
+                           "kind": a.get("kind", "remote")})
+                t["calls"] += a.get("calls", 0)
+                t["in"] += a.get("in", 0)
+                t["out"] += a.get("out", 0)
+                t["usd"] += a.get("usd", 0.0)
+                st["measured"] += a.get("usd", 0.0)
+                st["calls"] += a.get("calls", 0)
+            rh = ev.get("hits") or {}
+            st["hits"]["exact"] += rh.get("exact", 0)
+            st["hits"]["semantic"] += rh.get("semantic", 0)
+            st["saved_cache"] += ev.get("saved_usd", 0.0) or 0.0
+            st["est_usd"] += ev.get("est_usd", 0.0) or 0.0
+            st["partial_usd"] += ev.get("partial_usd", 0.0) or 0.0
+            st["partial_calls"] += ev.get("partial_calls", 0) or 0
+            st["local_calls"] += ev.get("local_calls", 0) or 0
+            st["local_tokens"] += ev.get("local_tokens", 0) or 0
+            st["rollups"] = st.get("rollups", 0) + 1
+            continue
         hit = ev.get("cache")
         if hit in st["hits"]:
             st["hits"][hit] += 1
@@ -1937,7 +2026,9 @@ def hub_cost_block(cfg, pricing, days=None, claude_total=0.0):
     if events and (by_prov or hits["exact"] or hits["semantic"]):
         out.append("")
         out.append("=" * 64)
-        out.append(f"HUB MEASURED USAGE ({window}, from {USAGE_LOG})")
+        rolled = st.get("rollups", 0)
+        note = " — includes a rollup of older events" if rolled else ""
+        out.append(f"HUB MEASURED USAGE ({window}, from {USAGE_LOG}{note})")
         out.append("-" * 64)
         for name, a in sorted(by_prov.items(), key=lambda x: -x[1]["usd"]):
             tag = "free" if a["kind"] == "local" else "paid"
@@ -1959,7 +2050,7 @@ def hub_cost_block(cfg, pricing, days=None, claude_total=0.0):
         if ttfts:
             out.append(f"  STREAM TTFT          p50 {median(ttfts):.0f}ms  "
                        f"p90 {percentile(ttfts, 90):.0f}ms  "
-                       f"over {len(ttfts)} streamed call(s)")
+                       f"over {len(ttfts)} recent streamed call(s)")
 
         # The savings side of the ledger — the whole point of the cascade,
         # the router and the cache.
@@ -4187,6 +4278,10 @@ def cmd_cache(cfg=None, clear=False):
     hits = {"exact": 0, "semantic": 0, "near-miss": 0}
     sims = []
     for ev in read_usage():
+        if ev.get("rollup"):
+            for k in hits:
+                hits[k] += (ev.get("hits") or {}).get(k, 0)
+            continue                     # sims stay tail-only: recency matters
         h = ev.get("cache")
         if h in hits:
             hits[h] += 1

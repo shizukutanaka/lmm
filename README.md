@@ -473,7 +473,12 @@ Two append-only JSONL files under `~/.lmm/`, both plain text you can `cat`:
 
 - `usage.jsonl` — one line per call: provider, model, tokens, USD, cache
   status, cascade rung. This is what `lmm cost` reads, and what makes
-  `--days N` meaningful.
+  `--days N` meaningful. Past ~4MB the oldest events are folded into a single
+  rollup line whose totals are preserved exactly — so the file stays small
+  enough to parse on the GUI's refresh timer, and `lmm cost` reports the same
+  numbers before and after. Only per-event detail ages out: TTFT percentiles
+  and near-miss similarities always come from the recent raw tail, where
+  recency is the point.
 - `cache.jsonl` — cached answers (and embeddings, if the semantic tier is on).
   Drop it any time with `lmm cache --clear`.
 
