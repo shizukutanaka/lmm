@@ -498,6 +498,10 @@ running hub's compaction — can still, rarely, drop a statistics line; a
 portable cross-process file lock does not exist in the standard library, and
 that trade is taken openly rather than papered over.
 
+Version history lives in [CHANGELOG.md](CHANGELOG.md) — useful because
+"upgrading" a single-file tool is just re-downloading `lmm.py`, and the log is
+how you tell what a newer copy changed.
+
 ## Tests & CI
 
 ```bash
