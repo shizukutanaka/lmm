@@ -63,6 +63,7 @@ import hashlib
 import struct
 import argparse
 import subprocess
+import threading
 import datetime
 import html
 import webbrowser
@@ -84,6 +85,16 @@ USAGE_LOG = os.path.join(LMM_DIR, "usage.jsonl")
 # recent tail stays raw. ~4MB is roughly 20k events.
 USAGE_MAX_BYTES = 4_000_000
 USAGE_KEEP_TAIL = 2000
+
+# The hub serves requests on concurrent threads (ThreadingMixIn), and both
+# state files are maintained by read-modify-replace rewrites (compaction,
+# cache pruning, vCache observations). Unlocked, an append racing a rewrite
+# is simply erased by the os.replace — measured at 21.9% of all metering
+# events lost under 8 concurrent writers. Writers serialise on these;
+# readers stay lock-free (os.replace is atomic, so they never see a torn
+# file, only a slightly stale one).
+_USAGE_LOCK = threading.Lock()
+_CACHE_LOCK = threading.Lock()
 CACHE_LOG = os.path.join(LMM_DIR, "cache.jsonl")
 
 # ---- Public pricing (USD per 1M tokens) — approximate, editable ----
@@ -1673,21 +1684,33 @@ def log_usage(event):
     """Append one metering event to ~/.lmm/usage.jsonl. Never raises: telemetry
     must not be able to break the call it is measuring."""
     try:
-        os.makedirs(LMM_DIR, exist_ok=True)
-        event = dict(event)
-        event.setdefault("ts", datetime.datetime.now().isoformat(timespec="seconds"))
-        with open(USAGE_LOG, "a", encoding="utf-8") as fh:
-            fh.write(json.dumps(event, ensure_ascii=False) + "\n")
-        # O(1) size check per append; the O(n) fold runs only past the cap,
-        # so its cost is amortised over the ~20k appends that grew the file.
-        if os.path.getsize(USAGE_LOG) > USAGE_MAX_BYTES:
-            usage_compact()
+        with _USAGE_LOCK:
+            os.makedirs(LMM_DIR, exist_ok=True)
+            event = dict(event)
+            event.setdefault("ts",
+                             datetime.datetime.now().isoformat(timespec="seconds"))
+            with open(USAGE_LOG, "a", encoding="utf-8") as fh:
+                fh.write(json.dumps(event, ensure_ascii=False) + "\n")
+            # O(1) size check per append; the O(n) fold runs only past the
+            # cap, so its cost is amortised over the ~20k appends that grew
+            # the file. Inside the lock: an append racing the fold's
+            # os.replace was how one in five events silently vanished.
+            if os.path.getsize(USAGE_LOG) > USAGE_MAX_BYTES:
+                _usage_compact_locked()
     except Exception:
         pass
 
 
 def usage_compact(keep=None):
+    """Public entry: see _usage_compact_locked. Takes the writer lock so a
+    manual compaction cannot race the hub's own appends."""
+    with _USAGE_LOCK:
+        return _usage_compact_locked(keep)
+
+
+def _usage_compact_locked(keep=None):
     """Fold everything but the newest `keep` events into one rollup line.
+    Caller must hold _USAGE_LOCK.
 
     The rollup preserves the TOTALS exactly — spend, tokens, calls, hits,
     savings, and the estimated/partial breakdowns — so `lmm cost` reports the
@@ -3561,6 +3584,11 @@ def record_observation(cfg, key, sim, correct):
     capped at cache.max_entries, so this stays a small rewrite.
     """
     conf = merged_cache(cfg)
+    with _CACHE_LOCK:
+        return _record_observation_locked(conf, key, sim, correct)
+
+
+def _record_observation_locked(conf, key, sim, correct):
     entries = cache_entries(conf)
     if not entries:
         return
@@ -3678,16 +3706,25 @@ def cache_store(cfg, messages, model, result, usd=0.0, temperature=None):
         if emb:
             entry["emb"] = emb
     try:
-        os.makedirs(LMM_DIR, exist_ok=True)
-        with open(CACHE_LOG, "a", encoding="utf-8") as fh:
-            fh.write(json.dumps(entry, ensure_ascii=False) + "\n")
+        with _CACHE_LOCK:
+            os.makedirs(LMM_DIR, exist_ok=True)
+            with open(CACHE_LOG, "a", encoding="utf-8") as fh:
+                fh.write(json.dumps(entry, ensure_ascii=False) + "\n")
+            _cache_prune_locked(conf)
     except Exception:
         return
-    cache_prune(conf)
 
 
 def cache_prune(conf):
-    """Rewrite the log when it outgrows max_entries, keeping the newest."""
+    """Public entry — takes the writer lock. See _cache_prune_locked."""
+    with _CACHE_LOCK:
+        _cache_prune_locked(conf)
+
+
+def _cache_prune_locked(conf):
+    """Rewrite the log when it outgrows max_entries, keeping the newest.
+    Caller must hold _CACHE_LOCK: this is a read-modify-replace, and an append
+    landing between the read and the os.replace would be erased."""
     cap = int(conf.get("max_entries", 2000))
     try:
         entries = cache_entries(conf)

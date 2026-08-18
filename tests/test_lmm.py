@@ -2381,6 +2381,75 @@ class TestCliSmoke(unittest.TestCase):
             shutil.rmtree(d, ignore_errors=True)
 
 
+class TestConcurrency(unittest.TestCase):
+    """The hub serves requests on concurrent threads, and both state files are
+    maintained by read-modify-replace rewrites. Unlocked, an append racing a
+    rewrite is erased by the os.replace — measured at 21.9% of all metering
+    events lost under 8 writers before the locks went in. A tool that sells
+    measurement must not lose a fifth of its measurements under load."""
+
+    THREADS, PER = 8, 250
+
+    def test_no_metering_event_is_lost_under_concurrent_compaction(self):
+        import threading
+        with temp_state():
+            saved = lmm.USAGE_MAX_BYTES
+            lmm.USAGE_MAX_BYTES = 4000        # force frequent compaction
+            try:
+                def worker(t):
+                    for _ in range(self.PER):
+                        lmm.log_usage({"provider": "p%d" % t, "kind": "remote",
+                                       "in": 10, "out": 10, "usd": 0.001,
+                                       "cache": "miss"})
+                ts = [threading.Thread(target=worker, args=(t,))
+                      for t in range(self.THREADS)]
+                for t in ts:
+                    t.start()
+                for t in ts:
+                    t.join()
+                st = lmm.hub_cost_stats()
+            finally:
+                lmm.USAGE_MAX_BYTES = saved
+        expected = self.THREADS * self.PER
+        self.assertEqual(st["calls"], expected)
+        self.assertAlmostEqual(st["measured"], expected * 0.001, places=9)
+
+    def test_no_cache_entry_is_lost_to_a_concurrent_prune(self):
+        import threading
+        with temp_state():
+            def worker(t):
+                for i in range(40):
+                    msgs = [{"role": "user", "content": "q-%d-%d" % (t, i)}]
+                    lmm.cache_store({}, msgs, "m", {"ok": 1}, temperature=0.0)
+            ts = [threading.Thread(target=worker, args=(t,)) for t in range(8)]
+            for t in ts:
+                t.start()
+            for t in ts:
+                t.join()
+            n = len(lmm.cache_entries(lmm.DEFAULT_CACHE))
+        self.assertEqual(n, 320)
+
+    def test_concurrent_observations_all_land(self):
+        # record_observation is a read-modify-replace of the whole cache file;
+        # two racing observers used to overwrite each other's labels — the
+        # evidence the verified cache certifies entries on.
+        import threading
+        with temp_state():
+            msgs = [{"role": "user", "content": "q"}]
+            lmm.cache_store({}, msgs, "m", {"ok": 1}, temperature=0.0)
+            key = lmm.cache_key(msgs, "m")
+
+            def observe(i):
+                lmm.record_observation({}, key, 0.9, i % 2 == 0)
+            ts = [threading.Thread(target=observe, args=(i,)) for i in range(30)]
+            for t in ts:
+                t.start()
+            for t in ts:
+                t.join()
+            entry = lmm.cache_entries(lmm.DEFAULT_CACHE)[0]
+        self.assertEqual(len(entry["obs"]), 30)
+
+
 class TestUsageCompaction(unittest.TestCase):
     """usage.jsonl is append-only and every reader parses the whole file — the
     GUI on a 5-second timer. Unbounded, the metering that exists to SHOW spend

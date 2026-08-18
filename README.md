@@ -485,6 +485,13 @@ Two append-only JSONL files under `~/.lmm/`, both plain text you can `cat`:
 Still no secrets: API keys live in your config, are used, and are never copied
 into either file.
 
+Writers to both files are serialised within a process (the hub's concurrent
+request threads cannot lose each other's events to a compaction or prune). Two
+*separate* lmm processes writing at the same instant — say `lmm ask` racing a
+running hub's compaction — can still, rarely, drop a statistics line; a
+portable cross-process file lock does not exist in the standard library, and
+that trade is taken openly rather than papered over.
+
 ## Tests & CI
 
 ```bash
