@@ -1806,8 +1806,15 @@ def cost_report(cfg, days=30):
     if not data or not data.get("by_family"):
         out = [f"No Claude session logs found at {CLAUDE_PROJECTS} ({window})"]
         return "\n".join(out + hub_cost_block(cfg, pricing, days))
-    out = [f"Anthropic measured usage ({window}, {data['total_sessions']} sessions)",
-           "-" * 64]
+    out = [f"Anthropic measured usage ({window}, {data['total_sessions']} sessions)"]
+    if days:
+        # The two halves of this report filter time differently, and the reader
+        # cannot tell from the numbers. Session logs carry no single reliable
+        # timestamp, so a whole session counts by when it last ran; hub calls
+        # are timestamped individually. Say so where the numbers are.
+        out.append("(sessions counted by last-run time; hub calls below are "
+                   "timestamped per call)")
+    out.append("-" * 64)
     for fam, a in sorted(data["by_family"].items(),
                          key=lambda x: -(x[1]["in"] + x[1]["out"])):
         p = pricing.get(fam, pricing["default"])
