@@ -2791,16 +2791,13 @@ class HubServer(object):
         s.bind((host, 0))
         self.port = s.getsockname()[1]
         s.close()
-
-
-        def run():
-            # cmd_serve_hub prints a startup banner; a test suite is not its
-            # console, and the noise buries real failures.
-            import contextlib
-            import io
-            with contextlib.redirect_stdout(io.StringIO()):
-                lmm.cmd_serve_hub(cfg, host, self.port)
-        self.thread = threading.Thread(target=run, daemon=True)
+        # quiet=True, NOT redirect_stdout: contextlib.redirect_stdout swaps
+        # sys.stdout for the WHOLE PROCESS, and this thread never exits — the
+        # fixture was silently swallowing every print in the interpreter for
+        # the rest of the run.
+        self.thread = threading.Thread(
+            target=lmm.cmd_serve_hub, args=(cfg, host, self.port),
+            kwargs={"quiet": True}, daemon=True)
         self.thread.start()
         for _ in range(100):                  # wait for the listener
             try:
@@ -2823,6 +2820,97 @@ class HubServer(object):
                 return r.status, r.read().decode()
         except urllib.error.HTTPError as e:
             return e.code, e.read().decode()
+
+
+try:
+    import openai as _openai
+    HAS_OPENAI = True
+except ImportError:
+    HAS_OPENAI = False
+
+
+@unittest.skipUnless(HAS_OPENAI, "openai SDK not installed — the suite stays "
+                     "zero-dependency; this class runs only where the real "
+                     "client library happens to be available")
+class TestOpenAISdkCompat(unittest.TestCase):
+    """The README's core claim is "point your apps at the hub". Apps do not
+    speak hand-rolled curl — they speak the OpenAI client library, which has
+    its own strictness about SSE framing, [DONE], and the usage chunk's empty
+    `choices`. Until the real SDK had run against the hub, that claim was
+    unproven."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.backend = StubBackend()
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.backend.stop()
+
+    def cfg(self, **hub):
+        return {"providers": {"stub": {"api_key": "k",
+                                       "base_url": self.backend.base_url,
+                                       "model": "m", "kind": "remote"}},
+                "hub": hub, "cache": {"enabled": False}}
+
+    def client(self, hub, api_key="dummy"):
+        return _openai.OpenAI(base_url="http://127.0.0.1:%d/v1" % hub.port,
+                              api_key=api_key)
+
+    def test_non_streaming_roundtrip(self):
+        with temp_state():
+            hub = HubServer(self.cfg())
+            r = self.client(hub).chat.completions.create(
+                model="stub", max_tokens=64,
+                messages=[{"role": "system", "content": "be terse"},
+                          {"role": "user", "content": "hi"}])
+        self.assertIn("roles=system,user", r.choices[0].message.content)
+        self.assertEqual(r.usage.completion_tokens, 200)
+
+    def test_streaming_assembles_through_the_sdk(self):
+        # The SDK yields ZERO chunks, with no error, if the blank-line
+        # framing is wrong — the silent failure mode this class exists for.
+        with temp_state():
+            hub = HubServer(self.cfg())
+            parts = []
+            for chunk in self.client(hub).chat.completions.create(
+                    model="stub", stream=True,
+                    messages=[{"role": "user", "content": "count"}]):
+                if chunk.choices and chunk.choices[0].delta.content:
+                    parts.append(chunk.choices[0].delta.content)
+        self.assertGreater(len(parts), 3)
+        self.assertIn("The answer is 4", "".join(parts))
+
+    def test_stream_usage_chunk_parses_in_the_sdk(self):
+        # That final chunk carries choices: [] — stricter parsers reject it,
+        # so it must only appear when the client opted in, and must parse.
+        with temp_state():
+            hub = HubServer(self.cfg())
+            usage = None
+            for chunk in self.client(hub).chat.completions.create(
+                    model="stub", stream=True,
+                    stream_options={"include_usage": True},
+                    messages=[{"role": "user", "content": "count"}]):
+                if chunk.usage:
+                    usage = chunk.usage
+        self.assertIsNotNone(usage)
+        self.assertEqual(usage.completion_tokens, 200)
+
+    def test_models_list_through_the_sdk(self):
+        with temp_state():
+            hub = HubServer(self.cfg())
+            ids = [m.id for m in self.client(hub).models.list()]
+        self.assertEqual(ids, ["stub"])
+
+    def test_wrong_token_is_an_authentication_error(self):
+        with temp_state():
+            hub = HubServer(self.cfg(token="tok_real"))
+            with self.assertRaises(_openai.AuthenticationError):
+                self.client(hub, api_key="wrong").chat.completions.create(
+                    model="stub", messages=[{"role": "user", "content": "x"}])
+            r = self.client(hub, api_key="tok_real").chat.completions.create(
+                model="stub", messages=[{"role": "user", "content": "x"}])
+        self.assertTrue(r.choices[0].message.content)
 
 
 class TestHubServer(unittest.TestCase):

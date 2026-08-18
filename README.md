@@ -73,6 +73,12 @@ lmm examples        -> print a sample config file
 
 Point your apps at `lmm serve --hub` and every request goes through one path —
 cache, routing, cascade, metering — across all your local and cloud backends.
+That claim is tested against the **real `openai` client library**, not just
+curl: non-streaming, streaming (where a framing mistake shows up as zero
+chunks and no error), the opt-in usage chunk, model listing, and the 401 →
+`AuthenticationError` path all run through the actual SDK. Those tests skip
+automatically where the SDK isn't installed, so the suite itself stays
+zero-dependency.
 Three published techniques do the cost work, implemented with the standard
 library alone:
 

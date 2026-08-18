@@ -2505,7 +2505,7 @@ def cmd_serve(model):
     print("endpoint ready: http://localhost:11434  (OpenAI-compatible)")
 
 
-def cmd_serve_hub(cfg, host, port):
+def cmd_serve_hub(cfg, host, port, quiet=False):
     """Start an OpenAI-compatible proxy that fans out to every configured
     provider (cloud + local). Apps point at this one endpoint; `lmm` routes
     each request. This is the hub: one endpoint, many backends."""
@@ -2531,7 +2531,8 @@ def cmd_serve_hub(cfg, host, port):
     allowed, lines = hub_bind_check(host, hub,
                                    lambda: secrets.token_urlsafe(24))
     for line in lines:
-        print(line)
+        if not quiet:
+            print(line)
     if not allowed:
         return
 
@@ -2645,9 +2646,9 @@ def cmd_serve_hub(cfg, host, port):
         daemon_threads = True
 
     httpd = S((host, port), Handler)
-    print(f"[hub] OpenAI-compatible endpoint: http://{host}:{port}/v1")
-    print(f"[hub] backends: {', '.join(provs)}")
-    print("[hub] Ctrl+C to stop.")
+    quiet or print(f"[hub] OpenAI-compatible endpoint: http://{host}:{port}/v1")
+    quiet or print(f"[hub] backends: {', '.join(provs)}")
+    quiet or print("[hub] Ctrl+C to stop.")
     try:
         httpd.serve_forever()
     except KeyboardInterrupt:
