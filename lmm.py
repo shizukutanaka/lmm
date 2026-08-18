@@ -2584,6 +2584,44 @@ def prune_seen(seen, live, tick, grace=2):
     return seen
 
 
+def watch_list(cfg):
+    """(runtime name, lowercase title keyword) pairs the daemon watches.
+
+    Registry entries plus cfg extra_runtimes — cmd_stop already treats those as
+    first class and the daemon should agree. Pure, so the composition is
+    testable off Windows.
+    """
+    out = []
+    for rt, entry in RUNTIME_REGISTRY.items():
+        for kw in entry.get("titles", []):
+            out.append((rt, kw.lower()))
+    for e in (cfg or {}).get("extra_runtimes", []):
+        for kw in e.get("titles", []) or [e.get("name", "")]:
+            if kw:
+                out.append((e.get("name", "?"), kw.lower()))
+    return out
+
+
+def watch_new_windows(windows, seen, tick, watchlist):
+    """Decide what to act on this tick: [(hwnd, title, runtime)] for windows
+    not seen before. Also stamps `seen` so the caller only has to prune.
+
+    Separated from the ctypes calls because the DECISION is what regressed
+    before (recycled handles being skipped forever), and the decision needs no
+    Windows API to verify.
+    """
+    fresh = []
+    for hwnd, title in windows:
+        first = hwnd not in seen
+        seen[hwnd] = tick
+        if not first:
+            continue
+        low = (title or "").lower()
+        rt = next((r for r, kw in watchlist if kw in low), "?")
+        fresh.append((hwnd, title, rt))
+    return fresh
+
+
 def cmd_watch(cfg, interval=3.0):
     """Background daemon: automatically strip the taskbar button from any
     newly-spawned LLM-runtime window. This is the root-cause fix (not a
@@ -2599,14 +2637,7 @@ def cmd_watch(cfg, interval=3.0):
     # were enumerating the whole desktop just to match nothing. cfg-defined
     # extra_runtimes participate too — cmd_stop already treats them as first
     # class, and the daemon should agree.
-    watchlist = []                       # (runtime name, lowercase keyword)
-    for rt, entry in RUNTIME_REGISTRY.items():
-        for kw in entry.get("titles", []):
-            watchlist.append((rt, kw.lower()))
-    for e in (cfg or {}).get("extra_runtimes", []):
-        for kw in e.get("titles", []) or [e.get("name", "")]:
-            if kw:
-                watchlist.append((e.get("name", "?"), kw.lower()))
+    watchlist = watch_list(cfg)          # (runtime name, lowercase keyword)
     all_keywords = [kw for _, kw in watchlist]
     # HWND -> last tick seen. Windows RECYCLES window handles, so a plain
     # ever-growing "seen" set eventually swallows a brand-new window that
@@ -2620,15 +2651,9 @@ def cmd_watch(cfg, interval=3.0):
         while True:
             tick += 1
             current = _enum_windows_by_title(all_keywords)
-            live = set()
-            for hwnd, title in current:
-                live.add(hwnd)
-                if hwnd in seen:
-                    seen[hwnd] = tick
-                    continue
-                seen[hwnd] = tick
-                low = title.lower()
-                rt = next((r for r, kw in watchlist if kw in low), "?")
+            live = set(h for h, _ in current)
+            for hwnd, title, rt in watch_new_windows(current, seen, tick,
+                                                     watchlist):
                 try:
                     user32 = ctypes.windll.user32
                     ex = user32.GetWindowLongW(hwnd, GWL_EXSTYLE)
@@ -2694,6 +2719,46 @@ def cmd_autostart():
             print("autostart registration failed. Manual option: copy this to your "
                   "Startup folder as a shortcut:\n"
                   f'  {python_exe} "{me}" watch')
+
+
+def gpu_label(gpu):
+    """The GPU line for the GUI header. Pure, so the ⚠ threshold is testable
+    without a display."""
+    if not gpu:
+        return "GPU: n/a"
+    text = "GPU: %s %s/%s MiB (%s%%)" % (gpu["name"], gpu["used"], gpu["total"],
+                                         gpu["pct"])
+    # flag a nearly-full card: the next model load is the one that fails
+    return text + "  \u26a0" if gpu["pct"] >= 85 else text
+
+
+def gui_rows(items):
+    """(values, tag) per runtime for the GUI table.
+
+    Lifted out of launch_gui's paint() closure so it can be tested without
+    tkinter — which is not installed everywhere, and was the excuse for this
+    layer having no coverage while it silently drifted.
+    """
+    rows = []
+    for it in items:
+        rows.append(((
+            it["name"], it["type"],
+            "PAID" if it.get("paid") else "free",
+            "YES" if it["running"] else "no",
+            "YES" if it.get("serving") else "-",
+            it.get("procs", 0),
+            ", ".join(it.get("models", [])) or "-",
+            str(it.get("endpoint", "-")),
+        ), "on" if it["running"] else "off"))
+    return rows
+
+
+def gui_model_choices(items):
+    """Dropdown values: every model on every discovered runtime, deduped."""
+    models = []
+    for it in items:
+        models.extend(it.get("models") or [])
+    return sorted(set(models))
 
 
 def launch_gui(cfg):
@@ -2802,31 +2867,17 @@ def launch_gui(cfg):
         """Everything touching widgets. Tk is not thread-safe, so this only
         ever runs on the main thread, marshalled back via root.after."""
         gpu, cost_line, items = data
-        gpu_var.set(f"GPU: {gpu['name']} {gpu['used']}/{gpu['total']} MiB ({gpu['pct']}%)"
-                    if gpu else "GPU: n/a")
-        # color the GPU red when VRAM is tight (backstage->frontstage on exception)
-        if gpu and gpu["pct"] >= 85:
-            gpu_var.set(gpu_var.get() + "  ⚠")
+        gpu_var.set(gpu_label(gpu))
         if cost_line:
             cost_label.config(text=cost_line)
         for row in tree.get_children():
             tree.delete(row)
-        all_models = []
-        for it in items:
-            tag = "on" if it["running"] else "off"
-            tree.insert("", "end", values=(
-                it["name"], it["type"],
-                "PAID" if it.get("paid") else "free",
-                "YES" if it["running"] else "no",
-                "YES" if it.get("serving") else "-",
-                it.get("procs", 0),
-                ", ".join(it.get("models", [])) or "-",
-                str(it.get("endpoint", "-")),
-            ), tags=(tag,))
-            all_models.extend(it.get("models") or [])
+        for values, tag in gui_rows(items):
+            tree.insert("", "end", values=values, tags=(tag,))
         # keep the user's typed value; only refresh the dropdown choices
-        if all_models:
-            mdl_cb.configure(values=sorted(set(all_models)))
+        choices = gui_model_choices(items)
+        if choices:
+            mdl_cb.configure(values=choices)
         tree.tag_configure("on", foreground="#1b5e20")
         tree.tag_configure("off", foreground="#9e9e9e")
 

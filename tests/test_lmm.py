@@ -2265,6 +2265,221 @@ class TestPresentationSurfaces(unittest.TestCase):
         self.assertEqual(lmm.VERSION, "1.2.0")
 
 
+class TestCliSmoke(unittest.TestCase):
+    """Every command, in a real subprocess, with an isolated HOME.
+
+    This is the check that was run by hand after every change in this repo's
+    history — which is exactly why `lmm hide` could be a silent no-op and
+    `lmm cli` could exit 2 for as long as they did. A check nobody runs
+    automatically catches nothing.
+    """
+
+    COMMANDS = [
+        ["--version"], ["discover"], ["discover", "--json"], ["cli"],
+        ["status"], ["models"], ["cost"], ["cost", "--days", "7"],
+        ["route", "summarize this"], ["route", "--explain", "hi"],
+        ["fit", "--vram", "8"], ["bench"], ["cache"], ["examples"],
+        ["hide", "claude"], ["ask"],
+    ]
+
+    @classmethod
+    def setUpClass(cls):
+        cls.home = tempfile.mkdtemp(prefix="lmm-smoke-home-")
+        cls.root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+    @classmethod
+    def tearDownClass(cls):
+        shutil.rmtree(cls.home, ignore_errors=True)
+
+    def run_cmd(self, args, home=None):
+        import subprocess
+        env = dict(os.environ)
+        env["HOME"] = home or self.home
+        env.pop("OLLAMA_HOST", None)
+        return subprocess.run(
+            [sys.executable, os.path.join(self.root, "lmm.py")] + args,
+            capture_output=True, timeout=120, env=env)
+
+    def test_every_command_succeeds_with_no_config(self):
+        # The tool's core promise is that it works with zero configuration.
+        for args in self.COMMANDS:
+            with self.subTest(cmd=" ".join(args)):
+                r = self.run_cmd(args)
+                self.assertEqual(r.returncode, 0,
+                                 "lmm %s exited %d\n%s" % (
+                                     " ".join(args), r.returncode,
+                                     r.stderr.decode()[:400]))
+
+    def test_every_command_says_something(self):
+        # Silence is how `lmm hide` hid a missing dispatch branch for months.
+        for args in self.COMMANDS:
+            with self.subTest(cmd=" ".join(args)):
+                r = self.run_cmd(args)
+                self.assertTrue((r.stdout + r.stderr).strip(),
+                                "lmm %s printed nothing at all" % " ".join(args))
+
+    def test_examples_output_is_loadable_config(self):
+        r = self.run_cmd(["examples"])
+        cfg = json.loads(r.stdout.decode())
+        self.assertIn("providers", cfg)
+
+    def test_examples_matches_the_committed_sample(self):
+        # config.example.json is generated from `lmm examples`; if they drift,
+        # the documented shape stops matching the real one.
+        r = self.run_cmd(["examples"])
+        with open(os.path.join(self.root, "config.example.json"),
+                  encoding="utf-8") as fh:
+            self.assertEqual(json.loads(r.stdout.decode()), json.load(fh))
+
+    def test_version_is_the_constant(self):
+        r = self.run_cmd(["--version"])
+        self.assertIn(lmm.VERSION, r.stdout.decode())
+
+    def test_an_unknown_command_fails_loudly(self):
+        r = self.run_cmd(["definitely-not-a-command"])
+        self.assertNotEqual(r.returncode, 0)
+
+    def test_a_working_directory_config_cannot_run_shell_commands(self):
+        # Regression for the RCE: `lmm` reads ./lmm.config.json, and
+        # extra_runtimes[].models_cmd is a shell command, so any repo you cd
+        # into could run code the moment you typed `lmm`.
+        import subprocess
+        d = tempfile.mkdtemp(prefix="lmm-smoke-cwd-")
+        marker = os.path.join(d, "PWNED")
+        try:
+            with open(os.path.join(d, "lmm.config.json"), "w",
+                      encoding="utf-8") as fh:
+                json.dump({"extra_runtimes": [{
+                    "name": "Innocent", "procs": [], "installed_paths": [],
+                    "models_cmd": "touch %s" % marker}]}, fh)
+            env = dict(os.environ)
+            env["HOME"] = self.home
+            subprocess.run([sys.executable, os.path.join(self.root, "lmm.py"),
+                            "discover"], capture_output=True, timeout=120,
+                           cwd=d, env=env)
+            self.assertFalse(os.path.exists(marker),
+                             "a working-directory config executed shell")
+        finally:
+            shutil.rmtree(d, ignore_errors=True)
+
+
+class TestGuiLogic(unittest.TestCase):
+    """tkinter is not installed everywhere, and that was the standing excuse
+    for this layer having no coverage while it drifted. The logic never needed
+    Tk — it was just trapped inside a closure."""
+
+    ITEMS = [
+        {"name": "Ollama", "type": "local", "paid": False, "running": True,
+         "serving": True, "procs": 2, "models": ["qwen2.5:7b", "llama3.1:8b"],
+         "endpoint": "http://localhost:11434/v1"},
+        {"name": "Claude Code", "type": "remote", "paid": True, "running": False,
+         "serving": False, "procs": 0, "models": [],
+         "endpoint": "api.anthropic.com"},
+    ]
+
+    def test_rows_carry_running_and_serving_separately(self):
+        # `running` is "window or port"; `serving` is "the port answered".
+        # Collapsing them was what made a GUI app and a headless server look
+        # identical in the table.
+        rows = lmm.gui_rows(self.ITEMS)
+        self.assertEqual(len(rows), 2)
+        (vals, tag) = rows[0]
+        self.assertEqual(tag, "on")
+        self.assertEqual(vals[3], "YES")          # running
+        self.assertEqual(vals[4], "YES")          # serving
+        self.assertEqual(rows[1][1], "off")
+        self.assertEqual(rows[1][0][4], "-")      # not serving
+
+    def test_rows_have_one_cell_per_column(self):
+        for vals, _ in lmm.gui_rows(self.ITEMS):
+            self.assertEqual(len(vals), 8)        # matches the GUI's `cols`
+
+    def test_paid_and_models_render(self):
+        vals = lmm.gui_rows(self.ITEMS)[0][0]
+        self.assertEqual(vals[2], "free")
+        self.assertIn("qwen2.5:7b", vals[6])
+        self.assertEqual(lmm.gui_rows(self.ITEMS)[1][0][2], "PAID")
+        self.assertEqual(lmm.gui_rows(self.ITEMS)[1][0][6], "-")
+
+    def test_rows_survive_a_sparse_item(self):
+        # detect_extra used to omit keys detect_runtime emits.
+        rows = lmm.gui_rows([{"name": "X", "type": "local", "running": False}])
+        self.assertEqual(rows[0][0][4], "-")
+        self.assertEqual(rows[0][0][5], 0)
+
+    def test_model_choices_are_deduped_and_sorted(self):
+        items = self.ITEMS + [{"name": "LM Studio", "type": "local",
+                               "running": True, "models": ["llama3.1:8b", "phi-4"]}]
+        self.assertEqual(lmm.gui_model_choices(items),
+                         ["llama3.1:8b", "phi-4", "qwen2.5:7b"])
+
+    def test_model_choices_empty_when_nothing_is_running(self):
+        self.assertEqual(lmm.gui_model_choices([{"name": "X", "models": []}]), [])
+
+    def test_gpu_label_warns_only_when_vram_is_tight(self):
+        tight = lmm.gpu_label({"name": "RTX", "used": 900, "total": 1000, "pct": 90})
+        roomy = lmm.gpu_label({"name": "RTX", "used": 100, "total": 1000, "pct": 10})
+        self.assertIn("\u26a0", tight)
+        self.assertNotIn("\u26a0", roomy)
+        self.assertIn("RTX", roomy)
+
+    def test_gpu_label_handles_no_gpu(self):
+        self.assertEqual(lmm.gpu_label(None), "GPU: n/a")
+
+
+class TestWatchDecision(unittest.TestCase):
+    """The daemon's per-tick decision, without the Windows API. This is the
+    part that regressed before — recycled handles being skipped forever."""
+
+    def watchlist(self):
+        return lmm.watch_list({})
+
+    def test_watchlist_covers_the_registry(self):
+        wl = self.watchlist()
+        names = {rt for rt, _ in wl}
+        self.assertIn("claude", names)
+        self.assertTrue(all(kw == kw.lower() for _, kw in wl))
+
+    def test_watchlist_includes_user_runtimes(self):
+        wl = lmm.watch_list({"extra_runtimes": [{"name": "My Agent"}]})
+        self.assertIn(("My Agent", "my agent"), wl)
+
+    def test_a_window_is_acted_on_once(self):
+        seen, wl = {}, [("claude", "claude")]
+        first = lmm.watch_new_windows([(100, "Claude")], seen, 1, wl)
+        self.assertEqual([(h, t, r) for h, t, r in first],
+                         [(100, "Claude", "claude")])
+        again = lmm.watch_new_windows([(100, "Claude")], seen, 2, wl)
+        self.assertEqual(again, [])               # not hidden twice
+
+    def test_a_recycled_handle_is_treated_as_new_again(self):
+        # Windows reuses HWND values. Before prune_seen, a new window landing
+        # on an old handle was skipped forever and never hidden.
+        seen, wl = {}, [("claude", "claude")]
+        lmm.watch_new_windows([(100, "Claude")], seen, 1, wl)
+        lmm.prune_seen(seen, live=set(), tick=5, grace=2)   # window closed
+        again = lmm.watch_new_windows([(100, "Claude")], seen, 6, wl)
+        self.assertEqual(len(again), 1)
+
+    def test_the_owning_runtime_is_identified(self):
+        wl = lmm.watch_list({})
+        got = lmm.watch_new_windows([(1, "ChatGPT")], {}, 1, wl)
+        self.assertEqual(got[0][2], "chatgpt")
+
+    def test_an_unmatched_title_still_reports_a_placeholder(self):
+        got = lmm.watch_new_windows([(1, "Some Other App")], {}, 1,
+                                    [("claude", "claude")])
+        self.assertEqual(got[0][2], "?")
+
+    def test_seen_is_stamped_for_every_window_not_just_new_ones(self):
+        # An existing window must keep its tick refreshed, or prune_seen will
+        # forget a window that is still open.
+        seen, wl = {}, [("claude", "claude")]
+        lmm.watch_new_windows([(100, "Claude")], seen, 1, wl)
+        lmm.watch_new_windows([(100, "Claude")], seen, 7, wl)
+        self.assertEqual(seen[100], 7)
+
+
 class StubBackend(object):
     """A real OpenAI-compatible server on localhost, speaking both streamed and
     non-streamed replies.
