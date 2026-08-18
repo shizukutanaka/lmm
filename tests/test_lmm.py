@@ -2353,6 +2353,23 @@ class TestCliSmoke(unittest.TestCase):
         self.assertIn("GPU:", out)
         self.assertIn("hub:", out)
 
+    def test_a_closed_pipe_is_not_an_error(self):
+        # `lmm discover | head -1` used to end in a BrokenPipeError traceback.
+        # A reader closing early is how pipes work, not a failure.
+        import subprocess
+        env = dict(os.environ)
+        env["HOME"] = self.home
+        p = subprocess.Popen(
+            [sys.executable, os.path.join(self.root, "lmm.py"), "discover"],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env)
+        p.stdout.readline()              # take one line, then hang up
+        p.stdout.close()
+        p.wait(timeout=120)
+        err = p.stderr.read().decode()
+        p.stderr.close()
+        self.assertNotIn("Traceback", err)
+        self.assertNotIn("BrokenPipeError", err)
+
     def test_an_unknown_command_fails_loudly(self):
         r = self.run_cmd(["definitely-not-a-command"])
         self.assertNotEqual(r.returncode, 0)

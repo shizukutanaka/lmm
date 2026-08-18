@@ -4443,4 +4443,15 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except BrokenPipeError:
+        # `lmm discover | head` — the reader closed first. That is how pipes
+        # are supposed to work, not an error; a traceback here fails basic
+        # UNIX table manners. Python would also complain again while flushing
+        # stdout at exit, so hand it a sink first.
+        os.dup2(os.open(os.devnull, os.O_WRONLY), sys.stdout.fileno())
+        sys.exit(0)
+    except KeyboardInterrupt:
+        print()
+        sys.exit(130)          # the conventional 128+SIGINT
