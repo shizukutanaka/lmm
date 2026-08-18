@@ -1,7 +1,9 @@
 name: ci
 
-# Move this file to .github/workflows/ci.yml to enable it — GitHub only runs
-# workflows from that directory. See the "Tests & CI" section of the README.
+# NOTE: this cannot live in .github/workflows/ in this repo — pushes from the
+# Claude GitHub App are rejected without `workflows` permission (verified: the
+# remote refuses the push). Copy it there yourself to enable CI:
+#     mkdir -p .github/workflows && cp ci/github-actions-ci.yml .github/workflows/ci.yml
 #
 # lmm is a single zero-dependency file, so CI needs no install step and no
 # cache — it exists to enforce two claims the README makes: the test suite

@@ -457,14 +457,14 @@ Stdlib `unittest`, no network, no fixtures to install — the same
 zero-dependency rule the tool follows. `lmm.py` stays a single distributable
 file; the tests live outside it.
 
-A GitHub Actions workflow is provided at **`ci/github-actions-ci.yml`**. To
-enable it, move it into place (it has to live under `.github/workflows/` to
-run):
+A GitHub Actions workflow lives at **`ci/github-actions-ci.yml`**. It is not in
+`.github/workflows/` because pushes from this repo's GitHub App are rejected
+without `workflows` permission, so enabling it is a one-line copy you run
+yourself:
 
 ```bash
-mkdir -p .github/workflows
-git mv ci/github-actions-ci.yml .github/workflows/ci.yml
-git commit -m "ci: enable GitHub Actions" && git push
+mkdir -p .github/workflows && cp ci/github-actions-ci.yml .github/workflows/ci.yml
+git add .github && git commit -m "ci: enable GitHub Actions" && git push
 ```
 
 It runs the full suite on Python 3.8 through 3.13 (3.8 being the floor this

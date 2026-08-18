@@ -1825,28 +1825,13 @@ def cost_report(cfg, days=30):
     out.append("-" * 64)
     out.append(f"TOTAL est ${grand:,.2f}  "
                "(pricing approximate; verify on your Anthropic billing page)")
-    # ---- cross-provider estimate (cloud APIs have no local session log) ----
-    # Use the local Ollama token volume as a proxy baseline: if the same
-    # workload ran on each cloud provider, what would it cost? This makes
-    # `lmm cost` cover local->cloud without requiring API telemetry.
-    proxy = 0
-    if data and data.get("by_family"):
-        proxy = max((a["in"] + a["out"] for a in data["by_family"].values()),
-                    default=0)
-    if proxy <= 0:
-        proxy = 1_000_000  # default 1M-token baseline for comparison
-    out.append("")
-    out.append("=" * 64)
-    out.append(f"CROSS-PROVIDER ESTIMATE (baseline = "
-               f"{proxy/1e6:.2f}M tok in+out, illustrative)")
-    out.append("-" * 64)
-    cloud_keys = [k for k in pricing
-                  if k not in ("opus", "sonnet", "haiku", "default")]
-    for k in sorted(cloud_keys):
-        p = pricing[k]
-        # assume ~50/50 in/out split of the baseline for a simple comparison
-        c = (proxy / 2 / 1e6 * p["in"]) + (proxy / 2 / 1e6 * p["out"])
-        out.append(f"  {k:22} ~${c:,.2f}")
+    # A "cross-provider estimate" block used to sit here: it took the largest
+    # Claude family's token volume as a baseline, assumed a 50/50 in/out split,
+    # and priced that against every cloud entry in the rate table. Deleted,
+    # because every input to it was invented — the baseline was not the user's
+    # cloud workload, the split was a guess, and the rate-table nicknames go
+    # stale — and because metering now reports what each provider ACTUALLY
+    # cost. A number nobody can act on does not belong beside measured ones.
     return "\n".join(out + hub_cost_block(cfg, pricing, days, grand))
 
 
@@ -1903,9 +1888,7 @@ def cost_summary(cfg, days=None):
     The GUI used to show `cost_report(...).splitlines()[-1]`, which was correct
     only while the report ended with a total. Once the telemetry block was
     appended, that last line became whichever of these fired last: an ALL-IN
-    total, an *illustrative* cross-provider estimate, or a whole sentence
-    explaining there was no telemetry yet. So a hypothetical number could sit
-    next to the GPU readout looking like real spend.
+    total or a whole sentence explaining there was no telemetry yet.
     """
     pricing = merged_pricing(cfg)
     st = hub_cost_stats(days)
@@ -2413,6 +2396,15 @@ def cmd_serve_hub(cfg, host, port):
               "config (see `lmm examples`). Nothing to proxy.")
         return
 
+    # The `breaker` config key was documented in `lmm examples` but never read:
+    # HUB_BREAKER was built from the defaults at import time, so anyone who set
+    # a threshold or cooldown had it silently ignored. Apply it here, where the
+    # config is finally in hand.
+    brk = merged_breaker(cfg)
+    HUB_BREAKER.threshold = int(brk.get("threshold", 3))
+    HUB_BREAKER.cooldown_s = float(brk.get("cooldown_s", 30))
+    hub_breaker = HUB_BREAKER if brk.get("enabled", True) else None
+
     hub = merged_hub(cfg)
     token = hub.get("token") or None
     allowed, lines = hub_bind_check(host, hub,
@@ -2513,7 +2505,7 @@ def cmd_serve_hub(cfg, host, port):
             extra = {k: req[k] for k in PASSTHROUGH_KEYS if k in req}
             hub_opts = {"cascade": bool(req.get("lmm_cascade")),
                         "cache": not no_cache, "extra": extra, "source": "hub",
-                        "breaker": HUB_BREAKER}
+                        "breaker": hub_breaker}
             if req.get("stream"):
                 hub_opts["client_usage"] = bool(
                     (req.get("stream_options") or {}).get("include_usage"))

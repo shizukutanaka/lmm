@@ -250,6 +250,47 @@ class TestCache(unittest.TestCase):
             self.assertIsNone(entry)
 
 
+class TestNoFabricatedNumbers(unittest.TestCase):
+    """`lmm cost` reports what was measured. A figure derived from an invented
+    baseline has no place beside one that was actually billed."""
+
+    def test_cost_report_has_no_cross_provider_estimate(self):
+        with temp_state():
+            lmm.log_usage({"provider": "p", "kind": "remote", "in": 10,
+                           "out": 10, "usd": 1.0, "cache": "miss"})
+            report = lmm.cost_report({}, None)
+        self.assertNotIn("CROSS-PROVIDER", report)
+        self.assertNotIn("illustrative", report)
+
+    def test_the_report_still_shows_what_was_measured(self):
+        with temp_state():
+            lmm.log_usage({"provider": "p", "kind": "remote", "in": 10,
+                           "out": 10, "usd": 1.0, "cache": "miss"})
+            report = lmm.cost_report({}, None)
+        self.assertIn("HUB MEASURED TOTAL", report)
+
+    def test_breaker_config_is_actually_honoured(self):
+        # The key was advertised by `lmm examples` and silently ignored:
+        # HUB_BREAKER was built from defaults at import time.
+        saved = (lmm.HUB_BREAKER.threshold, lmm.HUB_BREAKER.cooldown_s)
+        try:
+            brk = lmm.merged_breaker({"breaker": {"threshold": 7,
+                                                  "cooldown_s": 90}})
+            self.assertEqual(brk["threshold"], 7)
+            self.assertEqual(brk["cooldown_s"], 90)
+            self.assertTrue(brk["enabled"])          # default preserved
+            lmm.HUB_BREAKER.threshold = brk["threshold"]
+            lmm.HUB_BREAKER.cooldown_s = brk["cooldown_s"]
+            for _ in range(6):
+                lmm.HUB_BREAKER.record_failure("p", now=1000.0)
+            self.assertEqual(lmm.HUB_BREAKER.state("p", now=1000.0), "closed")
+            lmm.HUB_BREAKER.record_failure("p", now=1000.0)   # 7th
+            self.assertEqual(lmm.HUB_BREAKER.state("p", now=1000.0), "open")
+        finally:
+            lmm.HUB_BREAKER.threshold, lmm.HUB_BREAKER.cooldown_s = saved
+            lmm.HUB_BREAKER.record_success("p")
+
+
 class TestToolCalls(unittest.TestCase):
     """A tool-calling reply leaves `content` null and puts its payload in
     `tool_calls`. Treating that as an empty answer turned the cascade from a
@@ -2064,7 +2105,7 @@ class TestHubCostStats(unittest.TestCase):
 
     def test_cost_summary_is_one_line_and_honest(self):
         # The GUI shows this verbatim; it must never be a paragraph, and it
-        # must not surface the illustrative cross-provider estimates.
+        # must not surface any hypothetical figure.
         with temp_state():
             self.seed()
             line = lmm.cost_summary({})
