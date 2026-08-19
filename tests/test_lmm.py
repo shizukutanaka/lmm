@@ -2984,6 +2984,48 @@ class TestPerModelRouting(unittest.TestCase):
             len([p for p in self.stub.seen_get if "models" in p]), 2,
             "a stale entry was served past its TTL")
 
+    def test_liveness_is_not_probed_per_request(self):
+        """Every hub request used to run both implicit-provider detectors —
+        an HTTP probe plus subprocess spawns — even when the request named an
+        explicit provider. Measured: 2.00 spawns + 1.00 probes per request,
+        a ~153 req/s ceiling. The routing-path wrappers are memoised for
+        IMPLICIT_CACHE_TTL; N requests may detect at most once each."""
+        counts = {"ollama": 0, "lmstudio": 0}
+        saved_o, saved_l = lmm.detect_ollama, lmm.detect_lmstudio
+        lmm.detect_ollama = lambda *a, **k: (
+            counts.__setitem__("ollama", counts["ollama"] + 1),
+            {"running": False})[1]
+        lmm.detect_lmstudio = lambda *a, **k: (
+            counts.__setitem__("lmstudio", counts["lmstudio"] + 1),
+            {"running": False})[1]
+        try:
+            with lmm._IMPLICIT_CACHE_LOCK:
+                lmm._IMPLICIT_CACHE.clear()
+            with temp_state():
+                hub = HubServer(self.cfg)
+                for _ in range(8):
+                    self._post(hub, {"model": "stub", "lmm_no_cache": 1,
+                                     "messages": [{"role": "user",
+                                                   "content": "hi"}]})
+            self.assertLessEqual(counts["ollama"], 1, counts)
+            self.assertLessEqual(counts["lmstudio"], 1, counts)
+        finally:
+            lmm.detect_ollama, lmm.detect_lmstudio = saved_o, saved_l
+
+    def test_the_liveness_memo_expires(self):
+        calls = []
+        with lmm._IMPLICIT_CACHE_LOCK:
+            lmm._IMPLICIT_CACHE.clear()
+        probe = lambda: (calls.append(1), None)[1]
+        lmm._memo_implicit("x", probe)
+        lmm._memo_implicit("x", probe)
+        self.assertEqual(len(calls), 1, "the memo did not hold")
+        with lmm._IMPLICIT_CACHE_LOCK:      # rewind the clock: entry stale
+            ts, val = lmm._IMPLICIT_CACHE["x"]
+            lmm._IMPLICIT_CACHE["x"] = (ts - 2 * lmm.IMPLICIT_CACHE_TTL, val)
+        lmm._memo_implicit("x", probe)
+        self.assertEqual(len(calls), 2, "a stale entry outlived its TTL")
+
     def test_an_unknown_model_is_a_clear_400(self):
         import urllib.error
         with temp_state():

@@ -2258,9 +2258,44 @@ def route_task(cfg, task):
     return "%s (%s)" % (name, "; ".join(why))
 
 
+_IMPLICIT_CACHE = {}                    # key -> (monotonic_ts, provider|None)
+_IMPLICIT_CACHE_LOCK = threading.Lock()
+IMPLICIT_CACHE_TTL = 5.0
+
+
+def _memo_implicit(key, fn):
+    """5-second memo for the implicit-provider detectors.
+
+    resolve_ask_targets runs both detectors on EVERY request — even when the
+    caller names an explicit provider — and each detection is an HTTP probe
+    plus one or two subprocess spawns (pgrep/tasklist). Measured under
+    concurrent load: 2.00 spawns and 1.00 probes per request, capping the hub
+    at ~153 req/s against a localhost stub. A backend's liveness does not
+    change on a per-request timescale: death mid-window is the circuit
+    breaker's job, and a just-started backend waits at most the TTL. Only
+    these routing-path wrappers are memoised — discover/status/doctor read
+    the detectors directly, because for them freshness IS the product. CLI
+    commands run in fresh processes and always re-detect.
+    """
+    now = time.monotonic()
+    with _IMPLICIT_CACHE_LOCK:
+        hit = _IMPLICIT_CACHE.get(key)
+        if hit and now - hit[0] < IMPLICIT_CACHE_TTL:
+            return dict(hit[1]) if hit[1] else None
+    val = fn()
+    with _IMPLICIT_CACHE_LOCK:
+        _IMPLICIT_CACHE[key] = (now, dict(val) if val else None)
+    return val
+
+
 def local_ollama_provider():
     """Synthesize an implicit local provider from a running Ollama, so `lmm ask`
-    works even with no config (zero-config hub). Returns dict or None."""
+    works even with no config (zero-config hub). Returns dict or None.
+    Memoised for IMPLICIT_CACHE_TTL seconds — see _memo_implicit."""
+    return _memo_implicit("ollama", _local_ollama_provider_live)
+
+
+def _local_ollama_provider_live():
     d = detect_ollama()
     if not d.get("running"):
         return None
@@ -3467,7 +3502,12 @@ def detect_lmstudio():
 def local_lmstudio_provider():
     """Synthesize an implicit local provider from a running LM Studio server,
     so `lmm ask` / `lmm serve --hub` can fan out to it too (zero-config hub).
-    Returns dict or None."""
+    Returns dict or None.
+    Memoised for IMPLICIT_CACHE_TTL seconds — see _memo_implicit."""
+    return _memo_implicit("lmstudio", _local_lmstudio_provider_live)
+
+
+def _local_lmstudio_provider_live():
     d = detect_lmstudio()
     if not d.get("running"):
         return None

@@ -95,6 +95,16 @@ the merge of the managed-routing line of work into the same tool.
   suite stays zero-dependency.
 
 ### Fixed
+- **The hub probed liveness on every request — with subprocesses.** Both
+  implicit-provider detectors ran per request, even when the request named an
+  explicit provider: measured under concurrent load at 2.00 subprocess spawns
+  (pgrep/tasklist) plus 1.00 Ollama HTTP probe per request, capping the hub
+  at ~153 req/s against a localhost stub. The routing-path wrappers are now
+  memoised for 5 s (liveness does not change per-request; death mid-window is
+  the circuit breaker's job, a fresh start waits at most the TTL), while
+  discover/status/doctor keep reading the detectors directly — for them,
+  freshness is the product. Same bench after: **302 req/s**, 0.06 spawns and
+  0.03 probes per request, proven by count in a test rather than by timing.
 - **A model-id request paid for work it threw away.** Restoring per-model
   routing made every model-id request fetch the backend's model list (one
   full round-trip) and also run the whole default router — an Ollama port
