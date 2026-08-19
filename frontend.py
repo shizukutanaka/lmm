@@ -477,9 +477,11 @@ def cmd_serve_hub(cfg, host, port, quiet=False):
             # verbatim — the client asked for qwen2.5-coder:3b, not for
             # whatever the provider's config happens to default to.
             explicit = req.get("model", "")
-            targets = resolve_ask_targets(
-                cfg, messages_text(msgs), explicit if explicit in provs else None)
             if explicit and explicit not in provs:
+                # A model id: map it to its owner directly. Running the full
+                # router first and discarding the result cost every model-id
+                # request an Ollama port probe and a pgrep — measured as the
+                # whole remaining latency gap after the model-list cache.
                 owner = resolve_provider_by_model(provs, explicit)
                 if owner:
                     targets = [(owner, dict(provs[owner], model=explicit))]
@@ -494,6 +496,10 @@ def cmd_serve_hub(cfg, host, port, quiet=False):
                         "type": "invalid_request_error",
                         "code": "model_not_found"}})
                     return
+            else:
+                targets = resolve_ask_targets(
+                    cfg, messages_text(msgs),
+                    explicit if explicit in provs else None)
             if not targets:
                 self._send(400, {"error": "no provider available for model '%s'" % explicit})
                 return

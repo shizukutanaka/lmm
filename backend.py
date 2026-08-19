@@ -389,6 +389,19 @@ RUNTIME_ENDPOINTS = {
 # llama.cpp's server and Open WebUI both default to 8080, so an open port alone
 # cannot say which is there. Ports listed here are only believed when a
 # matching process is also running.
+
+# Display names (what discover prints, what users naturally type in
+# ask_order) -> provider keys (what the routing and the trail record). One
+# map: it used to be duplicated inside resolve_ask_targets and
+# optimize_ask_order — with a comment in the second copy admitting it
+# "mirrors" the first, which is a drift waiting for its moment.
+NAME_TO_KEY = {
+    "ollama": "local-ollama(implicit)",
+    "lm studio": "local-lmstudio(implicit)",
+    "claude code (anthropic)": "claude-code",
+    "claude": "claude-code",
+}
+
 AMBIGUOUS_PORTS = {8080}
 
 
@@ -1541,14 +1554,19 @@ def probe_port(port, host="127.0.0.1", timeout=0.25):
         s.close()
 
 
-def probe_models(base_url, timeout=1.0):
+def probe_models(base_url, timeout=1.0, api_key=None):
     """Best-effort model list from an OpenAI-compatible /models endpoint.
     Anything unexpected (auth required, different schema, HTML) yields []
-    rather than an error — this is a nicety, not a detection signal."""
+    rather than an error. The one HTTP reader for model lists: discover uses
+    it anonymously with a short timeout as a liveness nicety, fetch_models
+    with auth and patience as the real inventory — one parser, two questions."""
     import urllib.request
     try:
+        headers = {"Accept": "application/json"}
+        if api_key:
+            headers["Authorization"] = "Bearer " + api_key
         req = urllib.request.Request(base_url.rstrip("/") + "/models",
-                                     headers={"Accept": "application/json"})
+                                     headers=headers)
         with urllib.request.urlopen(req, timeout=timeout) as resp:
             body = json.loads(resp.read().decode("utf-8", "ignore"))
     except Exception:
@@ -2263,13 +2281,6 @@ def resolve_ask_targets(cfg, prompt, explicit):
     NOTE: ask_order entries may be either provider keys (from config 'providers')
     or human-readable discover names (e.g. "Ollama"). We normalize both forms.
     """
-    # Map discover display names -> provider keys / implicit keys.
-    NAME_TO_KEY = {
-        "ollama": "local-ollama(implicit)",
-        "lm studio": "local-lmstudio(implicit)",
-        "claude code (anthropic)": "claude-code",  # if configured as a provider
-        "claude": "claude-code",
-    }
     provs = merged_providers(cfg)
     # fold in the implicit running-Ollama safety net so explicit references
     # to it (e.g. a model id resolved back to "local-ollama(implicit)")
@@ -3469,30 +3480,53 @@ def local_lmstudio_provider():
             "model": model, "kind": "local", "_implicit": True}
 
 
+_MODELS_CACHE = {}                      # base_url -> (monotonic_ts, [ids])
+_MODELS_CACHE_LOCK = threading.Lock()
+MODELS_CACHE_TTL = 30.0
+
+
 def fetch_models(prov):
     """Return a list of model-id strings for a provider, or [] on failure.
-    Ollama uses /api/tags; OpenAI-compatible clouds use /v1/models."""
+    Ollama uses /api/tags; OpenAI-compatible clouds use /v1/models.
+
+    Results are cached for MODELS_CACHE_TTL seconds per base_url. The hub is
+    a long-lived process that needs this list on every model-id request and
+    every /v1/models call; without the cache each one paid a full round-trip
+    to the backend — measured at +80% P50 against a localhost stub, and a
+    whole network RTT against anything real. Unreachable backends cache their
+    [] too, for the breaker's reason: a dead backend must not cost every
+    request its timeout. The price is that a just-started backend can stay
+    invisible for up to the TTL. CLI commands run in a fresh process, so they
+    always see fresh data.
+    """
+    base = prov.get("base_url", "")
+    now = time.monotonic()
+    with _MODELS_CACHE_LOCK:
+        hit = _MODELS_CACHE.get(base)
+        if hit and now - hit[0] < MODELS_CACHE_TTL:
+            return list(hit[1])
+    models = _fetch_models_live(prov, base)
+    with _MODELS_CACHE_LOCK:
+        _MODELS_CACHE[base] = (now, list(models))
+    return models
+
+
+def _fetch_models_live(prov, base):
     try:
-        base = prov.get("base_url", "")
-        if prov.get("kind") == "local" and "11434" in base:
-            # Ollama's native tags endpoint (strip any /v1 suffix)
-            root = base.replace("/v1", "").rstrip("/")
-            r = http_get_json(root + "/api/tags")
-            if r and "models" in r:
-                return [m.get("name", "?") for m in r["models"]]
-        # OpenAI-compatible: /v1/models. Providers in this tree store base_url
-        # WITH the /v1 suffix (it is what you paste from a provider's docs),
-        # so appending /v1/models verbatim produced /v1/v1/models — a 404 on
-        # every real backend, which read as "no models" rather than a bug.
+        # Providers in this tree store base_url WITH the /v1 suffix (it is
+        # what you paste from a provider's docs); normalise before appending.
         root = base.rstrip("/")
         if root.endswith("/v1"):
             root = root[:-3].rstrip("/")
-        r = http_get_json(root + "/v1/models", api_key=prov.get("api_key"))
-        if r and "data" in r:
-            return [m.get("id", m.get("name", "?")) for m in r["data"]]
+        if prov.get("kind") == "local" and "11434" in base:
+            # Ollama's native tags endpoint
+            r = http_get_json(root + "/api/tags")
+            if r and "models" in r:
+                return [m.get("name", "?") for m in r["models"]]
+        return probe_models(root + "/v1", timeout=30,
+                            api_key=prov.get("api_key"))
     except Exception:
         return []
-    return []
 
 
 def resolve_provider_by_model(provs, model_id):
@@ -3604,7 +3638,7 @@ def optimize_ask_order(cfg):
     explicit entries are preserved in identity, only reordered by evidence.
 
     NOTE: ask_order holds DISPLAY names (e.g. "Ollama") but the hub log records
-    PROVIDER keys (e.g. "local-ollama(implicit)"). We normalize via NAME_TO_KEY
+    PROVIDER keys (e.g. "local-ollama(implicit)"). We normalize via the shared NAME_TO_KEY
     before matching, else every backend looks "unmeasured" (measure, don't trust).
 
     Cost-aware (FrugalGPT / RouteLLM lesson): a backend that is free AND works is
@@ -3617,13 +3651,6 @@ def optimize_ask_order(cfg):
     order = list(cfg.get("ask_order") or [])
     if not order:
         return order, stat
-    # display-name -> provider-key normalizer (mirrors resolve_ask_targets)
-    NAME_TO_KEY = {
-        "ollama": "local-ollama(implicit)",
-        "lm studio": "local-lmstudio(implicit)",
-        "claude code (anthropic)": "claude-code",
-        "claude": "claude-code",
-    }
     def norm(n):
         if n in stat:
             return n

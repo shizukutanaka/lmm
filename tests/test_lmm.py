@@ -2730,13 +2730,16 @@ class StubBackend(object):
         import socketserver
         import threading
         self.seen = []
+        self.seen_get = []
         answer_text = answer
         seen = self.seen
+        seen_get = self.seen_get
 
         class H(http.server.BaseHTTPRequestHandler):
             def do_GET(self):
                 # A real /v1/models, so fetch_models and the hub's model
                 # aggregation are tested over real HTTP, not monkeypatches.
+                seen_get.append(self.path)
                 if self.path.rstrip("/").endswith("/v1/models"):
                     return self._json({"object": "list", "data": [
                         {"id": "stub-model-a", "object": "model"},
@@ -2949,6 +2952,37 @@ class TestPerModelRouting(unittest.TestCase):
                                    "messages": [{"role": "user",
                                                  "content": "hi"}]})
         self.assertEqual(res["model"], "default-model")
+
+    def test_model_lists_are_cached_not_refetched_per_request(self):
+        """Per-request fetch_models measured +80% P50 on model-id requests —
+        a full backend round-trip per call. The hub is long-lived, so the
+        list is cached for MODELS_CACHE_TTL; N requests cost one GET."""
+        with temp_state():
+            hub = HubServer(self.cfg)
+            for _ in range(5):
+                self._post(hub, {"model": "stub-model-a", "lmm_no_cache": 1,
+                                 "messages": [{"role": "user",
+                                               "content": "hi"}]})
+            self._get(hub, "/v1/models")
+        gets = [p for p in self.stub.seen_get if "models" in p]
+        self.assertEqual(len(gets), 1,
+                         "each request re-fetched the model list: %r" % gets)
+
+    def test_the_cache_expires(self):
+        prov = self.cfg["providers"]["stub"]
+        self.assertEqual(lmm.fetch_models(prov),
+                         ["stub-model-a", "stub-model-b"])
+        self.assertEqual(lmm.fetch_models(prov),
+                         ["stub-model-a", "stub-model-b"])
+        self.assertEqual(
+            len([p for p in self.stub.seen_get if "models" in p]), 1)
+        with lmm._MODELS_CACHE_LOCK:      # rewind the clock: entry now stale
+            ts, ids = lmm._MODELS_CACHE[prov["base_url"]]
+            lmm._MODELS_CACHE[prov["base_url"]] = (ts - 2 * lmm.MODELS_CACHE_TTL, ids)
+        lmm.fetch_models(prov)
+        self.assertEqual(
+            len([p for p in self.stub.seen_get if "models" in p]), 2,
+            "a stale entry was served past its TTL")
 
     def test_an_unknown_model_is_a_clear_400(self):
         import urllib.error
@@ -3661,6 +3695,24 @@ class TestOneOfEach(unittest.TestCase):
     observability log had none of the first one's protections. One of each,
     verified — not asserted.
     """
+
+    def test_there_is_exactly_one_name_map(self):
+        """NAME_TO_KEY was duplicated inside resolve_ask_targets and
+        optimize_ask_order — the second copy's own comment admitted it
+        "mirrors" the first. One module constant now; no function may grow
+        a private copy again."""
+        import ast
+        import inspect
+        self.assertIn("ollama", lmm.NAME_TO_KEY)
+        for fn in (lmm.resolve_ask_targets, lmm.optimize_ask_order):
+            tree = ast.parse(inspect.getsource(fn))
+            body = next(n for n in tree.body
+                        if isinstance(n, ast.FunctionDef))
+            dicts = [n for n in ast.walk(body) if isinstance(n, ast.Dict)
+                     and any(isinstance(k, ast.Constant)
+                             and k.value == "ollama" for k in n.keys)]
+            self.assertEqual(dicts, [],
+                             "%s regrew a private name map" % fn.__name__)
 
     def test_there_is_exactly_one_router(self):
         self.assertFalse(hasattr(lmm, "score_and_route"),

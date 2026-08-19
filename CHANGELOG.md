@@ -45,6 +45,13 @@ the merge of the managed-routing line of work into the same tool.
   - **Two commands.** `cli` was an alias for `discover`; `hub-status`'s one
     unique capability — probing each configured provider — moved into
     `doctor`, which is where a health probe belongs.
+  - The second and third copies of `NAME_TO_KEY` (display name -> provider
+    key), which lived inside `resolve_ask_targets` and `optimize_ask_order` —
+    the latter's comment admitted it "mirrors" the former. One module
+    constant now, and a test forbids a function from growing a private copy.
+    The two HTTP model-list readers merged the same way: `fetch_models`
+    delegates its OpenAI-compatible branch to `probe_models`, which learned
+    to send auth.
   - `cache_prune` (a public wrapper with zero callers anywhere — every
     internal site already goes through the locked variant).
   - **A second pre-push hook and its scaffolding.** `hooks/pre-push` was the
@@ -88,6 +95,16 @@ the merge of the managed-routing line of work into the same tool.
   suite stays zero-dependency.
 
 ### Fixed
+- **A model-id request paid for work it threw away.** Restoring per-model
+  routing made every model-id request fetch the backend's model list (one
+  full round-trip) and also run the whole default router — an Ollama port
+  probe and a `pgrep` — only to discard that result once the id resolved.
+  Measured against a localhost stub: P50 22.5 ms vs 12.5 ms for the same
+  request by provider name. Model lists are now cached for 30 s per backend
+  (a dead backend's empty answer too, for the circuit breaker's reason), and
+  the router only runs when it is actually consulted. Same request now:
+  **2.0 ms** — faster than the name path, and proven by count, not vibes: a
+  test asserts N model-id requests cost exactly one upstream GET.
 - **The merge severed two shipped features, and a zero-caller sweep found
   them.** Per-model routing (master's fbbc59e): the hub was back to listing
   provider names instead of real model ids, and a client-picked model id
