@@ -45,6 +45,8 @@ the merge of the managed-routing line of work into the same tool.
   - **Two commands.** `cli` was an alias for `discover`; `hub-status`'s one
     unique capability — probing each configured provider — moved into
     `doctor`, which is where a health probe belongs.
+  - `cache_prune` (a public wrapper with zero callers anywhere — every
+    internal site already goes through the locked variant).
   - **A second pre-push hook and its scaffolding.** `hooks/pre-push` was the
     unwired ancestor of `.githooks/pre-push`; `setup-hooks.bat` wrapped the
     one command (`git config core.hooksPath .githooks`) that is identical on
@@ -86,6 +88,22 @@ the merge of the managed-routing line of work into the same tool.
   suite stays zero-dependency.
 
 ### Fixed
+- **The merge severed two shipped features, and a zero-caller sweep found
+  them.** Per-model routing (master's fbbc59e): the hub was back to listing
+  provider names instead of real model ids, and a client-picked model id
+  neither reached the provider serving it nor was forwarded — worse, an
+  unknown model silently routed to some default. `/v1/models` now aggregates
+  real ids (provider names stay as routable aliases), a picked id is
+  forwarded verbatim to its owner, and an unknown one is a clear 400.
+  Minimize-to-tray (master's 35bbf95): `setup_tray` had zero callers, so the
+  GUI feature simply vanished; it is wired back on Windows, and on other
+  platforms X keeps meaning close — withdrawing with no tray icon to restore
+  from would orphan the process.
+- **`fetch_models` never worked against this tree's own providers.** Their
+  `base_url` convention includes the `/v1` suffix, so appending `/v1/models`
+  produced `/v1/v1/models` — a 404 that read as "no models". The tests had
+  monkeypatched it, which is how a path bug survives; it now runs against a
+  real HTTP stub.
 - **The measurement loop was open.** `lmm stats` and `priority --optimize`
   read per-attempt routing outcomes that, after the merge, nothing wrote —
   the readers survived their writer. Failed attempts (which have no usage to

@@ -85,7 +85,7 @@ lmm hide <runtime>  -> strip a runtime's taskbar button (Claude/ChatGPT/...)
 lmm watch           -> background daemon: auto-hide new LLM windows
 lmm autostart       -> register `watch` to run at OS login (zero effort)
 lmm dash            -> generate + open a self-contained HTML dashboard
-lmm gui             -> open the live GUI dashboard explicitly
+lmm gui             -> open the live GUI dashboard (Windows: minimizes to tray)
 lmm config <init|list|get|set|unset> [key] [value] -> manage hub settings (CLI)
 lmm examples        -> print a sample config file
 ```
@@ -94,6 +94,12 @@ lmm examples        -> print a sample config file
 
 Point your apps at `lmm serve --hub` and every request goes through one path —
 cache, routing, cascade, metering — across all your local and cloud backends.
+`GET /v1/models` lists the **real model ids** of every reachable backend, with
+each provider's name kept as a routable alias. Ask for a real id and the hub
+routes to the provider that serves it and forwards **that exact model** — a
+proxy that silently substitutes some default for the model you named is lying
+to you, so naming a model nobody serves is a clear 400, not a quiet fallback.
+
 That claim is tested against the **real `openai` client library**, not just
 curl: non-streaming, streaming (where a framing mistake shows up as zero
 chunks and no error), the opt-in usage chunk, model listing, and the 401 →

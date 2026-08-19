@@ -2899,12 +2899,6 @@ def cache_store(cfg, messages, model, result, usd=0.0, temperature=None):
         return
 
 
-def cache_prune(conf):
-    """Public entry — takes the writer lock. See _cache_prune_locked."""
-    with _CACHE_LOCK:
-        _cache_prune_locked(conf)
-
-
 def _cache_prune_locked(conf):
     """Rewrite the log when it outgrows max_entries, keeping the newest.
     Caller must hold _CACHE_LOCK: this is a read-modify-replace, and an append
@@ -3486,9 +3480,14 @@ def fetch_models(prov):
             r = http_get_json(root + "/api/tags")
             if r and "models" in r:
                 return [m.get("name", "?") for m in r["models"]]
-        # OpenAI-compatible: /v1/models
-        r = http_get_json(base.rstrip("/") + "/v1/models",
-                          api_key=prov.get("api_key"))
+        # OpenAI-compatible: /v1/models. Providers in this tree store base_url
+        # WITH the /v1 suffix (it is what you paste from a provider's docs),
+        # so appending /v1/models verbatim produced /v1/v1/models — a 404 on
+        # every real backend, which read as "no models" rather than a bug.
+        root = base.rstrip("/")
+        if root.endswith("/v1"):
+            root = root[:-3].rstrip("/")
+        r = http_get_json(root + "/v1/models", api_key=prov.get("api_key"))
         if r and "data" in r:
             return [m.get("id", m.get("name", "?")) for m in r["data"]]
     except Exception:

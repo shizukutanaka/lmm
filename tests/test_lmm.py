@@ -2734,6 +2734,16 @@ class StubBackend(object):
         seen = self.seen
 
         class H(http.server.BaseHTTPRequestHandler):
+            def do_GET(self):
+                # A real /v1/models, so fetch_models and the hub's model
+                # aggregation are tested over real HTTP, not monkeypatches.
+                if self.path.rstrip("/").endswith("/v1/models"):
+                    return self._json({"object": "list", "data": [
+                        {"id": "stub-model-a", "object": "model"},
+                        {"id": "stub-model-b", "object": "model"}]})
+                self.send_response(404)
+                self.end_headers()
+
             def do_POST(self):
                 n = int(self.headers.get("Content-Length", 0))
                 req = json.loads(self.rfile.read(n).decode() or "{}")
@@ -2857,6 +2867,105 @@ except ImportError:
 @unittest.skipUnless(HAS_OPENAI, "openai SDK not installed — the suite stays "
                      "zero-dependency; this class runs only where the real "
                      "client library happens to be available")
+class TestTrayWiring(unittest.TestCase):
+    """setup_tray existed with zero callers after the merge — the minimize-
+    to-tray feature was silently severed. Headless CI cannot click a tray
+    icon, so these pin what can be pinned: the platform contract and the
+    wiring."""
+
+    def test_non_windows_is_a_no_op(self):
+        if os.name == "nt":
+            self.skipTest("Windows would actually build the tray")
+        self.assertIsNone(frontend.setup_tray(object()))
+
+    def test_launch_gui_wires_the_tray_and_a_safe_close(self):
+        """The GUI must call setup_tray, and when there is no tray (the
+        return is None) X must destroy the window — withdrawing with no tray
+        icon would orphan the process with no way to bring it back."""
+        import ast
+        path = os.path.join(os.path.dirname(os.path.dirname(
+            os.path.abspath(__file__))), "frontend.py")
+        with open(path, encoding="utf-8") as f:
+            tree = ast.parse(f.read())
+        gui = next(n for n in tree.body
+                   if isinstance(n, ast.FunctionDef) and n.name == "launch_gui")
+        calls = [c.func.id for c in ast.walk(gui)
+                 if isinstance(c, ast.Call) and isinstance(c.func, ast.Name)]
+        self.assertIn("setup_tray", calls)
+        src = ast.get_source_segment(open(path, encoding="utf-8").read(), gui)
+        self.assertIn("root.destroy", src)
+
+
+class TestPerModelRouting(unittest.TestCase):
+    """The hub's /v1/models and per-model routing, over plain HTTP (no SDK
+    needed), so this coverage exists even where the openai package is absent.
+    Master fixed the "stub model ids" bug in fbbc59e; the merge undid it and
+    nothing noticed, because resolve_provider_by_model kept existing with
+    zero callers — a reader-less writer's mirror image."""
+
+    def setUp(self):
+        self.stub = StubBackend()
+        self.cfg = {"providers": {"stub": {
+            "api_key": "k", "base_url": self.stub.base_url,
+            "model": "default-model", "kind": "local"}},
+            "ask_order": ["stub"]}
+
+    def tearDown(self):
+        self.stub.stop()
+
+    def _get(self, hub, path):
+        import urllib.request
+        with urllib.request.urlopen(
+                "http://127.0.0.1:%d%s" % (hub.port, path), timeout=10) as r:
+            return json.loads(r.read().decode())
+
+    def _post(self, hub, payload):
+        import urllib.request
+        req = urllib.request.Request(
+            "http://127.0.0.1:%d/v1/chat/completions" % hub.port,
+            data=json.dumps(payload).encode(),
+            headers={"Content-Type": "application/json"})
+        with urllib.request.urlopen(req, timeout=10) as r:
+            return json.loads(r.read().decode())
+
+    def test_models_lists_real_ids_and_the_provider_alias(self):
+        with temp_state():
+            hub = HubServer(self.cfg)
+            ids = [m["id"] for m in self._get(hub, "/v1/models")["data"]]
+        self.assertEqual(ids, ["stub-model-a", "stub-model-b", "stub"])
+
+    def test_a_model_id_is_forwarded_verbatim(self):
+        with temp_state():
+            hub = HubServer(self.cfg)
+            res = self._post(hub, {"model": "stub-model-a", "lmm_no_cache": 1,
+                                   "messages": [{"role": "user",
+                                                 "content": "hi"}]})
+        self.assertEqual(res["model"], "stub-model-a")
+
+    def test_a_provider_name_still_routes_to_its_default_model(self):
+        with temp_state():
+            hub = HubServer(self.cfg)
+            res = self._post(hub, {"model": "stub", "lmm_no_cache": 1,
+                                   "messages": [{"role": "user",
+                                                 "content": "hi"}]})
+        self.assertEqual(res["model"], "default-model")
+
+    def test_an_unknown_model_is_a_clear_400(self):
+        import urllib.error
+        with temp_state():
+            hub = HubServer(self.cfg)
+            saved = lmm.local_ollama_provider
+            lmm.local_ollama_provider = lambda: None    # no safety net
+            try:
+                with self.assertRaises(urllib.error.HTTPError) as cm:
+                    self._post(hub, {"model": "no-such-model",
+                                     "messages": [{"role": "user",
+                                                   "content": "hi"}]})
+                self.assertEqual(cm.exception.code, 400)
+            finally:
+                lmm.local_ollama_provider = saved
+
+
 class TestOpenAISdkCompat(unittest.TestCase):
     """The README's core claim is "point your apps at the hub". Apps do not
     speak hand-rolled curl — they speak the OpenAI client library, which has
@@ -2922,10 +3031,24 @@ class TestOpenAISdkCompat(unittest.TestCase):
         self.assertEqual(usage.completion_tokens, 200)
 
     def test_models_list_through_the_sdk(self):
+        """Real model ids from the backend, plus the provider name as a
+        routable alias. Listing only provider names — as the hub once did —
+        meant a client could never pick between two models on one backend."""
         with temp_state():
             hub = HubServer(self.cfg())
             ids = [m.id for m in self.client(hub).models.list()]
-        self.assertEqual(ids, ["stub"])
+        self.assertEqual(ids, ["stub-model-a", "stub-model-b", "stub"])
+
+    def test_a_real_model_id_routes_and_is_forwarded(self):
+        """Picking a model from /v1/models must reach the provider that
+        serves it AND request that exact model — not the provider's default.
+        The stub echoes the model it was asked for, so this is end-to-end."""
+        with temp_state():
+            hub = HubServer(self.cfg())
+            res = self.client(hub).chat.completions.create(
+                model="stub-model-b",
+                messages=[{"role": "user", "content": "hi"}])
+        self.assertEqual(res.model, "stub-model-b")
 
     def test_wrong_token_is_an_authentication_error(self):
         with temp_state():

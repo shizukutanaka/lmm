@@ -432,9 +432,23 @@ def cmd_serve_hub(cfg, host, port, quiet=False):
                 self._deny()
                 return
             if self.path.rstrip("/").endswith("/v1/models"):
-                self._send(200, {"object": "list", "data": [
-                    {"id": n, "object": "model", "owned_by": p["kind"]}
-                    for n, p in provs.items()]})
+                # Real model ids from every reachable backend, plus the
+                # provider names themselves as routable aliases. Returning
+                # only provider names — as this once did — meant a client
+                # could never pick between two models on the same backend,
+                # the exact stub-ids bug fbbc59e fixed and the merge undid.
+                data, seen = [], set()
+                for n, p in provs.items():
+                    for mid in fetch_models(p):
+                        if mid not in seen:
+                            seen.add(mid)
+                            data.append({"id": mid, "object": "model",
+                                         "owned_by": n})
+                    if n not in seen:
+                        seen.add(n)
+                        data.append({"id": n, "object": "model",
+                                     "owned_by": p["kind"]})
+                self._send(200, {"object": "list", "data": data})
             else:
                 self._send(404, {"error": "not found"})
 
@@ -456,9 +470,30 @@ def cmd_serve_hub(cfg, host, port, quiet=False):
             # messages array is forwarded, so system prompts and prior turns
             # survive the hop.
             msgs = req.get("messages", [])
-            explicit = req.get("model", "")  # may be a configured provider name
+            # `model` may be a provider name (an alias we list in /v1/models)
+            # or a REAL model id the client picked from that same listing. A
+            # provider name routes to that provider's default model; a model
+            # id must reach the provider that serves it AND be forwarded
+            # verbatim — the client asked for qwen2.5-coder:3b, not for
+            # whatever the provider's config happens to default to.
+            explicit = req.get("model", "")
             targets = resolve_ask_targets(
                 cfg, messages_text(msgs), explicit if explicit in provs else None)
+            if explicit and explicit not in provs:
+                owner = resolve_provider_by_model(provs, explicit)
+                if owner:
+                    targets = [(owner, dict(provs[owner], model=explicit))]
+                else:
+                    # The client named a model nobody serves. Answering with
+                    # some other model anyway — which this handler used to do
+                    # by falling back to default routing — is the one thing a
+                    # proxy must never be: a silent substitution.
+                    self._send(400, {"error": {
+                        "message": "unknown model '%s' — GET /v1/models for "
+                                   "what this hub serves" % explicit,
+                        "type": "invalid_request_error",
+                        "code": "model_not_found"}})
+                    return
             if not targets:
                 self._send(400, {"error": "no provider available for model '%s'" % explicit})
                 return
@@ -752,6 +787,15 @@ def launch_gui(cfg):
         return
     root.title("LMM — Local/remote Model Manager")
     root.geometry("920x560")
+
+    # Windows: a system-tray icon, so minimizing keeps lmm running in the
+    # background (the taskbar-tidiness thesis applied to lmm itself).
+    # setup_tray wires X -> withdraw and returns a cleanup; on non-Windows it
+    # returns None and X keeps its default meaning — closing a window must
+    # never orphan a process that has no tray icon to bring it back.
+    tray_cleanup = setup_tray(root)
+    if tray_cleanup is None:
+        root.protocol("WM_DELETE_WINDOW", root.destroy)
 
     style = ttk.Style()
     try:
