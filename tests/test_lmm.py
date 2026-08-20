@@ -4042,6 +4042,45 @@ class TestClaimsSurviveElenchus(unittest.TestCase):
             stub.stop()
 
 
+class TestRetryAfterSurvivesElenchus(unittest.TestCase):
+    """Claim: "a 429's Retry-After is honoured but capped, so a hostile
+    header cannot park the hub." Acquitted — these are the acquittal's
+    evidence: the parser was tested, but nothing proved the retry LOOP
+    actually waits the header's time, nor that the cap really binds.
+    """
+
+    def _run(self, retry_after, cap_ms=8000):
+        sleeps = []
+        calls = []
+        saved = lmm.call_provider
+        try:
+            def fake(prov, prompt, temperature=0.7, extra=None, **kw):
+                calls.append(1)
+                if len(calls) == 1:
+                    return {"error": "429", "retriable": True,
+                            "retry_after": retry_after, "status": 429}
+                return {"choices": [{"message": {"content": "ok"}}]}
+            lmm.call_provider = fake
+            res = lmm.call_with_retry(
+                {"model": "m", "base_url": "http://x/v1"}, "hi",
+                retry={"attempts": 3, "base_ms": 250, "cap_ms": cap_ms},
+                sleep=sleeps.append)
+            return res, sleeps
+        finally:
+            lmm.call_provider = saved
+
+    def test_the_loop_waits_what_the_server_asked(self):
+        res, sleeps = self._run(retry_after=2.0)
+        self.assertEqual(sleeps, [2.0],
+                         "Retry-After was parsed but not obeyed by the loop")
+        self.assertIn("choices", res)
+
+    def test_a_hostile_header_cannot_park_the_hub(self):
+        res, sleeps = self._run(retry_after=86400.0, cap_ms=8000)
+        self.assertEqual(sleeps, [8.0],
+                         "a hostile Retry-After exceeded the backoff ceiling")
+
+
 class TestPrivacyPinSurvivesElenchus(unittest.TestCase):
     """Claim on trial: "route.private pins a prompt to local providers."
     Cross-examined, the pin yielded three ways: with ask_order set the check
