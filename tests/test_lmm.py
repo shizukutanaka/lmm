@@ -4070,6 +4070,76 @@ class TestClaimsSurviveElenchus(unittest.TestCase):
             stub.stop()
 
 
+class TestTelemetrySurvivesElenchus(unittest.TestCase):
+    """Two sworn statements from the code itself, cross-examined.
+
+    "Telemetry must not be able to break the call it is measuring"
+    (log_usage). First exhibit was thrown out: a chmod-based read-only
+    directory proves nothing under root, which ignores permission bits —
+    the "read-only" dir quietly accepted all three files. This version
+    injects EROFS at the open() itself, so it binds for any uid.
+
+    "Those tokens were generated and billed whether or not anyone read
+    them" (hub_stream's finally). Proven by hanging up mid-stream and
+    finding the spend on the books, flagged partial.
+    """
+
+    def setUp(self):
+        self.stub = StubBackend()
+        self.cfg = {"providers": {"stub": {
+            "api_key": "k", "base_url": self.stub.base_url,
+            "model": "m", "kind": "local"}}, "ask_order": ["stub"]}
+
+    def tearDown(self):
+        self.stub.stop()
+
+    def test_a_read_only_disk_never_breaks_the_call(self):
+        import builtins
+        import errno
+        with temp_state():
+            targets = lmm.resolve_ask_targets(self.cfg, "x", None)
+            real_open = builtins.open
+
+            def refusing(path, *a, **kw):
+                mode = a[0] if a else kw.get("mode", "r")
+                if isinstance(path, str) and path.startswith(lmm.LMM_DIR) \
+                        and any(m in mode for m in "wax+"):
+                    raise OSError(errno.EROFS, "Read-only file system", path)
+                return real_open(path, *a, **kw)
+
+            builtins.open = refusing
+            try:
+                res, _ = lmm.hub_complete(self.cfg, "what is 2+2", targets,
+                                          {"cache": True, "source": "ask"})
+                self.assertIn("choices", res,
+                              "a full disk/read-only disk broke the answer")
+                b = lmm.CircuitBreaker(persist=True)
+                for _ in range(3):
+                    b.record_failure("dead")     # must not raise
+                self.assertFalse(b.available("dead"),
+                                 "the in-memory half stopped working too")
+                frames = list(lmm.hub_stream(
+                    self.cfg, [{"role": "user", "content": "hi"}], targets,
+                    {"cache": True, "source": "chat"}))
+                self.assertTrue(any(b"data:" in f for f in frames))
+            finally:
+                builtins.open = real_open
+
+    def test_an_abandoned_stream_is_still_billed(self):
+        with temp_state():
+            targets = lmm.resolve_ask_targets(self.cfg, "hi", None)
+            gen = lmm.hub_stream(self.cfg,
+                                 [{"role": "user", "content": "hi"}],
+                                 targets, {"cache": False, "source": "hub"})
+            next(gen)                    # the client reads one frame...
+            gen.close()                  # ...and hangs up
+            evs = [e for e in lmm.read_usage() if not e.get("event")]
+            self.assertEqual(len(evs), 1,
+                             "tokens were generated but never billed")
+            self.assertTrue(evs[0].get("partial"),
+                            "an abandoned stream must be flagged partial")
+
+
 class TestCompatSurvivesElenchus(unittest.TestCase):
     """Two acquittals with the evidence entered.
 
