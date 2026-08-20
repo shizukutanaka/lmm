@@ -561,6 +561,13 @@ and it had three holes: a single transient blip abandoned a working provider, a
 permanently dead one was re-tried first on *every* request, and `429`'s
 `Retry-After` was ignored. Two standard patterns close them:
 
+The breaker's memory outlives the process: state lives in
+`~/.lmm/breaker.json`, so five consecutive `lmm ask` runs against a dead
+backend pay its timeout at most `threshold` times, not five. Cross-process
+writes are last-writer-wins — the same openly-taken trade as the metering
+log; the state is advisory, so the worst case is one extra probe. Delete the
+file (or wait out `cooldown_s`) when you know the outage is over.
+
 **Retry with full jitter** — a transient failure (`429`, `5xx`, connection
 error, timeout) is retried on the *same* provider before failing over, with the
 delay drawn uniformly from `[0, min(cap, base·2^attempt)]`. That randomisation

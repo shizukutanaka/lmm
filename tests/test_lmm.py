@@ -4037,6 +4037,99 @@ class TestClaimsSurviveElenchus(unittest.TestCase):
             stub.stop()
 
 
+class TestBreakerSurvivesElenchus(unittest.TestCase):
+    """Claim: "a dead backend stops charging every request its full timeout."
+    Cross-examined, it failed twice: `lmm ask` never engaged the breaker at
+    all (the comment beside HUB_BREAKER even said ask "makes a fresh one per
+    process" — it made none), and the state died with the process, so a CLI
+    user re-paid the timeout on every single run.
+    """
+
+    def _cfg(self, stub):
+        return {"providers": {
+            "dead": {"api_key": "k", "base_url": "http://127.0.0.1:9/v1",
+                     "model": "m", "kind": "local"},
+            "good": {"api_key": "k", "base_url": stub.base_url,
+                     "model": "m", "kind": "local"}},
+            "ask_order": ["dead", "good"],
+            "retry": {"attempts": 1},
+            "breaker": {"enabled": True, "threshold": 3, "cooldown_s": 300}}
+
+    def test_ask_stops_paying_for_a_dead_provider(self):
+        """5 asks, dead provider first in ask_order: it may be attempted at
+        most `threshold` times before the circuit opens and it is skipped."""
+        stub = StubBackend()
+        attempts = []
+        real = lmm.call_with_retry
+
+        def counting(prov, *a, **kw):
+            attempts.append(prov["base_url"])
+            return real(prov, *a, **kw)
+
+        lmm.call_with_retry = counting
+        try:
+            with temp_state():
+                import io
+                import contextlib
+                cfg = self._cfg(stub)
+                for _ in range(5):
+                    with contextlib.redirect_stdout(io.StringIO()):
+                        frontend.cmd_ask("hi", None, cfg, no_cache=True)
+                dead_tries = sum(1 for u in attempts if ":9/" in u)
+                self.assertEqual(dead_tries, 3,
+                                 "the dead provider was attempted %d times "
+                                 "across 5 asks; the breaker never opened"
+                                 % dead_tries)
+        finally:
+            lmm.call_with_retry = real
+            stub.stop()
+
+    def test_the_open_circuit_survives_the_process(self):
+        """The half that made the claim false for CLI users: a second
+        process must inherit the first one's open circuit."""
+        import subprocess
+        home = tempfile.mkdtemp(prefix="lmm-breaker-")
+        root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        env = dict(os.environ, HOME=home)
+        script1 = (
+            "import sys; sys.path.insert(0, %r); import backend\n"
+            "for _ in range(3): backend.HUB_BREAKER.record_failure('dead')\n"
+            "print(backend.HUB_BREAKER.available('dead'))" % root)
+        script2 = (
+            "import sys; sys.path.insert(0, %r); import backend\n"
+            "print(backend.HUB_BREAKER.available('dead'))" % root)
+        try:
+            r1 = subprocess.run([sys.executable, "-c", script1], env=env,
+                                capture_output=True, text=True, timeout=120)
+            self.assertEqual(r1.stdout.strip(), "False", r1.stderr)
+            r2 = subprocess.run([sys.executable, "-c", script2], env=env,
+                                capture_output=True, text=True, timeout=120)
+            self.assertEqual(r2.stdout.strip(), "False",
+                             "a fresh process forgot the open circuit: "
+                             + r2.stderr)
+        finally:
+            shutil.rmtree(home, ignore_errors=True)
+
+    def test_healthy_traffic_writes_no_state_file(self):
+        """record_success on a name with no history must not touch disk —
+        otherwise every successful call becomes a disk write."""
+        with temp_state():
+            lmm.HUB_BREAKER.record_success("fine")
+            self.assertFalse(
+                os.path.exists(os.path.join(lmm.LMM_DIR, "breaker.json")),
+                "a healthy call wrote breaker state")
+
+    def test_recovery_is_forgettable(self):
+        with temp_state():
+            for _ in range(3):
+                lmm.HUB_BREAKER.record_failure("dead")
+            self.assertFalse(lmm.HUB_BREAKER.available("dead"))
+            lmm.HUB_BREAKER.reset()
+            self.assertTrue(lmm.HUB_BREAKER.available("dead"))
+            self.assertFalse(
+                os.path.exists(os.path.join(lmm.LMM_DIR, "breaker.json")))
+
+
 class TestClosedLoop(unittest.TestCase):
     """The product's core claim: routing outcomes are measured, and the
     measurements are readable. The merge silently broke this — the readers
@@ -4200,6 +4293,10 @@ class temp_state(object):
         self.dir = tempfile.mkdtemp(prefix="lmm-test-")
         self.saved = (lmm.LMM_DIR, lmm.USAGE_LOG, lmm.CACHE_LOG,
                       lmm.CLAUDE_PROJECTS)
+        # The breaker is process-wide AND persisted; without a reset, one
+        # test opening a circuit for "stub" poisons every later test that
+        # reuses the name — for cooldown_s of wall time.
+        lmm.HUB_BREAKER.reset()
         lmm.LMM_DIR = self.dir
         lmm.USAGE_LOG = os.path.join(self.dir, "usage.jsonl")
         lmm.CACHE_LOG = os.path.join(self.dir, "cache.jsonl")
@@ -4210,6 +4307,7 @@ class temp_state(object):
         return self
 
     def __exit__(self, *exc):
+        lmm.HUB_BREAKER.reset()
         (lmm.LMM_DIR, lmm.USAGE_LOG, lmm.CACHE_LOG,
          lmm.CLAUDE_PROJECTS) = self.saved
         for name in ("usage.jsonl", "cache.jsonl"):

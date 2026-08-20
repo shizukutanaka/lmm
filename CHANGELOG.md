@@ -95,6 +95,16 @@ the merge of the managed-routing line of work into the same tool.
   suite stays zero-dependency.
 
 ### Fixed
+- **The circuit breaker was a hub-only story.** "A dead backend stops
+  charging every request its full timeout" failed cross-examination twice:
+  `lmm ask` never passed a breaker into the request path at all — the
+  comment beside HUB_BREAKER claimed ask "makes a fresh one per process",
+  and it made none — and the state died with the process, so every CLI run
+  re-paid the timeout. The breaker now rides the ask and --verify paths and
+  persists to `~/.lmm/breaker.json` (wall-clock cooldowns, last-writer-wins
+  across processes, zero writes on healthy traffic). Proven across real
+  processes: a second interpreter inherits the first one's open circuit,
+  and five asks attempt a dead provider exactly `threshold` times.
 - **The documented env-var key pattern sent the literal string.** `lmm
   secrets` prints "move secrets to environment variables; lmm reads them at
   call time", and the README shows `"api_key": "$OPENAI_API_KEY"` — but

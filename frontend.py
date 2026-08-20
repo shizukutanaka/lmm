@@ -1056,9 +1056,14 @@ def cmd_ask(prompt, provider, cfg, cascade=False, no_cache=False,
         thr = cfg.get("route_threshold", DEFAULT_ROUTE_THRESHOLD)
         print(f"[route] strength={score:.2f} threshold={thr} -> "
               + ", ".join(n for n, _ in backend.order_targets(cfg, prompt, targets)))
+    brk = merged_breaker(cfg)
+    HUB_BREAKER.threshold = int(brk.get("threshold", 3))
+    HUB_BREAKER.cooldown_s = float(brk.get("cooldown_s", 30))
     res, trace = hub_complete(cfg, prompt, targets,
                               {"cascade": cascade, "cache": not no_cache,
-                               "source": "ask"})
+                               "source": "ask",
+                               "breaker": HUB_BREAKER
+                               if brk.get("enabled", True) else None})
     for line in trace:               # warnings are never hidden behind --explain
         if explain or line.startswith("[warn]"):
             print(line)

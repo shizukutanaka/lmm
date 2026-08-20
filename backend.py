@@ -939,30 +939,85 @@ class CircuitBreaker:
                  failure re-opens it.
 
     The clock is injectable (`now`) so state transitions are testable without
-    sleeping. State is per-process: it helps the long-lived hub, and does no
-    harm to a one-shot `lmm ask`.
+    sleeping. The clock is wall time, deliberately: with persist=True the
+    state survives the process in ~/.lmm/breaker.json, so consecutive one-shot
+    `lmm ask` invocations share the memory — without that, "a dead backend
+    stops charging every request its timeout" was only true inside a single
+    long-lived hub, and a CLI user paid the full timeout on every run.
+    Cross-process writes are last-writer-wins, the same openly-taken trade as
+    the metering log; the state is advisory, so the worst case is one extra
+    probe of a dead backend.
     """
 
-    def __init__(self, threshold=3, cooldown_s=30):
+    def __init__(self, threshold=3, cooldown_s=30, persist=False):
         self.threshold = threshold
         self.cooldown_s = cooldown_s
+        self.persist = persist
+        self._loaded = False
         self._fails = {}
         self._open_until = {}
+        self._lock = threading.Lock()
+
+    def _path(self):
+        return os.path.join(LMM_DIR, "breaker.json")
+
+    def _load_locked(self):
+        if self._loaded or not self.persist:
+            return
+        self._loaded = True
+        try:
+            with open(self._path(), encoding="utf-8") as fh:
+                d = json.load(fh)
+            now = time.time()
+            for k, v in (d.get("open_until") or {}).items():
+                if isinstance(v, (int, float)) and v > now:
+                    self._open_until.setdefault(k, v)
+            for k, v in (d.get("fails") or {}).items():
+                if isinstance(v, int) and v > 0:
+                    self._fails.setdefault(k, v)
+        except Exception:
+            pass                      # a missing or corrupt file is a closed circuit
+
+    def _save_locked(self):
+        if not self.persist:
+            return
+        try:
+            now = time.time()
+            os.makedirs(LMM_DIR, exist_ok=True)
+            state = {"fails": {k: v for k, v in self._fails.items() if v > 0},
+                     "open_until": {k: v for k, v in self._open_until.items()
+                                    if v > now}}
+            tmp = self._path() + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as fh:
+                json.dump(state, fh)
+            os.replace(tmp, self._path())
+        except Exception:
+            pass                      # telemetry must not break the call
 
     def record_success(self, name):
-        self._fails.pop(name, None)
-        self._open_until.pop(name, None)
+        with self._lock:
+            self._load_locked()
+            changed = name in self._fails or name in self._open_until
+            self._fails.pop(name, None)
+            self._open_until.pop(name, None)
+            if changed:               # healthy steady state writes nothing
+                self._save_locked()
 
     def record_failure(self, name, now=None):
         now = time.time() if now is None else now
-        n = self._fails.get(name, 0) + 1
-        self._fails[name] = n
-        if n >= self.threshold:
-            self._open_until[name] = now + self.cooldown_s
+        with self._lock:
+            self._load_locked()
+            n = self._fails.get(name, 0) + 1
+            self._fails[name] = n
+            if n >= self.threshold:
+                self._open_until[name] = now + self.cooldown_s
+            self._save_locked()
 
     def state(self, name, now=None):
         now = time.time() if now is None else now
-        until = self._open_until.get(name)
+        with self._lock:
+            self._load_locked()
+            until = self._open_until.get(name)
         if until is None:
             return "closed"
         return "open" if now < until else "half-open"
@@ -971,10 +1026,23 @@ class CircuitBreaker:
         """A provider is available unless its circuit is fully open."""
         return self.state(name, now) != "open"
 
+    def reset(self):
+        """Forget everything, including the persisted file. For tests and for
+        a user who knows the outage is over (`rm ~/.lmm/breaker.json` works
+        just as well — this is that, plus the in-memory half)."""
+        with self._lock:
+            self._fails.clear()
+            self._open_until.clear()
+            self._loaded = False
+            try:
+                os.remove(self._path())
+            except OSError:
+                pass
 
-# Shared by the long-lived hub across requests. `lmm ask` makes a fresh one per
-# process, which is fine — the breaker only pays off when many requests share it.
-HUB_BREAKER = CircuitBreaker()
+
+# Shared by every path in this process, and — because persist=True — by
+# consecutive CLI processes too, via ~/.lmm/breaker.json.
+HUB_BREAKER = CircuitBreaker(persist=True)
 
 
 def merged_route(cfg):
@@ -3632,11 +3700,17 @@ def route_and_verify(task, cfg, ask_order=None, max_tries=3):
         return None, "no reachable backend", None
     tried = []
     pricing = merged_pricing(cfg)
-    for name, prov in order_targets(cfg, task, targets)[:max_tries]:
+    ordered = order_targets(cfg, task, targets)
+    if merged_breaker(cfg).get("enabled", True):
+        live = [(n, p) for n, p in ordered if HUB_BREAKER.available(n)]
+        if live:                        # never skip the last one standing
+            ordered = live
+    for name, prov in ordered[:max_tries]:
         t0 = time.time()
         r = call_provider(prov, task, stream=False)
         elapsed_ms = int((time.time() - t0) * 1000)
         if isinstance(r, dict) and r.get("error"):
+            HUB_BREAKER.record_failure(name)
             tried.append(f"{name} error: {r['error']}")
             continue
         try:
@@ -3649,6 +3723,8 @@ def route_and_verify(task, cfg, ask_order=None, max_tries=3):
         # answer was still generated and still billed. Leaving this loop
         # unmetered contradicted the product's first claim — every call lmm
         # makes shows up in the bill.
+        HUB_BREAKER.record_success(name)   # a real reply closes the circuit,
+                                            # whatever the quality gate says
         meter_call(name, prov, prov.get("model"), r, pricing,
                    source="verify", cache="miss", accepted=bool(ok),
                    ms=elapsed_ms)
