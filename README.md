@@ -512,6 +512,10 @@ Edit settings from the CLI with `lmm config` — no hand-editing JSON:
 lmm config init                                   # create ~/.lmm/config.json
 lmm config set ask_order '["openai","local-ollama(implicit)"]'
 lmm config set providers.openai '{"kind":"cloud","base_url":"https://api.openai.com/v1","api_key":"$OPENAI_API_KEY","model":"gpt-4o"}'
+# "$OPENAI_API_KEY" is expanded from the environment when providers are
+# resolved, so the secret never sits in the file. If the variable is not
+# set, the literal "$NAME" is kept and `lmm doctor` names it — instead of
+# the provider's 401 being the only witness.
 lmm config get ask_order
 lmm config unset providers.openai
 ```

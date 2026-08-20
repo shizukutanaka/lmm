@@ -1056,8 +1056,19 @@ def merged_providers(cfg):
     for name, v in (cfg.get("providers") or {}).items():
         if not isinstance(v, dict):
             continue
+        key = v.get("api_key", "")
+        # "api_key": "$OPENAI_API_KEY" is the documented way to keep the
+        # secret out of the config file — and `lmm secrets` explicitly
+        # promises "lmm reads them at call time". Until this line existed,
+        # nothing did: the literal string "$OPENAI_API_KEY" went out as the
+        # bearer token and auth failed with no hint why. Expansion happens
+        # here because this is the one gateway from config to providers; an
+        # UNSET variable stays as the literal "$NAME", which `lmm doctor`
+        # reports by name instead of letting the 401 be the only witness.
+        if isinstance(key, str) and "$" in key:
+            key = os.path.expandvars(key)
         provs[name] = {
-            "api_key": v.get("api_key", ""),
+            "api_key": key,
             "base_url": v.get("base_url", "https://api.openai.com/v1"),
             "model": v.get("model", ""),
             "kind": v.get("kind", "remote"),
@@ -3378,6 +3389,8 @@ def bench_once(prov, prompt, max_tokens=128):
     tpot = (e2e - ttft) / (out - 1) if out > 1 else 0.0
     return {"ttft_ms": ttft * 1000, "tpot_ms": tpot * 1000, "e2e_ms": e2e * 1000,
             "out_tokens": out, "tok_per_s": out / e2e if e2e > 0 else 0.0,
+            "in_tokens": (usage or {}).get("prompt_tokens")
+            or estimate_tokens(prompt),
             "estimated": usage is None}
 
 
@@ -3618,8 +3631,11 @@ def route_and_verify(task, cfg, ask_order=None, max_tries=3):
     if not targets:
         return None, "no reachable backend", None
     tried = []
+    pricing = merged_pricing(cfg)
     for name, prov in order_targets(cfg, task, targets)[:max_tries]:
+        t0 = time.time()
         r = call_provider(prov, task, stream=False)
+        elapsed_ms = int((time.time() - t0) * 1000)
         if isinstance(r, dict) and r.get("error"):
             tried.append(f"{name} error: {r['error']}")
             continue
@@ -3629,6 +3645,13 @@ def route_and_verify(task, cfg, ask_order=None, max_tries=3):
             tried.append(f"{name} bad response")
             continue
         ok, vreason = verify_reply(task, reply)
+        # Metered whether the gate accepts the reply or not: a rejected
+        # answer was still generated and still billed. Leaving this loop
+        # unmetered contradicted the product's first claim — every call lmm
+        # makes shows up in the bill.
+        meter_call(name, prov, prov.get("model"), r, pricing,
+                   source="verify", cache="miss", accepted=bool(ok),
+                   ms=elapsed_ms)
         if ok:
             return name, f"verified ok ({vreason})", reply
         tried.append(f"{name} failed verify: {vreason}")

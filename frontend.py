@@ -1108,7 +1108,22 @@ def cmd_bench(cfg, provider=None, runs=3, prompt=None, max_tokens=128):
         # The first call pays for model load, connection setup and any cold
         # cache. Including it would measure the machine's startup, not its
         # steady-state serving speed, so it is discarded.
-        warm = bench_once(prov, prompt, max_tokens)
+        def bill(res):
+            # A benchmark spends real tokens — the warm-up too. A measuring
+            # instrument that spends money off the books contradicted the
+            # product's first claim, so every bench call is metered like any
+            # other, under its own source so `lmm cost` shows what measuring
+            # itself has cost you.
+            if not res.get("error"):
+                meter_call(name, prov, prov.get("model"),
+                           {"usage": {"prompt_tokens": res.get("in_tokens", 0),
+                                      "completion_tokens": res.get("out_tokens", 0)}},
+                           pricing, source="bench",
+                           estimated=bool(res.get("estimated")),
+                           ms=int(res.get("e2e_ms", 0)))
+            return res
+
+        warm = bill(bench_once(prov, prompt, max_tokens))
         if warm.get("error"):
             print(f"  {name:<26} failed: {warm['error']}")
             continue
@@ -1118,7 +1133,7 @@ def cmd_bench(cfg, provider=None, runs=3, prompt=None, max_tokens=128):
             # the server's prefix cache (Ollama and vLLM both keep one) and
             # report a cache-hit TTFT instead of a real prefill — the run would
             # measure the cache, not the model.
-            r = bench_once(prov, "(%d) %s" % (i, prompt), max_tokens)
+            r = bill(bench_once(prov, "(%d) %s" % (i, prompt), max_tokens))
             if not r.get("error"):
                 samples.append(r)
         if not samples:
@@ -1746,7 +1761,16 @@ def cmd_doctor(cfg):
     #    the machine checks above see local processes, but a cloud provider
     #    has no process to see — only a probe can grade it)
     provs = (cfg.get("providers") or {}) if isinstance(cfg, dict) else {}
+    resolved = merged_providers(cfg) if isinstance(cfg, dict) else {}
     for name, prov in provs.items():
+        # An api_key of "$NAME" is the documented env-var pattern. If it is
+        # still "$NAME" after expansion, the variable is not set in THIS
+        # environment — say so by name, or the only witness is a 401.
+        rkey = (resolved.get(name) or {}).get("api_key", "")
+        if isinstance(rkey, str) and rkey.startswith("$"):
+            chk(f"provider '{name}' api_key env var set", False,
+                f"{rkey} is not set in this environment")
+        prov = resolved.get(name) or prov
         ok = False
         detail = ""
         try:

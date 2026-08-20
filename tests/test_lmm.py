@@ -3875,6 +3875,168 @@ class TestOneOfEach(unittest.TestCase):
             stub.stop()
 
 
+class TestClaimsSurviveElenchus(unittest.TestCase):
+    """The product's strongest claims, cross-examined the Socratic way: take
+    the claim, derive a consequence, test the consequence for real. Each test
+    here began as a refutation — the claim was FALSE when first examined —
+    and stays as the proof that it is now true.
+
+    Claim 1: "move secrets to environment variables; lmm reads them at call
+    time" (printed by `lmm secrets`, documented in the README). Refuted:
+    nothing expanded $VARS — the literal string "$OPENAI_API_KEY" went out
+    as the bearer token.
+    Claim 2: "every call lmm makes is metered". Refuted twice: `ask
+    --verify` and `lmm bench` both called providers directly and spent off
+    the books.
+    """
+
+    class _AuthStub(object):
+        """Tiny server that records the Authorization header it receives."""
+
+        def __init__(self):
+            import http.server
+            import socketserver
+            import threading
+            self.auth = []
+            auth = self.auth
+
+            class H(http.server.BaseHTTPRequestHandler):
+                def do_POST(self):
+                    auth.append(self.headers.get("Authorization"))
+                    body = json.dumps({"choices": [{"message": {
+                        "content": "The Schrodinger equation governs how the "
+                                   "quantum state of a physical system evolves "
+                                   "over time via the Hamiltonian, and it "
+                                   "underlies superposition and interference "
+                                   "throughout quantum mechanics."}}],
+                        "usage": {"prompt_tokens": 10,
+                                  "completion_tokens": 40}}).encode()
+                    self.send_response(200)
+                    self.send_header("Content-Type", "application/json")
+                    self.send_header("Content-Length", str(len(body)))
+                    self.end_headers()
+                    self.wfile.write(body)
+
+                def log_message(self, *a):
+                    pass
+
+            class S(socketserver.ThreadingMixIn, http.server.HTTPServer):
+                daemon_threads = True
+
+            self.httpd = S(("127.0.0.1", 0), H)
+            self.port = self.httpd.server_address[1]
+            threading.Thread(target=self.httpd.serve_forever,
+                             daemon=True).start()
+
+        @property
+        def base_url(self):
+            return "http://127.0.0.1:%d/v1" % self.port
+
+        def stop(self):
+            self.httpd.shutdown()
+            self.httpd.server_close()
+
+    def test_a_dollar_api_key_sends_the_env_value_not_the_literal(self):
+        stub = self._AuthStub()
+        os.environ["LMM_TEST_KEY"] = "sk-real-value-from-env"
+        try:
+            cfg = {"providers": {"p": {
+                "api_key": "$LMM_TEST_KEY", "base_url": stub.base_url,
+                "model": "m", "kind": "cloud"}}}
+            prov = lmm.merged_providers(cfg)["p"]
+            lmm.call_provider(prov, "hi")
+            self.assertEqual(stub.auth[-1], "Bearer sk-real-value-from-env",
+                             "the documented $VAR pattern sent: %r"
+                             % stub.auth[-1])
+        finally:
+            del os.environ["LMM_TEST_KEY"]
+            stub.stop()
+
+    def test_an_unset_env_var_is_named_by_doctor(self):
+        """A missing variable must be reported by NAME — otherwise the only
+        witness is a 401 from the provider."""
+        import io
+        import contextlib
+        cfg = {"providers": {"p": {
+            "api_key": "$LMM_UNSET_VAR_FOR_TEST",
+            "base_url": "http://127.0.0.1:9/v1", "model": "m",
+            "kind": "cloud"}}}
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            try:
+                frontend.cmd_doctor(cfg)
+            except SystemExit:
+                pass
+        out = buf.getvalue()
+        self.assertIn("LMM_UNSET_VAR_FOR_TEST", out)
+        self.assertIn("api_key env var set", out)
+
+    def test_verify_calls_are_metered_accepted_and_rejected(self):
+        stub = self._AuthStub()
+        try:
+            with temp_state():
+                cfg = {"providers": {"good": {
+                    "api_key": "k", "base_url": stub.base_url,
+                    "model": "m", "kind": "local"}},
+                    "ask_order": ["good"]}
+                name, reason, reply = lmm.route_and_verify(
+                    "explain quantum mechanics", cfg)
+                self.assertEqual(name, "good")
+                metered = [e for e in lmm.read_usage()
+                           if not e.get("event")
+                           and e.get("source") == "verify"]
+                self.assertEqual(len(metered), 1,
+                                 "an accepted --verify call left no meter event")
+                self.assertTrue(metered[0].get("accepted"))
+                self.assertEqual(metered[0].get("out"), 40)
+        finally:
+            stub.stop()
+
+    def test_a_rejected_verify_reply_is_still_billed(self):
+        """The gate rejecting an answer does not un-spend the tokens."""
+        saved = lmm.call_provider
+        try:
+            with temp_state():
+                lmm.call_provider = lambda prov, task, **kw: {
+                    "choices": [{"message": {"content": "Short."}}],
+                    "usage": {"prompt_tokens": 5, "completion_tokens": 2}}
+                cfg = {"providers": {"p": {
+                    "api_key": "k", "base_url": "http://127.0.0.1:9/v1",
+                    "model": "m", "kind": "local"}}, "ask_order": ["p"]}
+                name, reason, reply = lmm.route_and_verify(
+                    "explain quantum mechanics", cfg, max_tries=1)
+                self.assertIsNone(name)
+                metered = [e for e in lmm.read_usage()
+                           if not e.get("event")
+                           and e.get("source") == "verify"]
+                self.assertEqual(len(metered), 1,
+                                 "a rejected reply was spent off the books")
+                self.assertFalse(metered[0].get("accepted"))
+        finally:
+            lmm.call_provider = saved
+
+    def test_bench_meters_every_run_including_the_warmup(self):
+        stub = StubBackend()
+        try:
+            with temp_state():
+                import io
+                import contextlib
+                cfg = {"providers": {"stub": {
+                    "api_key": "k", "base_url": stub.base_url,
+                    "model": "m", "kind": "local"}},
+                    "ask_order": ["stub"]}
+                with contextlib.redirect_stdout(io.StringIO()):
+                    frontend.cmd_bench(cfg, "stub", 2, "hello", 16)
+                metered = [e for e in lmm.read_usage()
+                           if not e.get("event")
+                           and e.get("source") == "bench"]
+                self.assertEqual(len(metered), 3,
+                                 "bench runs (2) + warm-up (1) must all be "
+                                 "billed, got %d" % len(metered))
+        finally:
+            stub.stop()
+
+
 class TestClosedLoop(unittest.TestCase):
     """The product's core claim: routing outcomes are measured, and the
     measurements are readable. The merge silently broke this — the readers

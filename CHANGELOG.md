@@ -95,6 +95,21 @@ the merge of the managed-routing line of work into the same tool.
   suite stays zero-dependency.
 
 ### Fixed
+- **The documented env-var key pattern sent the literal string.** `lmm
+  secrets` prints "move secrets to environment variables; lmm reads them at
+  call time", and the README shows `"api_key": "$OPENAI_API_KEY"` — but
+  nothing anywhere expanded it. Captured on the wire: `Authorization: Bearer
+  $OPENAI_API_KEY`, so following the product's own security advice broke
+  auth with no hint why. Expansion now happens at the one gateway from
+  config to providers; an UNSET variable stays literal and `lmm doctor`
+  reports it by name.
+- **Two spenders were off the books.** "Every call lmm makes is metered" was
+  false twice over: `ask --verify` called providers directly and metered
+  nothing — including rejected replies, which are billed whether the quality
+  gate likes them or not — and `lmm bench` spent tokens on every run,
+  warm-up included, invisibly. Both now meter under their own sources
+  (`verify`, `bench`), so `lmm cost` shows what verifying and measuring have
+  cost you.
 - **The hub probed liveness on every request — with subprocesses.** Both
   implicit-provider detectors ran per request, even when the request named an
   explicit provider: measured under concurrent load at 2.00 subprocess spawns
