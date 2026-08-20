@@ -1,12 +1,17 @@
 #!/usr/bin/env bash
 # lmm pre-push hook -- never let a broken hub reach the remote.
 #
-# Philosophy: measure, don't trust. The hub must prove itself before it ships.
-# At push time the change is already COMMITTED, so we test the exact blob that
-# is about to be pushed (git show <local_sha>:<path>) rather than the working
-# tree, and we run the artifact's OWN self-proof (`python <blob> selftest --guard`)
-# directly. A valid-Python-but-broken file passes py_compile + line-count yet
-# fails its embedded selftest, so this catches class-8 style corruption.
+# Philosophy: measure, don't trust. At push time the change is already
+# COMMITTED, so we test the exact REVISION being pushed -- not the working
+# tree, which may contain unpushed edits that mask or cause a failure.
+#
+# This used to extract each changed .py file and run its selftest as a lone
+# blob. That premise died when lmm became three files that import each other:
+# a lone lmm.py exits 1 by design (missing siblings), so the old hook blocked
+# every push -- and only ran at all on one specific machine, because it
+# hardcoded that machine's temp directory. A git worktree checks out the
+# pushed revision as a complete tree into a portable temp dir, and running
+# from inside it needs no path translation on MSYS either.
 #
 # Bypass (explicit override, per self-edit-gate convention):
 #   LMM_SKIP_HOOK=1 git push ...
@@ -17,61 +22,30 @@ if [ "${LMM_SKIP_HOOK:-0}" = "1" ]; then
   exit 0
 fi
 
-# pre-push receives lines: <local-ref> <local-sha> <remote-ref> <remote-sha>
 status=0
+tested=""
+# pre-push receives lines: <local-ref> <local-sha> <remote-ref> <remote-sha>
 while read -r local_ref local_sha remote_ref remote_sha; do
   [ -z "${local_sha:-}" ] && continue
-  # Figure out the diff base. A brand-new branch has a zero remote_sha.
-  if [ "${remote_sha:-0}" = "0000000000000000000000000000000000000000" ]; then
-    base=""
-  else
-    base="${remote_sha}"
+  # Deleting a remote branch pushes the zero sha; nothing to test.
+  case "${local_sha}" in 0000000000000000000000000000000000000000) continue ;; esac
+  # Several refs can point at the same commit; prove each revision once.
+  case " ${tested} " in *" ${local_sha} "*) continue ;; esac
+  tested="${tested} ${local_sha}"
+
+  echo "[pre-push] self-proof of the exact pushed revision ${local_sha:0:8}:" >&2
+  tmpdir=$(mktemp -d 2>/dev/null) || { echo "[pre-push] mktemp failed; skipping guard." >&2; continue; }
+  if ! git worktree add --detach --quiet "${tmpdir}" "${local_sha}" 2>/dev/null; then
+    rm -rf "${tmpdir}"
+    echo "[pre-push] could not check out ${local_sha:0:8}; skipping guard." >&2
+    continue
   fi
-
-  # Python files changed in this push (against the remote we push to).
-  if [ -n "${base}" ]; then
-    changed_py=$(git diff --name-only "${base}" "${local_sha}" 2>/dev/null | grep -E '\.py$' || true)
-  else
-    changed_py=$(git diff --name-only "${local_sha}" 2>/dev/null | grep -E '\.py$' || true)
+  if ! (cd "${tmpdir}" && LMM_SELFTEST_SKIP_LIVE=1 python lmm.py selftest --guard); then
+    echo "[pre-push] BLOCKED: revision ${local_sha:0:8} failed its own selftest." >&2
+    echo "[pre-push] Fix the code (or run: LMM_SKIP_HOOK=1 git push to override) then re-push." >&2
+    status=1
   fi
-
-  [ -z "${changed_py}" ] && continue
-
-  echo "[pre-push] regression guard on pushed blobs:" >&2
-  echo "${changed_py}" >&2
-
-  while IFS= read -r f; do
-    [ -z "$f" ] && continue
-    # Extract the EXACT blob about to be pushed.
-    # NOTE: on MSYS, `mktemp -t` yields /tmp/... which python resolves as
-    # C:\tmp\... (nonexistent) -> can't open file -> false selftest failure.
-    # Always use an explicit Windows temp path on this PC.
-    tmp="C:/Users/HP/AppData/Local/Temp/lmm_hook_${local_sha:0:8}_XXXXXX.py"
-    tmp=$(mktemp "$tmp" 2>/dev/null || mktemp "C:/Users/HP/AppData/Local/Temp/lmm_hook_XXXXXX.py")
-    if ! git show "${local_sha}:${f}" >"${tmp}" 2>/dev/null; then
-      rm -f "${tmp}"
-      continue
-    fi
-    if ! python "${tmp}" selftest --guard >/dev/null 2>&1; then
-      echo "[pre-push] BLOCKED: ${f} failed its own selftest at ${local_sha:0:8}." >&2
-      echo "[pre-push] Fix the code (or run: LMM_SKIP_HOOK=1 git push to override) then re-push." >&2
-      status=1
-    fi
-    rm -f "${tmp}"
-  done <<< "${changed_py}"
-
-  # 3) full offline self-guard (CI equivalent) — runs the hub's own selftest on
-  #    the whole tree, so a broken hub is caught even when GitHub Actions is
-  #    unavailable. Keeps the "measure, don't trust" promise server-independent.
-  if [ -x "$(dirname "$0")/guard.sh" ]; then
-    if ! bash "$(dirname "$0")/guard.sh" >/dev/null 2>&1; then
-      echo "[pre-push] BLOCKED: $(dirname "$0")/guard.sh reported a broken hub." >&2
-      status=1
-    fi
-  fi
+  git worktree remove --force "${tmpdir}" 2>/dev/null || rm -rf "${tmpdir}"
 done
 
-if [ "$status" -ne 0 ]; then
-  echo "[pre-push] push aborted -- hub did not prove itself." >&2
-fi
-exit $status
+exit "${status}"

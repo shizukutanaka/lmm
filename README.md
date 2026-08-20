@@ -85,7 +85,7 @@ lmm hide <runtime>  -> strip a runtime's taskbar button (Claude/ChatGPT/...)
 lmm watch           -> background daemon: auto-hide new LLM windows
 lmm autostart       -> register `watch` to run at OS login (zero effort)
 lmm dash            -> generate + open a self-contained HTML dashboard
-lmm gui             -> open the live GUI dashboard explicitly
+lmm gui             -> open the live GUI dashboard (Windows: minimizes to tray)
 lmm config <init|list|get|set|unset> [key] [value] -> manage hub settings (CLI)
 lmm examples        -> print a sample config file
 ```
@@ -94,6 +94,12 @@ lmm examples        -> print a sample config file
 
 Point your apps at `lmm serve --hub` and every request goes through one path —
 cache, routing, cascade, metering — across all your local and cloud backends.
+`GET /v1/models` lists the **real model ids** of every reachable backend, with
+each provider's name kept as a routable alias. Ask for a real id and the hub
+routes to the provider that serves it and forwards **that exact model** — a
+proxy that silently substitutes some default for the model you named is lying
+to you, so naming a model nobody serves is a clear 400, not a quiet fallback.
+
 That claim is tested against the **real `openai` client library**, not just
 curl: non-streaming, streaming (where a framing mistake shows up as zero
 chunks and no error), the opt-in usage chunk, model listing, and the 401 →
@@ -670,6 +676,14 @@ mkdir -p .github/workflows && cp ci/github-actions-ci.yml .github/workflows/ci.y
 git add .github && git commit -m "ci: enable GitHub Actions" && git push
 ```
 
+For contributors there is also a local proof-before-ship gate: enable it once
+with `git config core.hooksPath .githooks` (same command on every platform).
+`pre-commit` runs `guard.sh` against the working tree, and `pre-push` checks
+out the **exact revision being pushed** into a temporary worktree and runs its
+selftest there — the working tree may contain unpushed edits that would mask
+or cause a failure, so it is the wrong thing to test at push time. Override
+with `LMM_SKIP_HOOK=1` when you mean it.
+
 ## How it works
 
 | Concern        | Approach                                                        |
@@ -690,13 +704,3 @@ git add .github && git commit -m "ci: enable GitHub Actions" && git push
 ## License
 
 MIT — see [LICENSE](LICENSE).
-
-# lmm -- proof-before-ship: every push passes the embedded selftest.
-
-Every `git push` runs the hub's own `selftest --guard` on the exact blob being
-pushed (via `.githooks/pre-push`, wired through `git config core.hooksPath
-.githooks`). A broken hub (valid Python, broken logic) is blocked before it
-reaches the remote. Survives fresh clones — run `setup-hooks.bat` once after
-cloning (Windows) or `git config core.hooksPath .githooks` on other platforms.
-
-Override (explicit, per self-edit-gate): `LMM_SKIP_HOOK=1 git push`.

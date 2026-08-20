@@ -45,6 +45,21 @@ the merge of the managed-routing line of work into the same tool.
   - **Two commands.** `cli` was an alias for `discover`; `hub-status`'s one
     unique capability — probing each configured provider — moved into
     `doctor`, which is where a health probe belongs.
+  - The second and third copies of `NAME_TO_KEY` (display name -> provider
+    key), which lived inside `resolve_ask_targets` and `optimize_ask_order` —
+    the latter's comment admitted it "mirrors" the former. One module
+    constant now, and a test forbids a function from growing a private copy.
+    The two HTTP model-list readers merged the same way: `fetch_models`
+    delegates its OpenAI-compatible branch to `probe_models`, which learned
+    to send auth.
+  - `cache_prune` (a public wrapper with zero callers anywhere — every
+    internal site already goes through the locked variant).
+  - **A second pre-push hook and its scaffolding.** `hooks/pre-push` was the
+    unwired ancestor of `.githooks/pre-push`; `setup-hooks.bat` wrapped the
+    one command (`git config core.hooksPath .githooks`) that is identical on
+    every platform; `lmm_ROADMAP.md` was a 70-feature speculation whose own
+    conclusion was that most of it should not be built — and whose "build
+    now" list had already been built.
 
 ### Added
 - The managed-routing commands: `chat` (a REPL that keeps history), `config`
@@ -80,6 +95,42 @@ the merge of the managed-routing line of work into the same tool.
   suite stays zero-dependency.
 
 ### Fixed
+- **The hub probed liveness on every request — with subprocesses.** Both
+  implicit-provider detectors ran per request, even when the request named an
+  explicit provider: measured under concurrent load at 2.00 subprocess spawns
+  (pgrep/tasklist) plus 1.00 Ollama HTTP probe per request, capping the hub
+  at ~153 req/s against a localhost stub. The routing-path wrappers are now
+  memoised for 5 s (liveness does not change per-request; death mid-window is
+  the circuit breaker's job, a fresh start waits at most the TTL), while
+  discover/status/doctor keep reading the detectors directly — for them,
+  freshness is the product. Same bench after: **302 req/s**, 0.06 spawns and
+  0.03 probes per request, proven by count in a test rather than by timing.
+- **A model-id request paid for work it threw away.** Restoring per-model
+  routing made every model-id request fetch the backend's model list (one
+  full round-trip) and also run the whole default router — an Ollama port
+  probe and a `pgrep` — only to discard that result once the id resolved.
+  Measured against a localhost stub: P50 22.5 ms vs 12.5 ms for the same
+  request by provider name. Model lists are now cached for 30 s per backend
+  (a dead backend's empty answer too, for the circuit breaker's reason), and
+  the router only runs when it is actually consulted. Same request now:
+  **2.0 ms** — faster than the name path, and proven by count, not vibes: a
+  test asserts N model-id requests cost exactly one upstream GET.
+- **The merge severed two shipped features, and a zero-caller sweep found
+  them.** Per-model routing (master's fbbc59e): the hub was back to listing
+  provider names instead of real model ids, and a client-picked model id
+  neither reached the provider serving it nor was forwarded — worse, an
+  unknown model silently routed to some default. `/v1/models` now aggregates
+  real ids (provider names stay as routable aliases), a picked id is
+  forwarded verbatim to its owner, and an unknown one is a clear 400.
+  Minimize-to-tray (master's 35bbf95): `setup_tray` had zero callers, so the
+  GUI feature simply vanished; it is wired back on Windows, and on other
+  platforms X keeps meaning close — withdrawing with no tray icon to restore
+  from would orphan the process.
+- **`fetch_models` never worked against this tree's own providers.** Their
+  `base_url` convention includes the `/v1` suffix, so appending `/v1/models`
+  produced `/v1/v1/models` — a 404 that read as "no models". The tests had
+  monkeypatched it, which is how a path bug survives; it now runs against a
+  real HTTP stub.
 - **The measurement loop was open.** `lmm stats` and `priority --optimize`
   read per-attempt routing outcomes that, after the merge, nothing wrote —
   the readers survived their writer. Failed attempts (which have no usage to
@@ -112,6 +163,16 @@ the merge of the managed-routing line of work into the same tool.
   two live checks are already skipped there. The gate now asserts that `doctor`
   runs and reaches a verdict, and prints that verdict, so an unhealthy host is
   still visible without failing the build.
+- **The pre-push guard blocked every push, worked on exactly one machine,
+  and silently skipped its own tree check.** It tested each pushed `.py`
+  file as a lone blob — a premise that died with the three-file split, since
+  a lone `lmm.py` exits 1 by design; it hardcoded one specific machine's
+  temp directory, so it only ran at all on that machine; and it looked for
+  `guard.sh` inside `.githooks/`, where it has never been, so the tree-level
+  check silently never executed. It now checks out the exact pushed revision
+  into a temporary git worktree and runs the selftest there — portable, and
+  proven both ways: a good revision passes, a tree with a module deleted is
+  blocked.
 - **`selftest --guard` ignored its own contract.** It documented "exit code
   only" and then printed the full banner. It now prints failures only, so a
   green run is silent and a red one still says what broke.
