@@ -3709,6 +3709,34 @@ class TestPackaging(unittest.TestCase):
         finally:
             shutil.rmtree(d, ignore_errors=True)
 
+    def test_the_launcher_tracks_library_upgrades_without_reinstall(self):
+        """install.sh claims the launcher "picks up an upgrade to the
+        library without being reinstalled itself". Cross-examined for real:
+        install, then upgrade ONLY the library copy, and the same launcher
+        must report the new version."""
+        import subprocess
+        if not shutil.which("bash"):
+            self.skipTest("bash not available")
+        home = tempfile.mkdtemp(prefix="lmm-up-")
+        try:
+            env = dict(os.environ, HOME=home)
+            subprocess.run(["bash", os.path.join(self.root, "install.sh")],
+                           env=env, stdout=subprocess.DEVNULL,
+                           stderr=subprocess.DEVNULL, timeout=120, check=True)
+            lib = os.path.join(home, ".local", "share", "lmm", "backend.py")
+            with open(lib, encoding="utf-8") as f:
+                src = f.read()
+            with open(lib, "w", encoding="utf-8") as f:
+                f.write(src.replace('VERSION = "', 'VERSION = "9.9.9-', 1))
+            launcher = os.path.join(home, ".local", "bin", "lmm")
+            v = subprocess.run([launcher, "--version"], env=env,
+                               stdout=subprocess.PIPE, timeout=120)
+            self.assertIn("9.9.9-", v.stdout.decode(),
+                          "the launcher froze a copy instead of tracking "
+                          "the library")
+        finally:
+            shutil.rmtree(home, ignore_errors=True)
+
     def test_install_sh_produces_a_working_command(self):
         import subprocess
         if not shutil.which("bash"):
