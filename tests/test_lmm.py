@@ -4042,6 +4042,56 @@ class TestClaimsSurviveElenchus(unittest.TestCase):
             stub.stop()
 
 
+class TestCompatSurvivesElenchus(unittest.TestCase):
+    """Two acquittals with the evidence entered.
+
+    "Config is backward compatible across every version" — examined against
+    the REAL v1.0.0 example config, resurrected from the git tag and pinned
+    here verbatim, not against a synthetic approximation of it.
+
+    "A self-contained HTML dashboard" — the generated page must reference no
+    external resource; a dashboard that phones home is neither self-contained
+    nor private.
+    """
+
+    V1_CONFIG = {
+        "pricing": {"my-model": {"in": 1.0, "out": 2.0, "cw": 1.0, "cr": 0.1}},
+        "route": {"private": ["secret", "\u793e\u5185", "private", "local",
+                              "offline"],
+                  "heavy": ["code", "\u8a2d\u8a08", "refactor", "debug",
+                            "architecture"]},
+        "extra_runtimes": [
+            {"name": "vLLM", "type": "local", "paid": False,
+             "procs": ["vllm", "vllm.entrypoints"],
+             "installed_paths": ["~/.vllm"],
+             "endpoint": "http://localhost:8000/v1",
+             "models_cmd": "curl -s http://localhost:8000/v1/models"},
+            {"name": "My Remote Agent", "type": "remote", "paid": True,
+             "procs": ["myagent"], "installed_paths": ["~/myagent"],
+             "endpoint": "https://api.myagent.example"}]}
+
+    def test_the_v1_example_config_still_drives_todays_code(self):
+        cfg = dict(self.V1_CONFIG)
+        self.assertIn("my-model", lmm.merged_pricing(cfg))
+        self.assertIn("secret", lmm.merged_route(cfg)["private"])
+        score, _ = lmm.prompt_strength(cfg, "hello")
+        self.assertTrue(0.0 <= score <= 1.0)
+        self.assertEqual(lmm.merged_providers(cfg), {},
+                         "v1 had no providers key; today must not invent one")
+        lmm.resolve_ask_targets(cfg, "hello", None)   # must not raise
+        names = [r["name"] for r in cfg["extra_runtimes"]]
+        self.assertEqual(names, ["vLLM", "My Remote Agent"])
+
+    def test_the_dashboard_is_self_contained(self):
+        import re
+        with temp_state():
+            html_text = frontend.build_dash({})
+        ext = re.findall(r'(?:src|href)\s*=\s*["\'](https?://[^"\']+)',
+                         html_text)
+        self.assertEqual(ext, [],
+                         "the dashboard references external resources")
+
+
 class TestVarietySurvivesElenchus(unittest.TestCase):
     """Claim: cache.max_temp — "above this the caller wants variety, not a
     cache". Half-refuted: the store side honoured it (a hot answer was never
