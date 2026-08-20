@@ -3121,6 +3121,16 @@ def hub_complete(cfg, messages, targets, opts=None):
     cache_model = targets[0][1].get("model")
 
     # ---- (1) cache -----------------------------------------------------
+    # An explicit high temperature is a request for VARIETY. The store side
+    # always honoured that (a hot answer is never frozen into the cache); the
+    # lookup side did not, so a hot repeat of a cached question was served
+    # the frozen answer — the exact thing the caller asked not to get.
+    if (use_cache and req_temp is not None
+            and float(req_temp) > float(merged_cache(cfg).get("max_temp", 0.3))):
+        use_cache = False
+        trace.append("[cache] bypassed: temperature %.2f asks for variety"
+                     % float(req_temp))
+
     explore = None          # near neighbour awaiting a correctness label
     if use_cache:
         probe_model = cache_model
@@ -3289,6 +3299,10 @@ def hub_stream(cfg, messages, targets, opts=None):
         yield SSE_DONE
         return
     cache_model = targets[0][1].get("model")
+
+    if (use_cache and req_temp is not None
+            and float(req_temp) > float(merged_cache(cfg).get("max_temp", 0.3))):
+        use_cache = False                # variety requested; see hub_complete
 
     explore = None          # near neighbour awaiting a correctness label
     if use_cache:

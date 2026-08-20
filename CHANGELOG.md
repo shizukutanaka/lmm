@@ -95,6 +95,13 @@ the merge of the managed-routing line of work into the same tool.
   suite stays zero-dependency.
 
 ### Fixed
+- **The variety request was half-honoured.** `cache.max_temp` promises
+  that an explicitly high temperature means "the caller wants variety, not
+  a cache". The store side kept that promise (a hot answer was never
+  frozen); the lookup side did not, so a hot repeat of a cached question
+  was served the frozen answer — the exact thing the caller asked not to
+  get. Both hub paths now bypass the cache for hot requests, with a trace
+  line saying so.
 - **The privacy pin yielded under pressure — three ways.** "route.private
   pins a prompt to local providers" failed cross-examination badly: with
   `ask_order` set the privacy check was never consulted, so a confidential

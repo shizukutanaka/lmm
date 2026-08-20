@@ -4042,6 +4042,104 @@ class TestClaimsSurviveElenchus(unittest.TestCase):
             stub.stop()
 
 
+class TestVarietySurvivesElenchus(unittest.TestCase):
+    """Claim: cache.max_temp — "above this the caller wants variety, not a
+    cache". Half-refuted: the store side honoured it (a hot answer was never
+    frozen), but the LOOKUP side did not, so a hot repeat of a cached
+    question was served the frozen answer — the exact thing the caller
+    asked not to get. Both halves now hold, and both are pinned here.
+
+    Also entered as acquittal evidence this sitting: chat keeps history
+    across turns, and the semantic tier's embedder structurally cannot pay
+    a cloud provider.
+    """
+
+    def setUp(self):
+        self.stub = StubBackend()
+        self.cfg = {"providers": {"stub": {
+            "api_key": "k", "base_url": self.stub.base_url,
+            "model": "m", "kind": "local"}}, "ask_order": ["stub"]}
+
+    def tearDown(self):
+        self.stub.stop()
+
+    def _ask(self, prompt, temp=None):
+        targets = lmm.resolve_ask_targets(self.cfg, prompt, None)
+        opts = {"cache": True, "source": "ask"}
+        if temp is not None:
+            opts["extra"] = {"temperature": temp}
+        return lmm.hub_complete(self.cfg, prompt, targets, opts)
+
+    def test_a_hot_answer_is_never_frozen(self):
+        with temp_state():
+            self._ask("tell me a story", temp=1.5)
+            self.assertEqual(len(lmm.cache_entries(lmm.merged_cache({}))), 0)
+
+    def test_a_hot_repeat_is_not_served_the_frozen_answer(self):
+        with temp_state():
+            self._ask("what is 2+2")                       # cold: cached
+            res, trace = self._ask("what is 2+2", temp=1.5)
+            self.assertFalse(any("hit" in t for t in trace),
+                             "variety was requested and the cache answered "
+                             "anyway: %r" % trace)
+            self.assertTrue(any("variety" in t for t in trace))
+
+    def test_a_cold_repeat_still_hits(self):
+        with temp_state():
+            self._ask("what is 2+2")
+            res, trace = self._ask("what is 2+2")
+            self.assertTrue(any("[cache]" in t and "hit" in t for t in trace))
+
+    def test_chat_carries_history_between_turns(self):
+        """README: chat "keeps conversation history". Simulated 2-turn
+        session; the second request must carry turn 1 and its reply."""
+        import builtins
+        import io
+        import contextlib
+        captured = []
+
+        def fake_stream(cfg, messages, targets, opts=None):
+            captured.append([m["content"] for m in messages])
+            yield (b'data: {"choices":[{"delta":{"content":"reply%d"}}]}\n\n'
+                   % len(captured))
+            yield b"data: [DONE]\n\n"
+
+        saved_hs = frontend.hub_stream
+        saved_rat = frontend.resolve_ask_targets
+        saved_in = builtins.input
+        answers = iter(["first question", "second question", "exit"])
+        try:
+            frontend.hub_stream = fake_stream
+            frontend.resolve_ask_targets = lambda cfg, line, prov: [
+                ("p", {"model": "m", "kind": "local", "base_url": "http://x"})]
+            builtins.input = lambda *a: next(answers)
+            with contextlib.redirect_stdout(io.StringIO()):
+                frontend.cmd_chat(None, {})
+        finally:
+            frontend.hub_stream = saved_hs
+            frontend.resolve_ask_targets = saved_rat
+            builtins.input = saved_in
+        self.assertEqual(captured[1],
+                         ["first question", "reply1", "second question"],
+                         "turn 2 did not carry turn 1's exchange")
+
+    def test_the_embedder_cannot_pay_anyone(self):
+        """"the semantic tier uses local embeddings, never a paid one" —
+        every URL the embedder touches must be localhost."""
+        urls = []
+        saved = lmm.http_post_json
+        try:
+            lmm.http_post_json = lambda url, *a, **kw: (
+                urls.append(url) or {"error": "x"})
+            lmm.embed_text("hello", "nomic-embed-text")
+        finally:
+            lmm.http_post_json = saved
+        self.assertTrue(urls, "the embedder made no call at all")
+        for u in urls:
+            self.assertTrue(u.startswith("http://localhost:11434"),
+                            "the embedder left the machine: %s" % u)
+
+
 class TestRetryAfterSurvivesElenchus(unittest.TestCase):
     """Claim: "a 429's Retry-After is honoured but capped, so a hostile
     header cannot park the hub." Acquitted — these are the acquittal's
