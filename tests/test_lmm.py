@@ -720,13 +720,18 @@ class TestHubComplete(unittest.TestCase):
                              {"cascade": True, "cache": False})
         self.assertEqual(self.calls, ["local"])
 
-    def test_private_prompt_with_no_local_provider_warns(self):
+    def test_private_prompt_with_no_local_provider_is_refused(self):
+        """The old behaviour warned in the trace and sent the prompt anyway —
+        and the trace prints AFTER the request returns, so the warning was a
+        eulogy. A pin that yields is not a pin: no local provider means the
+        request is refused, and nothing is sent anywhere."""
         self.fake({})
         with temp_state():
-            _res, trace = lmm.hub_complete({}, "summarize this secret memo",
-                                           self.targets(),
-                                           {"cascade": False, "cache": False})
-        self.assertTrue(any(t.startswith("[warn]") for t in trace))
+            res, trace = lmm.hub_complete({}, "summarize this secret memo",
+                                          self.targets(),
+                                          {"cascade": False, "cache": False})
+        self.assertIn("refusing", res.get("error", ""))
+        self.assertEqual(self.calls, [], "the private prompt was sent out")
 
     def test_no_warning_when_a_local_provider_exists(self):
         self.fake({})
@@ -4035,6 +4040,100 @@ class TestClaimsSurviveElenchus(unittest.TestCase):
                                  "billed, got %d" % len(metered))
         finally:
             stub.stop()
+
+
+class TestPrivacyPinSurvivesElenchus(unittest.TestCase):
+    """Claim on trial: "route.private pins a prompt to local providers."
+    Cross-examined, the pin yielded three ways: with ask_order set the check
+    was never consulted (cloud-first order sent the secret to the cloud with
+    a local model sitting right there); with no ask_order the sort kept
+    cloud as a FALLBACK, so a failing local leaked; and with no local at all
+    it warned — in a trace printed after the request returned — and sent
+    anyway. A pin that yields is not a pin.
+    """
+
+    PRIVATE = "summarise this confidential internal memo about the merger"
+
+    def setUp(self):
+        self.stub = StubBackend()          # plays the cloud
+        self.sent = []
+        self._real = lmm.call_with_retry
+
+        def spy(prov, *a, **kw):
+            self.sent.append(prov.get("kind"))
+            return self._real(prov, *a, **kw)
+
+        lmm.call_with_retry = spy
+
+    def tearDown(self):
+        lmm.call_with_retry = self._real
+        self.stub.stop()
+
+    def _cfg(self, order, providers):
+        return {"providers": providers, "ask_order": order,
+                "retry": {"attempts": 1},
+                "route": {"private": ["confidential"]}}
+
+    def test_cloud_first_ask_order_does_not_outrank_privacy(self):
+        cfg = self._cfg(["cloud", "loc"], {
+            "cloud": {"api_key": "k", "base_url": self.stub.base_url,
+                      "model": "m", "kind": "cloud"},
+            "loc": {"api_key": "k", "base_url": "http://127.0.0.1:9/v1",
+                    "model": "m", "kind": "local"}})
+        with temp_state():
+            targets = lmm.resolve_ask_targets(cfg, self.PRIVATE, None)
+            lmm.hub_complete(cfg, self.PRIVATE, targets,
+                             {"cache": False, "source": "ask"})
+        self.assertNotIn("cloud", self.sent,
+                         "ask_order outranked the privacy pin")
+
+    def test_a_failing_local_does_not_fall_back_to_the_cloud(self):
+        """The subtlest leak: local listed first, local dead, cloud alive.
+        The old sort kept the cloud in the list as a fallback."""
+        cfg = self._cfg([], {
+            "loc": {"api_key": "k", "base_url": "http://127.0.0.1:9/v1",
+                    "model": "m", "kind": "local"},
+            "cloud": {"api_key": "k", "base_url": self.stub.base_url,
+                      "model": "m", "kind": "cloud"}})
+        with temp_state():
+            targets = lmm.resolve_ask_targets(cfg, self.PRIVATE, None)
+            res, _ = lmm.hub_complete(cfg, self.PRIVATE, targets,
+                                      {"cache": False, "source": "ask"})
+        self.assertNotIn("cloud", self.sent,
+                         "a failing local provider leaked the prompt to the cloud")
+        self.assertIn("error", res)
+
+    def test_no_local_at_all_is_refused_on_every_path(self):
+        cfg = self._cfg(["cloud"], {
+            "cloud": {"api_key": "k", "base_url": self.stub.base_url,
+                      "model": "m", "kind": "cloud"}})
+        with temp_state():
+            targets = lmm.resolve_ask_targets(cfg, self.PRIVATE, None)
+            res, _ = lmm.hub_complete(cfg, self.PRIVATE, targets,
+                                      {"cache": False, "source": "ask"})
+            self.assertIn("refusing", res.get("error", ""))
+            frames = b"".join(lmm.hub_stream(
+                cfg, [{"role": "user", "content": self.PRIVATE}], targets,
+                {"cache": False, "source": "chat"}))
+            self.assertIn(b"refusing", frames)
+            name, reason, reply = lmm.route_and_verify(self.PRIVATE, cfg)
+            self.assertIsNone(name)
+            self.assertIn("refusing", reason)
+        self.assertEqual(self.sent, [],
+                         "a private prompt reached a provider on some path")
+        self.assertEqual(self.stub.seen, [],
+                         "the cloud stub actually received the secret")
+
+    def test_a_public_prompt_is_untouched_by_the_pin(self):
+        cfg = self._cfg(["cloud"], {
+            "cloud": {"api_key": "k", "base_url": self.stub.base_url,
+                      "model": "m", "kind": "cloud"}})
+        with temp_state():
+            targets = lmm.resolve_ask_targets(cfg, "what is 2+2", None)
+            res, _ = lmm.hub_complete(cfg, "what is 2+2", targets,
+                                      {"cache": False, "source": "ask"})
+        self.assertNotIn("error", res)
+        self.assertEqual(self.sent, ["cloud"])
 
 
 class TestBreakerSurvivesElenchus(unittest.TestCase):

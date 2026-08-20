@@ -2474,6 +2474,32 @@ def is_private(cfg, text):
     return any(k.lower() in low for k in merged_route(cfg).get("private", []))
 
 
+def pin_private(cfg, messages, targets):
+    """Enforce route.private as a PIN, not a preference.
+
+    Cross-examined, the old behaviour failed twice: with ask_order set the
+    privacy check was never consulted at all, so a private prompt went to
+    whichever cloud the user happened to list first; and with no local
+    provider it emitted a trace warning and sent the prompt anyway — a
+    warning printed after the request returns is a eulogy, not a guard.
+    "Pins to local" means: non-local targets are REMOVED, and when nothing
+    local remains the request is refused outright. The user opted in by
+    listing the keyword; refusing is respecting their own instruction.
+
+    Returns (targets, refusal_or_None).
+    """
+    if not targets:
+        return targets, None
+    if not is_private(cfg, messages_text(as_messages(messages))):
+        return targets, None
+    local = [(n, p) for n, p in targets if p.get("kind") == "local"]
+    if local:
+        return local, None
+    return [], ("prompt matches route.private but no local provider is "
+                "available — refusing to send it to a remote API. Start one "
+                "(`lmm serve <model>`) or adjust route.private.")
+
+
 def prompt_strength(cfg, prompt):
     """Score how likely a prompt needs the strong model. Returns (score, feats)
     where score is in [0,1] and feats is a list of (label, weight) for
@@ -3079,14 +3105,14 @@ def hub_complete(cfg, messages, targets, opts=None):
     if not targets:
         return {"error": "no provider available"}, trace
 
-    # Privacy is pinned in order_targets/cascade_rungs, but only if a local
-    # provider exists at all. When none does, say so out loud rather than
-    # quietly shipping a prompt the user flagged as private to a remote API.
-    if (is_private(cfg, messages_text(as_messages(messages)))
-            and not any(t[1].get("kind") == "local" for t in targets)):
-        trace.append("[warn] prompt matches route.private but no local provider "
-                     "is running — it will be sent to a remote API "
-                     "(start one with `lmm serve <model>`)")
+    n_before = len(targets)
+    targets, refused = pin_private(cfg, messages, targets)
+    if refused:
+        return {"error": refused}, trace
+    if len(targets) != n_before:
+        trace.append("[private] %d non-local provider(s) excluded — "
+                     "route.private is a pin, not a preference"
+                     % (n_before - len(targets)))
 
     # The cache key identifies the REQUEST, not whoever ended up answering it:
     # a cascade may answer from rung 2, and next time that answer should be
@@ -3253,6 +3279,11 @@ def hub_stream(cfg, messages, targets, opts=None):
 
     breaker = opts.get("breaker")
     targets = order_targets(cfg, messages, targets)
+    targets, refused = pin_private(cfg, messages, targets)
+    if refused:
+        yield sse_frame({"error": {"message": refused}})
+        yield SSE_DONE
+        return
     if not targets:
         yield sse_frame({"error": {"message": "no provider available"}})
         yield SSE_DONE
@@ -3701,6 +3732,9 @@ def route_and_verify(task, cfg, ask_order=None, max_tries=3):
     tried = []
     pricing = merged_pricing(cfg)
     ordered = order_targets(cfg, task, targets)
+    ordered, refused = pin_private(cfg, task, ordered)
+    if refused:
+        return None, refused, None
     if merged_breaker(cfg).get("enabled", True):
         live = [(n, p) for n, p in ordered if HUB_BREAKER.available(n)]
         if live:                        # never skip the last one standing

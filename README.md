@@ -548,7 +548,7 @@ want the hub — everything else has a working default:
 | `retry` | `{attempts, base_ms, cap_ms}` full-jitter backoff per provider |
 | `breaker` | `{enabled, threshold, cooldown_s}` circuit breaker for dead providers |
 | `pricing` | Override or add rate-table entries |
-| `route` | `{private, heavy}` keyword lists. `private` pins a prompt to local providers |
+| `route` | `{private, heavy}` keyword lists. `private` is a hard pin: non-local providers are excluded outright — `ask_order` does not outrank it, a failing local never falls back to the cloud, and with no local provider the request is refused rather than sent |
 | `usage` | Hand-entered cloud spend, added on top of what lmm measures itself |
 | `extra_runtimes` | Your own runtimes for `discover` and `stop` |
 

@@ -95,6 +95,19 @@ the merge of the managed-routing line of work into the same tool.
   suite stays zero-dependency.
 
 ### Fixed
+- **The privacy pin yielded under pressure — three ways.** "route.private
+  pins a prompt to local providers" failed cross-examination badly: with
+  `ask_order` set the privacy check was never consulted, so a confidential
+  prompt went to whichever cloud the user listed first, with a local model
+  sitting right there; without `ask_order` the pin was only a sort, so the
+  cloud stayed in the list as a fallback and a failing local leaked the
+  prompt; and with no local provider at all it warned — in a trace printed
+  after the request had already returned — and sent anyway. One authority
+  (`pin_private`) now enforces it on every path (ask, chat, hub, --verify):
+  non-local targets are removed, and with nothing local left the request is
+  refused outright, because the user opted in by listing the keyword and
+  refusing is respecting their own instruction. Proven against a live stub
+  that must receive nothing.
 - **The circuit breaker was a hub-only story.** "A dead backend stops
   charging every request its full timeout" failed cross-examination twice:
   `lmm ask` never passed a breaker into the request path at all — the
