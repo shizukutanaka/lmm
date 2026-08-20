@@ -54,6 +54,11 @@ the merge of the managed-routing line of work into the same tool.
     to send auth.
   - `cache_prune` (a public wrapper with zero callers anywhere — every
     internal site already goes through the locked variant).
+  - `cascade_rungs`'s private branch and its `prompt` parameter: privacy is
+    `pin_private`'s job, enforced before rungs are built, and on pinned
+    input the branch was measured behaviourally identical to the normal
+    path. A second authority that can drift is worse than none — the same
+    lesson as the second router.
   - **A second pre-push hook and its scaffolding.** `hooks/pre-push` was the
     unwired ancestor of `.githooks/pre-push`; `setup-hooks.bat` wrapped the
     one command (`git config core.hooksPath .githooks`) that is identical on

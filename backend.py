@@ -2717,22 +2717,20 @@ def judge_answer(judge_prov, prompt, answer):
         return None
 
 
-def cascade_rungs(cfg, targets, prompt=None):
+def cascade_rungs(cfg, targets):
     """Order the rungs cheapest-first, which is what makes a cascade cheap.
     An explicit cascade.rungs list wins; otherwise it is derived from price, so
     a zero-config user still gets local -> cheap cloud -> expensive cloud.
 
-    Escalation must never leak: a prompt matching route.private stays on local
-    rungs, because "the cheap model did badly" is not a reason to ship a secret
-    to a cloud API.
+    Privacy is not this function's job: hub_complete runs pin_private BEFORE
+    building rungs, so a private prompt arrives here with non-local targets
+    already removed (or refused outright). This used to carry its own private
+    branch as defence in depth; on pinned input it was measured behaviourally
+    identical to the normal path, and a second authority that can drift is
+    worse than none — the same lesson as the second router.
     """
     casc = merged_cascade(cfg)
     cap = max(1, int(casc.get("max_rungs", 3)))
-    text = prompt if isinstance(prompt, str) else messages_text(prompt)
-    if text and is_private(cfg, text):
-        local = [t for t in targets if t[1].get("kind") == "local"]
-        if local:
-            return local[:cap]
     named = list(casc.get("rungs") or [])
     if named:
         by_name = dict(targets)
@@ -3149,7 +3147,7 @@ def hub_complete(cfg, messages, targets, opts=None):
                          "certified yet; answering for real and labelling it")
 
     # ---- (2)+(3) routing already applied; now walk the rungs -----------
-    rungs = cascade_rungs(cfg, targets, messages) if use_cascade else targets
+    rungs = cascade_rungs(cfg, targets) if use_cascade else targets
     judge = None
     if use_cascade and casc.get("judge"):
         judge = merged_providers(cfg).get(casc["judge"])
