@@ -512,6 +512,10 @@ Edit settings from the CLI with `lmm config` — no hand-editing JSON:
 lmm config init                                   # create ~/.lmm/config.json
 lmm config set ask_order '["openai","local-ollama(implicit)"]'
 lmm config set providers.openai '{"kind":"cloud","base_url":"https://api.openai.com/v1","api_key":"$OPENAI_API_KEY","model":"gpt-4o"}'
+# "$OPENAI_API_KEY" is expanded from the environment when providers are
+# resolved, so the secret never sits in the file. If the variable is not
+# set, the literal "$NAME" is kept and `lmm doctor` names it — instead of
+# the provider's 401 being the only witness.
 lmm config get ask_order
 lmm config unset providers.openai
 ```
@@ -544,7 +548,7 @@ want the hub — everything else has a working default:
 | `retry` | `{attempts, base_ms, cap_ms}` full-jitter backoff per provider |
 | `breaker` | `{enabled, threshold, cooldown_s}` circuit breaker for dead providers |
 | `pricing` | Override or add rate-table entries |
-| `route` | `{private, heavy}` keyword lists. `private` pins a prompt to local providers |
+| `route` | `{private, heavy}` keyword lists. `private` is a hard pin: non-local providers are excluded outright — `ask_order` does not outrank it, a failing local never falls back to the cloud, and with no local provider the request is refused rather than sent |
 | `usage` | Hand-entered cloud spend, added on top of what lmm measures itself |
 | `extra_runtimes` | Your own runtimes for `discover` and `stop` |
 
@@ -556,6 +560,13 @@ Falling through to the next provider on error was the only reliability lmm had,
 and it had three holes: a single transient blip abandoned a working provider, a
 permanently dead one was re-tried first on *every* request, and `429`'s
 `Retry-After` was ignored. Two standard patterns close them:
+
+The breaker's memory outlives the process: state lives in
+`~/.lmm/breaker.json`, so five consecutive `lmm ask` runs against a dead
+backend pay its timeout at most `threshold` times, not five. Cross-process
+writes are last-writer-wins — the same openly-taken trade as the metering
+log; the state is advisory, so the worst case is one extra probe. Delete the
+file (or wait out `cooldown_s`) when you know the outage is over.
 
 **Retry with full jitter** — a transient failure (`429`, `5xx`, connection
 error, timeout) is retried on the *same* provider before failing over, with the

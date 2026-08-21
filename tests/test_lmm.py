@@ -720,13 +720,18 @@ class TestHubComplete(unittest.TestCase):
                              {"cascade": True, "cache": False})
         self.assertEqual(self.calls, ["local"])
 
-    def test_private_prompt_with_no_local_provider_warns(self):
+    def test_private_prompt_with_no_local_provider_is_refused(self):
+        """The old behaviour warned in the trace and sent the prompt anyway —
+        and the trace prints AFTER the request returns, so the warning was a
+        eulogy. A pin that yields is not a pin: no local provider means the
+        request is refused, and nothing is sent anywhere."""
         self.fake({})
         with temp_state():
-            _res, trace = lmm.hub_complete({}, "summarize this secret memo",
-                                           self.targets(),
-                                           {"cascade": False, "cache": False})
-        self.assertTrue(any(t.startswith("[warn]") for t in trace))
+            res, trace = lmm.hub_complete({}, "summarize this secret memo",
+                                          self.targets(),
+                                          {"cascade": False, "cache": False})
+        self.assertIn("refusing", res.get("error", ""))
+        self.assertEqual(self.calls, [], "the private prompt was sent out")
 
     def test_no_warning_when_a_local_provider_exists(self):
         self.fake({})
@@ -3704,6 +3709,34 @@ class TestPackaging(unittest.TestCase):
         finally:
             shutil.rmtree(d, ignore_errors=True)
 
+    def test_the_launcher_tracks_library_upgrades_without_reinstall(self):
+        """install.sh claims the launcher "picks up an upgrade to the
+        library without being reinstalled itself". Cross-examined for real:
+        install, then upgrade ONLY the library copy, and the same launcher
+        must report the new version."""
+        import subprocess
+        if not shutil.which("bash"):
+            self.skipTest("bash not available")
+        home = tempfile.mkdtemp(prefix="lmm-up-")
+        try:
+            env = dict(os.environ, HOME=home)
+            subprocess.run(["bash", os.path.join(self.root, "install.sh")],
+                           env=env, stdout=subprocess.DEVNULL,
+                           stderr=subprocess.DEVNULL, timeout=120, check=True)
+            lib = os.path.join(home, ".local", "share", "lmm", "backend.py")
+            with open(lib, encoding="utf-8") as f:
+                src = f.read()
+            with open(lib, "w", encoding="utf-8") as f:
+                f.write(src.replace('VERSION = "', 'VERSION = "9.9.9-', 1))
+            launcher = os.path.join(home, ".local", "bin", "lmm")
+            v = subprocess.run([launcher, "--version"], env=env,
+                               stdout=subprocess.PIPE, timeout=120)
+            self.assertIn("9.9.9-", v.stdout.decode(),
+                          "the launcher froze a copy instead of tracking "
+                          "the library")
+        finally:
+            shutil.rmtree(home, ignore_errors=True)
+
     def test_install_sh_produces_a_working_command(self):
         import subprocess
         if not shutil.which("bash"):
@@ -3875,6 +3908,612 @@ class TestOneOfEach(unittest.TestCase):
             stub.stop()
 
 
+class TestClaimsSurviveElenchus(unittest.TestCase):
+    """The product's strongest claims, cross-examined the Socratic way: take
+    the claim, derive a consequence, test the consequence for real. Each test
+    here began as a refutation — the claim was FALSE when first examined —
+    and stays as the proof that it is now true.
+
+    Claim 1: "move secrets to environment variables; lmm reads them at call
+    time" (printed by `lmm secrets`, documented in the README). Refuted:
+    nothing expanded $VARS — the literal string "$OPENAI_API_KEY" went out
+    as the bearer token.
+    Claim 2: "every call lmm makes is metered". Refuted twice: `ask
+    --verify` and `lmm bench` both called providers directly and spent off
+    the books.
+    """
+
+    class _AuthStub(object):
+        """Tiny server that records the Authorization header it receives."""
+
+        def __init__(self):
+            import http.server
+            import socketserver
+            import threading
+            self.auth = []
+            auth = self.auth
+
+            class H(http.server.BaseHTTPRequestHandler):
+                def do_POST(self):
+                    auth.append(self.headers.get("Authorization"))
+                    body = json.dumps({"choices": [{"message": {
+                        "content": "The Schrodinger equation governs how the "
+                                   "quantum state of a physical system evolves "
+                                   "over time via the Hamiltonian, and it "
+                                   "underlies superposition and interference "
+                                   "throughout quantum mechanics."}}],
+                        "usage": {"prompt_tokens": 10,
+                                  "completion_tokens": 40}}).encode()
+                    self.send_response(200)
+                    self.send_header("Content-Type", "application/json")
+                    self.send_header("Content-Length", str(len(body)))
+                    self.end_headers()
+                    self.wfile.write(body)
+
+                def log_message(self, *a):
+                    pass
+
+            class S(socketserver.ThreadingMixIn, http.server.HTTPServer):
+                daemon_threads = True
+
+            self.httpd = S(("127.0.0.1", 0), H)
+            self.port = self.httpd.server_address[1]
+            threading.Thread(target=self.httpd.serve_forever,
+                             daemon=True).start()
+
+        @property
+        def base_url(self):
+            return "http://127.0.0.1:%d/v1" % self.port
+
+        def stop(self):
+            self.httpd.shutdown()
+            self.httpd.server_close()
+
+    def test_a_dollar_api_key_sends_the_env_value_not_the_literal(self):
+        stub = self._AuthStub()
+        os.environ["LMM_TEST_KEY"] = "sk-real-value-from-env"
+        try:
+            cfg = {"providers": {"p": {
+                "api_key": "$LMM_TEST_KEY", "base_url": stub.base_url,
+                "model": "m", "kind": "cloud"}}}
+            prov = lmm.merged_providers(cfg)["p"]
+            lmm.call_provider(prov, "hi")
+            self.assertEqual(stub.auth[-1], "Bearer sk-real-value-from-env",
+                             "the documented $VAR pattern sent: %r"
+                             % stub.auth[-1])
+        finally:
+            del os.environ["LMM_TEST_KEY"]
+            stub.stop()
+
+    def test_an_unset_env_var_is_named_by_doctor(self):
+        """A missing variable must be reported by NAME — otherwise the only
+        witness is a 401 from the provider."""
+        import io
+        import contextlib
+        cfg = {"providers": {"p": {
+            "api_key": "$LMM_UNSET_VAR_FOR_TEST",
+            "base_url": "http://127.0.0.1:9/v1", "model": "m",
+            "kind": "cloud"}}}
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            try:
+                frontend.cmd_doctor(cfg)
+            except SystemExit:
+                pass
+        out = buf.getvalue()
+        self.assertIn("LMM_UNSET_VAR_FOR_TEST", out)
+        self.assertIn("api_key env var set", out)
+
+    def test_verify_calls_are_metered_accepted_and_rejected(self):
+        stub = self._AuthStub()
+        try:
+            with temp_state():
+                cfg = {"providers": {"good": {
+                    "api_key": "k", "base_url": stub.base_url,
+                    "model": "m", "kind": "local"}},
+                    "ask_order": ["good"]}
+                name, reason, reply = lmm.route_and_verify(
+                    "explain quantum mechanics", cfg)
+                self.assertEqual(name, "good")
+                metered = [e for e in lmm.read_usage()
+                           if not e.get("event")
+                           and e.get("source") == "verify"]
+                self.assertEqual(len(metered), 1,
+                                 "an accepted --verify call left no meter event")
+                self.assertTrue(metered[0].get("accepted"))
+                self.assertEqual(metered[0].get("out"), 40)
+        finally:
+            stub.stop()
+
+    def test_a_rejected_verify_reply_is_still_billed(self):
+        """The gate rejecting an answer does not un-spend the tokens."""
+        saved = lmm.call_provider
+        try:
+            with temp_state():
+                lmm.call_provider = lambda prov, task, **kw: {
+                    "choices": [{"message": {"content": "Short."}}],
+                    "usage": {"prompt_tokens": 5, "completion_tokens": 2}}
+                cfg = {"providers": {"p": {
+                    "api_key": "k", "base_url": "http://127.0.0.1:9/v1",
+                    "model": "m", "kind": "local"}}, "ask_order": ["p"]}
+                name, reason, reply = lmm.route_and_verify(
+                    "explain quantum mechanics", cfg, max_tries=1)
+                self.assertIsNone(name)
+                metered = [e for e in lmm.read_usage()
+                           if not e.get("event")
+                           and e.get("source") == "verify"]
+                self.assertEqual(len(metered), 1,
+                                 "a rejected reply was spent off the books")
+                self.assertFalse(metered[0].get("accepted"))
+        finally:
+            lmm.call_provider = saved
+
+    def test_bench_meters_every_run_including_the_warmup(self):
+        stub = StubBackend()
+        try:
+            with temp_state():
+                import io
+                import contextlib
+                cfg = {"providers": {"stub": {
+                    "api_key": "k", "base_url": stub.base_url,
+                    "model": "m", "kind": "local"}},
+                    "ask_order": ["stub"]}
+                with contextlib.redirect_stdout(io.StringIO()):
+                    frontend.cmd_bench(cfg, "stub", 2, "hello", 16)
+                metered = [e for e in lmm.read_usage()
+                           if not e.get("event")
+                           and e.get("source") == "bench"]
+                self.assertEqual(len(metered), 3,
+                                 "bench runs (2) + warm-up (1) must all be "
+                                 "billed, got %d" % len(metered))
+        finally:
+            stub.stop()
+
+
+class TestTelemetrySurvivesElenchus(unittest.TestCase):
+    """Two sworn statements from the code itself, cross-examined.
+
+    "Telemetry must not be able to break the call it is measuring"
+    (log_usage). First exhibit was thrown out: a chmod-based read-only
+    directory proves nothing under root, which ignores permission bits —
+    the "read-only" dir quietly accepted all three files. This version
+    injects EROFS at the open() itself, so it binds for any uid.
+
+    "Those tokens were generated and billed whether or not anyone read
+    them" (hub_stream's finally). Proven by hanging up mid-stream and
+    finding the spend on the books, flagged partial.
+    """
+
+    def setUp(self):
+        self.stub = StubBackend()
+        self.cfg = {"providers": {"stub": {
+            "api_key": "k", "base_url": self.stub.base_url,
+            "model": "m", "kind": "local"}}, "ask_order": ["stub"]}
+
+    def tearDown(self):
+        self.stub.stop()
+
+    def test_a_read_only_disk_never_breaks_the_call(self):
+        import builtins
+        import errno
+        with temp_state():
+            targets = lmm.resolve_ask_targets(self.cfg, "x", None)
+            real_open = builtins.open
+
+            def refusing(path, *a, **kw):
+                mode = a[0] if a else kw.get("mode", "r")
+                if isinstance(path, str) and path.startswith(lmm.LMM_DIR) \
+                        and any(m in mode for m in "wax+"):
+                    raise OSError(errno.EROFS, "Read-only file system", path)
+                return real_open(path, *a, **kw)
+
+            builtins.open = refusing
+            try:
+                res, _ = lmm.hub_complete(self.cfg, "what is 2+2", targets,
+                                          {"cache": True, "source": "ask"})
+                self.assertIn("choices", res,
+                              "a full disk/read-only disk broke the answer")
+                b = lmm.CircuitBreaker(persist=True)
+                for _ in range(3):
+                    b.record_failure("dead")     # must not raise
+                self.assertFalse(b.available("dead"),
+                                 "the in-memory half stopped working too")
+                frames = list(lmm.hub_stream(
+                    self.cfg, [{"role": "user", "content": "hi"}], targets,
+                    {"cache": True, "source": "chat"}))
+                self.assertTrue(any(b"data:" in f for f in frames))
+            finally:
+                builtins.open = real_open
+
+    def test_an_abandoned_stream_is_still_billed(self):
+        with temp_state():
+            targets = lmm.resolve_ask_targets(self.cfg, "hi", None)
+            gen = lmm.hub_stream(self.cfg,
+                                 [{"role": "user", "content": "hi"}],
+                                 targets, {"cache": False, "source": "hub"})
+            next(gen)                    # the client reads one frame...
+            gen.close()                  # ...and hangs up
+            evs = [e for e in lmm.read_usage() if not e.get("event")]
+            self.assertEqual(len(evs), 1,
+                             "tokens were generated but never billed")
+            self.assertTrue(evs[0].get("partial"),
+                            "an abandoned stream must be flagged partial")
+
+
+class TestCompatSurvivesElenchus(unittest.TestCase):
+    """Two acquittals with the evidence entered.
+
+    "Config is backward compatible across every version" — examined against
+    the REAL v1.0.0 example config, resurrected from the git tag and pinned
+    here verbatim, not against a synthetic approximation of it.
+
+    "A self-contained HTML dashboard" — the generated page must reference no
+    external resource; a dashboard that phones home is neither self-contained
+    nor private.
+    """
+
+    V1_CONFIG = {
+        "pricing": {"my-model": {"in": 1.0, "out": 2.0, "cw": 1.0, "cr": 0.1}},
+        "route": {"private": ["secret", "\u793e\u5185", "private", "local",
+                              "offline"],
+                  "heavy": ["code", "\u8a2d\u8a08", "refactor", "debug",
+                            "architecture"]},
+        "extra_runtimes": [
+            {"name": "vLLM", "type": "local", "paid": False,
+             "procs": ["vllm", "vllm.entrypoints"],
+             "installed_paths": ["~/.vllm"],
+             "endpoint": "http://localhost:8000/v1",
+             "models_cmd": "curl -s http://localhost:8000/v1/models"},
+            {"name": "My Remote Agent", "type": "remote", "paid": True,
+             "procs": ["myagent"], "installed_paths": ["~/myagent"],
+             "endpoint": "https://api.myagent.example"}]}
+
+    def test_the_v1_example_config_still_drives_todays_code(self):
+        cfg = dict(self.V1_CONFIG)
+        self.assertIn("my-model", lmm.merged_pricing(cfg))
+        self.assertIn("secret", lmm.merged_route(cfg)["private"])
+        score, _ = lmm.prompt_strength(cfg, "hello")
+        self.assertTrue(0.0 <= score <= 1.0)
+        self.assertEqual(lmm.merged_providers(cfg), {},
+                         "v1 had no providers key; today must not invent one")
+        lmm.resolve_ask_targets(cfg, "hello", None)   # must not raise
+        names = [r["name"] for r in cfg["extra_runtimes"]]
+        self.assertEqual(names, ["vLLM", "My Remote Agent"])
+
+    def test_the_dashboard_is_self_contained(self):
+        import re
+        with temp_state():
+            html_text = frontend.build_dash({})
+        ext = re.findall(r'(?:src|href)\s*=\s*["\'](https?://[^"\']+)',
+                         html_text)
+        self.assertEqual(ext, [],
+                         "the dashboard references external resources")
+
+
+class TestVarietySurvivesElenchus(unittest.TestCase):
+    """Claim: cache.max_temp — "above this the caller wants variety, not a
+    cache". Half-refuted: the store side honoured it (a hot answer was never
+    frozen), but the LOOKUP side did not, so a hot repeat of a cached
+    question was served the frozen answer — the exact thing the caller
+    asked not to get. Both halves now hold, and both are pinned here.
+
+    Also entered as acquittal evidence this sitting: chat keeps history
+    across turns, and the semantic tier's embedder structurally cannot pay
+    a cloud provider.
+    """
+
+    def setUp(self):
+        self.stub = StubBackend()
+        self.cfg = {"providers": {"stub": {
+            "api_key": "k", "base_url": self.stub.base_url,
+            "model": "m", "kind": "local"}}, "ask_order": ["stub"]}
+
+    def tearDown(self):
+        self.stub.stop()
+
+    def _ask(self, prompt, temp=None):
+        targets = lmm.resolve_ask_targets(self.cfg, prompt, None)
+        opts = {"cache": True, "source": "ask"}
+        if temp is not None:
+            opts["extra"] = {"temperature": temp}
+        return lmm.hub_complete(self.cfg, prompt, targets, opts)
+
+    def test_a_hot_answer_is_never_frozen(self):
+        with temp_state():
+            self._ask("tell me a story", temp=1.5)
+            self.assertEqual(len(lmm.cache_entries(lmm.merged_cache({}))), 0)
+
+    def test_a_hot_repeat_is_not_served_the_frozen_answer(self):
+        with temp_state():
+            self._ask("what is 2+2")                       # cold: cached
+            res, trace = self._ask("what is 2+2", temp=1.5)
+            self.assertFalse(any("hit" in t for t in trace),
+                             "variety was requested and the cache answered "
+                             "anyway: %r" % trace)
+            self.assertTrue(any("variety" in t for t in trace))
+
+    def test_a_cold_repeat_still_hits(self):
+        with temp_state():
+            self._ask("what is 2+2")
+            res, trace = self._ask("what is 2+2")
+            self.assertTrue(any("[cache]" in t and "hit" in t for t in trace))
+
+    def test_chat_carries_history_between_turns(self):
+        """README: chat "keeps conversation history". Simulated 2-turn
+        session; the second request must carry turn 1 and its reply."""
+        import builtins
+        import io
+        import contextlib
+        captured = []
+
+        def fake_stream(cfg, messages, targets, opts=None):
+            captured.append([m["content"] for m in messages])
+            yield (b'data: {"choices":[{"delta":{"content":"reply%d"}}]}\n\n'
+                   % len(captured))
+            yield b"data: [DONE]\n\n"
+
+        saved_hs = frontend.hub_stream
+        saved_rat = frontend.resolve_ask_targets
+        saved_in = builtins.input
+        answers = iter(["first question", "second question", "exit"])
+        try:
+            frontend.hub_stream = fake_stream
+            frontend.resolve_ask_targets = lambda cfg, line, prov: [
+                ("p", {"model": "m", "kind": "local", "base_url": "http://x"})]
+            builtins.input = lambda *a: next(answers)
+            with contextlib.redirect_stdout(io.StringIO()):
+                frontend.cmd_chat(None, {})
+        finally:
+            frontend.hub_stream = saved_hs
+            frontend.resolve_ask_targets = saved_rat
+            builtins.input = saved_in
+        self.assertEqual(captured[1],
+                         ["first question", "reply1", "second question"],
+                         "turn 2 did not carry turn 1's exchange")
+
+    def test_the_embedder_cannot_pay_anyone(self):
+        """"the semantic tier uses local embeddings, never a paid one" —
+        every URL the embedder touches must be localhost."""
+        urls = []
+        saved = lmm.http_post_json
+        try:
+            lmm.http_post_json = lambda url, *a, **kw: (
+                urls.append(url) or {"error": "x"})
+            lmm.embed_text("hello", "nomic-embed-text")
+        finally:
+            lmm.http_post_json = saved
+        self.assertTrue(urls, "the embedder made no call at all")
+        for u in urls:
+            self.assertTrue(u.startswith("http://localhost:11434"),
+                            "the embedder left the machine: %s" % u)
+
+
+class TestRetryAfterSurvivesElenchus(unittest.TestCase):
+    """Claim: "a 429's Retry-After is honoured but capped, so a hostile
+    header cannot park the hub." Acquitted — these are the acquittal's
+    evidence: the parser was tested, but nothing proved the retry LOOP
+    actually waits the header's time, nor that the cap really binds.
+    """
+
+    def _run(self, retry_after, cap_ms=8000):
+        sleeps = []
+        calls = []
+        saved = lmm.call_provider
+        try:
+            def fake(prov, prompt, temperature=0.7, extra=None, **kw):
+                calls.append(1)
+                if len(calls) == 1:
+                    return {"error": "429", "retriable": True,
+                            "retry_after": retry_after, "status": 429}
+                return {"choices": [{"message": {"content": "ok"}}]}
+            lmm.call_provider = fake
+            res = lmm.call_with_retry(
+                {"model": "m", "base_url": "http://x/v1"}, "hi",
+                retry={"attempts": 3, "base_ms": 250, "cap_ms": cap_ms},
+                sleep=sleeps.append)
+            return res, sleeps
+        finally:
+            lmm.call_provider = saved
+
+    def test_the_loop_waits_what_the_server_asked(self):
+        res, sleeps = self._run(retry_after=2.0)
+        self.assertEqual(sleeps, [2.0],
+                         "Retry-After was parsed but not obeyed by the loop")
+        self.assertIn("choices", res)
+
+    def test_a_hostile_header_cannot_park_the_hub(self):
+        res, sleeps = self._run(retry_after=86400.0, cap_ms=8000)
+        self.assertEqual(sleeps, [8.0],
+                         "a hostile Retry-After exceeded the backoff ceiling")
+
+
+class TestPrivacyPinSurvivesElenchus(unittest.TestCase):
+    """Claim on trial: "route.private pins a prompt to local providers."
+    Cross-examined, the pin yielded three ways: with ask_order set the check
+    was never consulted (cloud-first order sent the secret to the cloud with
+    a local model sitting right there); with no ask_order the sort kept
+    cloud as a FALLBACK, so a failing local leaked; and with no local at all
+    it warned — in a trace printed after the request returned — and sent
+    anyway. A pin that yields is not a pin.
+    """
+
+    PRIVATE = "summarise this confidential internal memo about the merger"
+
+    def setUp(self):
+        self.stub = StubBackend()          # plays the cloud
+        self.sent = []
+        self._real = lmm.call_with_retry
+
+        def spy(prov, *a, **kw):
+            self.sent.append(prov.get("kind"))
+            return self._real(prov, *a, **kw)
+
+        lmm.call_with_retry = spy
+
+    def tearDown(self):
+        lmm.call_with_retry = self._real
+        self.stub.stop()
+
+    def _cfg(self, order, providers):
+        return {"providers": providers, "ask_order": order,
+                "retry": {"attempts": 1},
+                "route": {"private": ["confidential"]}}
+
+    def test_cloud_first_ask_order_does_not_outrank_privacy(self):
+        cfg = self._cfg(["cloud", "loc"], {
+            "cloud": {"api_key": "k", "base_url": self.stub.base_url,
+                      "model": "m", "kind": "cloud"},
+            "loc": {"api_key": "k", "base_url": "http://127.0.0.1:9/v1",
+                    "model": "m", "kind": "local"}})
+        with temp_state():
+            targets = lmm.resolve_ask_targets(cfg, self.PRIVATE, None)
+            lmm.hub_complete(cfg, self.PRIVATE, targets,
+                             {"cache": False, "source": "ask"})
+        self.assertNotIn("cloud", self.sent,
+                         "ask_order outranked the privacy pin")
+
+    def test_a_failing_local_does_not_fall_back_to_the_cloud(self):
+        """The subtlest leak: local listed first, local dead, cloud alive.
+        The old sort kept the cloud in the list as a fallback."""
+        cfg = self._cfg([], {
+            "loc": {"api_key": "k", "base_url": "http://127.0.0.1:9/v1",
+                    "model": "m", "kind": "local"},
+            "cloud": {"api_key": "k", "base_url": self.stub.base_url,
+                      "model": "m", "kind": "cloud"}})
+        with temp_state():
+            targets = lmm.resolve_ask_targets(cfg, self.PRIVATE, None)
+            res, _ = lmm.hub_complete(cfg, self.PRIVATE, targets,
+                                      {"cache": False, "source": "ask"})
+        self.assertNotIn("cloud", self.sent,
+                         "a failing local provider leaked the prompt to the cloud")
+        self.assertIn("error", res)
+
+    def test_no_local_at_all_is_refused_on_every_path(self):
+        cfg = self._cfg(["cloud"], {
+            "cloud": {"api_key": "k", "base_url": self.stub.base_url,
+                      "model": "m", "kind": "cloud"}})
+        with temp_state():
+            targets = lmm.resolve_ask_targets(cfg, self.PRIVATE, None)
+            res, _ = lmm.hub_complete(cfg, self.PRIVATE, targets,
+                                      {"cache": False, "source": "ask"})
+            self.assertIn("refusing", res.get("error", ""))
+            frames = b"".join(lmm.hub_stream(
+                cfg, [{"role": "user", "content": self.PRIVATE}], targets,
+                {"cache": False, "source": "chat"}))
+            self.assertIn(b"refusing", frames)
+            name, reason, reply = lmm.route_and_verify(self.PRIVATE, cfg)
+            self.assertIsNone(name)
+            self.assertIn("refusing", reason)
+        self.assertEqual(self.sent, [],
+                         "a private prompt reached a provider on some path")
+        self.assertEqual(self.stub.seen, [],
+                         "the cloud stub actually received the secret")
+
+    def test_a_public_prompt_is_untouched_by_the_pin(self):
+        cfg = self._cfg(["cloud"], {
+            "cloud": {"api_key": "k", "base_url": self.stub.base_url,
+                      "model": "m", "kind": "cloud"}})
+        with temp_state():
+            targets = lmm.resolve_ask_targets(cfg, "what is 2+2", None)
+            res, _ = lmm.hub_complete(cfg, "what is 2+2", targets,
+                                      {"cache": False, "source": "ask"})
+        self.assertNotIn("error", res)
+        self.assertEqual(self.sent, ["cloud"])
+
+
+class TestBreakerSurvivesElenchus(unittest.TestCase):
+    """Claim: "a dead backend stops charging every request its full timeout."
+    Cross-examined, it failed twice: `lmm ask` never engaged the breaker at
+    all (the comment beside HUB_BREAKER even said ask "makes a fresh one per
+    process" — it made none), and the state died with the process, so a CLI
+    user re-paid the timeout on every single run.
+    """
+
+    def _cfg(self, stub):
+        return {"providers": {
+            "dead": {"api_key": "k", "base_url": "http://127.0.0.1:9/v1",
+                     "model": "m", "kind": "local"},
+            "good": {"api_key": "k", "base_url": stub.base_url,
+                     "model": "m", "kind": "local"}},
+            "ask_order": ["dead", "good"],
+            "retry": {"attempts": 1},
+            "breaker": {"enabled": True, "threshold": 3, "cooldown_s": 300}}
+
+    def test_ask_stops_paying_for_a_dead_provider(self):
+        """5 asks, dead provider first in ask_order: it may be attempted at
+        most `threshold` times before the circuit opens and it is skipped."""
+        stub = StubBackend()
+        attempts = []
+        real = lmm.call_with_retry
+
+        def counting(prov, *a, **kw):
+            attempts.append(prov["base_url"])
+            return real(prov, *a, **kw)
+
+        lmm.call_with_retry = counting
+        try:
+            with temp_state():
+                import io
+                import contextlib
+                cfg = self._cfg(stub)
+                for _ in range(5):
+                    with contextlib.redirect_stdout(io.StringIO()):
+                        frontend.cmd_ask("hi", None, cfg, no_cache=True)
+                dead_tries = sum(1 for u in attempts if ":9/" in u)
+                self.assertEqual(dead_tries, 3,
+                                 "the dead provider was attempted %d times "
+                                 "across 5 asks; the breaker never opened"
+                                 % dead_tries)
+        finally:
+            lmm.call_with_retry = real
+            stub.stop()
+
+    def test_the_open_circuit_survives_the_process(self):
+        """The half that made the claim false for CLI users: a second
+        process must inherit the first one's open circuit."""
+        import subprocess
+        home = tempfile.mkdtemp(prefix="lmm-breaker-")
+        root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        env = dict(os.environ, HOME=home)
+        script1 = (
+            "import sys; sys.path.insert(0, %r); import backend\n"
+            "for _ in range(3): backend.HUB_BREAKER.record_failure('dead')\n"
+            "print(backend.HUB_BREAKER.available('dead'))" % root)
+        script2 = (
+            "import sys; sys.path.insert(0, %r); import backend\n"
+            "print(backend.HUB_BREAKER.available('dead'))" % root)
+        try:
+            r1 = subprocess.run([sys.executable, "-c", script1], env=env,
+                                capture_output=True, text=True, timeout=120)
+            self.assertEqual(r1.stdout.strip(), "False", r1.stderr)
+            r2 = subprocess.run([sys.executable, "-c", script2], env=env,
+                                capture_output=True, text=True, timeout=120)
+            self.assertEqual(r2.stdout.strip(), "False",
+                             "a fresh process forgot the open circuit: "
+                             + r2.stderr)
+        finally:
+            shutil.rmtree(home, ignore_errors=True)
+
+    def test_healthy_traffic_writes_no_state_file(self):
+        """record_success on a name with no history must not touch disk —
+        otherwise every successful call becomes a disk write."""
+        with temp_state():
+            lmm.HUB_BREAKER.record_success("fine")
+            self.assertFalse(
+                os.path.exists(os.path.join(lmm.LMM_DIR, "breaker.json")),
+                "a healthy call wrote breaker state")
+
+    def test_recovery_is_forgettable(self):
+        with temp_state():
+            for _ in range(3):
+                lmm.HUB_BREAKER.record_failure("dead")
+            self.assertFalse(lmm.HUB_BREAKER.available("dead"))
+            lmm.HUB_BREAKER.reset()
+            self.assertTrue(lmm.HUB_BREAKER.available("dead"))
+            self.assertFalse(
+                os.path.exists(os.path.join(lmm.LMM_DIR, "breaker.json")))
+
+
 class TestClosedLoop(unittest.TestCase):
     """The product's core claim: routing outcomes are measured, and the
     measurements are readable. The merge silently broke this — the readers
@@ -4038,6 +4677,10 @@ class temp_state(object):
         self.dir = tempfile.mkdtemp(prefix="lmm-test-")
         self.saved = (lmm.LMM_DIR, lmm.USAGE_LOG, lmm.CACHE_LOG,
                       lmm.CLAUDE_PROJECTS)
+        # The breaker is process-wide AND persisted; without a reset, one
+        # test opening a circuit for "stub" poisons every later test that
+        # reuses the name — for cooldown_s of wall time.
+        lmm.HUB_BREAKER.reset()
         lmm.LMM_DIR = self.dir
         lmm.USAGE_LOG = os.path.join(self.dir, "usage.jsonl")
         lmm.CACHE_LOG = os.path.join(self.dir, "cache.jsonl")
@@ -4048,6 +4691,7 @@ class temp_state(object):
         return self
 
     def __exit__(self, *exc):
+        lmm.HUB_BREAKER.reset()
         (lmm.LMM_DIR, lmm.USAGE_LOG, lmm.CACHE_LOG,
          lmm.CLAUDE_PROJECTS) = self.saved
         for name in ("usage.jsonl", "cache.jsonl"):

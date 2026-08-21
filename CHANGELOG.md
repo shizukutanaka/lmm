@@ -54,6 +54,11 @@ the merge of the managed-routing line of work into the same tool.
     to send auth.
   - `cache_prune` (a public wrapper with zero callers anywhere — every
     internal site already goes through the locked variant).
+  - `cascade_rungs`'s private branch and its `prompt` parameter: privacy is
+    `pin_private`'s job, enforced before rungs are built, and on pinned
+    input the branch was measured behaviourally identical to the normal
+    path. A second authority that can drift is worse than none — the same
+    lesson as the second router.
   - **A second pre-push hook and its scaffolding.** `hooks/pre-push` was the
     unwired ancestor of `.githooks/pre-push`; `setup-hooks.bat` wrapped the
     one command (`git config core.hooksPath .githooks`) that is identical on
@@ -95,6 +100,51 @@ the merge of the managed-routing line of work into the same tool.
   suite stays zero-dependency.
 
 ### Fixed
+- **The variety request was half-honoured.** `cache.max_temp` promises
+  that an explicitly high temperature means "the caller wants variety, not
+  a cache". The store side kept that promise (a hot answer was never
+  frozen); the lookup side did not, so a hot repeat of a cached question
+  was served the frozen answer — the exact thing the caller asked not to
+  get. Both hub paths now bypass the cache for hot requests, with a trace
+  line saying so.
+- **The privacy pin yielded under pressure — three ways.** "route.private
+  pins a prompt to local providers" failed cross-examination badly: with
+  `ask_order` set the privacy check was never consulted, so a confidential
+  prompt went to whichever cloud the user listed first, with a local model
+  sitting right there; without `ask_order` the pin was only a sort, so the
+  cloud stayed in the list as a fallback and a failing local leaked the
+  prompt; and with no local provider at all it warned — in a trace printed
+  after the request had already returned — and sent anyway. One authority
+  (`pin_private`) now enforces it on every path (ask, chat, hub, --verify):
+  non-local targets are removed, and with nothing local left the request is
+  refused outright, because the user opted in by listing the keyword and
+  refusing is respecting their own instruction. Proven against a live stub
+  that must receive nothing.
+- **The circuit breaker was a hub-only story.** "A dead backend stops
+  charging every request its full timeout" failed cross-examination twice:
+  `lmm ask` never passed a breaker into the request path at all — the
+  comment beside HUB_BREAKER claimed ask "makes a fresh one per process",
+  and it made none — and the state died with the process, so every CLI run
+  re-paid the timeout. The breaker now rides the ask and --verify paths and
+  persists to `~/.lmm/breaker.json` (wall-clock cooldowns, last-writer-wins
+  across processes, zero writes on healthy traffic). Proven across real
+  processes: a second interpreter inherits the first one's open circuit,
+  and five asks attempt a dead provider exactly `threshold` times.
+- **The documented env-var key pattern sent the literal string.** `lmm
+  secrets` prints "move secrets to environment variables; lmm reads them at
+  call time", and the README shows `"api_key": "$OPENAI_API_KEY"` — but
+  nothing anywhere expanded it. Captured on the wire: `Authorization: Bearer
+  $OPENAI_API_KEY`, so following the product's own security advice broke
+  auth with no hint why. Expansion now happens at the one gateway from
+  config to providers; an UNSET variable stays literal and `lmm doctor`
+  reports it by name.
+- **Two spenders were off the books.** "Every call lmm makes is metered" was
+  false twice over: `ask --verify` called providers directly and metered
+  nothing — including rejected replies, which are billed whether the quality
+  gate likes them or not — and `lmm bench` spent tokens on every run,
+  warm-up included, invisibly. Both now meter under their own sources
+  (`verify`, `bench`), so `lmm cost` shows what verifying and measuring have
+  cost you.
 - **The hub probed liveness on every request — with subprocesses.** Both
   implicit-provider detectors ran per request, even when the request named an
   explicit provider: measured under concurrent load at 2.00 subprocess spawns

@@ -939,30 +939,85 @@ class CircuitBreaker:
                  failure re-opens it.
 
     The clock is injectable (`now`) so state transitions are testable without
-    sleeping. State is per-process: it helps the long-lived hub, and does no
-    harm to a one-shot `lmm ask`.
+    sleeping. The clock is wall time, deliberately: with persist=True the
+    state survives the process in ~/.lmm/breaker.json, so consecutive one-shot
+    `lmm ask` invocations share the memory — without that, "a dead backend
+    stops charging every request its timeout" was only true inside a single
+    long-lived hub, and a CLI user paid the full timeout on every run.
+    Cross-process writes are last-writer-wins, the same openly-taken trade as
+    the metering log; the state is advisory, so the worst case is one extra
+    probe of a dead backend.
     """
 
-    def __init__(self, threshold=3, cooldown_s=30):
+    def __init__(self, threshold=3, cooldown_s=30, persist=False):
         self.threshold = threshold
         self.cooldown_s = cooldown_s
+        self.persist = persist
+        self._loaded = False
         self._fails = {}
         self._open_until = {}
+        self._lock = threading.Lock()
+
+    def _path(self):
+        return os.path.join(LMM_DIR, "breaker.json")
+
+    def _load_locked(self):
+        if self._loaded or not self.persist:
+            return
+        self._loaded = True
+        try:
+            with open(self._path(), encoding="utf-8") as fh:
+                d = json.load(fh)
+            now = time.time()
+            for k, v in (d.get("open_until") or {}).items():
+                if isinstance(v, (int, float)) and v > now:
+                    self._open_until.setdefault(k, v)
+            for k, v in (d.get("fails") or {}).items():
+                if isinstance(v, int) and v > 0:
+                    self._fails.setdefault(k, v)
+        except Exception:
+            pass                      # a missing or corrupt file is a closed circuit
+
+    def _save_locked(self):
+        if not self.persist:
+            return
+        try:
+            now = time.time()
+            os.makedirs(LMM_DIR, exist_ok=True)
+            state = {"fails": {k: v for k, v in self._fails.items() if v > 0},
+                     "open_until": {k: v for k, v in self._open_until.items()
+                                    if v > now}}
+            tmp = self._path() + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as fh:
+                json.dump(state, fh)
+            os.replace(tmp, self._path())
+        except Exception:
+            pass                      # telemetry must not break the call
 
     def record_success(self, name):
-        self._fails.pop(name, None)
-        self._open_until.pop(name, None)
+        with self._lock:
+            self._load_locked()
+            changed = name in self._fails or name in self._open_until
+            self._fails.pop(name, None)
+            self._open_until.pop(name, None)
+            if changed:               # healthy steady state writes nothing
+                self._save_locked()
 
     def record_failure(self, name, now=None):
         now = time.time() if now is None else now
-        n = self._fails.get(name, 0) + 1
-        self._fails[name] = n
-        if n >= self.threshold:
-            self._open_until[name] = now + self.cooldown_s
+        with self._lock:
+            self._load_locked()
+            n = self._fails.get(name, 0) + 1
+            self._fails[name] = n
+            if n >= self.threshold:
+                self._open_until[name] = now + self.cooldown_s
+            self._save_locked()
 
     def state(self, name, now=None):
         now = time.time() if now is None else now
-        until = self._open_until.get(name)
+        with self._lock:
+            self._load_locked()
+            until = self._open_until.get(name)
         if until is None:
             return "closed"
         return "open" if now < until else "half-open"
@@ -971,10 +1026,23 @@ class CircuitBreaker:
         """A provider is available unless its circuit is fully open."""
         return self.state(name, now) != "open"
 
+    def reset(self):
+        """Forget everything, including the persisted file. For tests and for
+        a user who knows the outage is over (`rm ~/.lmm/breaker.json` works
+        just as well — this is that, plus the in-memory half)."""
+        with self._lock:
+            self._fails.clear()
+            self._open_until.clear()
+            self._loaded = False
+            try:
+                os.remove(self._path())
+            except OSError:
+                pass
 
-# Shared by the long-lived hub across requests. `lmm ask` makes a fresh one per
-# process, which is fine — the breaker only pays off when many requests share it.
-HUB_BREAKER = CircuitBreaker()
+
+# Shared by every path in this process, and — because persist=True — by
+# consecutive CLI processes too, via ~/.lmm/breaker.json.
+HUB_BREAKER = CircuitBreaker(persist=True)
 
 
 def merged_route(cfg):
@@ -1056,8 +1124,19 @@ def merged_providers(cfg):
     for name, v in (cfg.get("providers") or {}).items():
         if not isinstance(v, dict):
             continue
+        key = v.get("api_key", "")
+        # "api_key": "$OPENAI_API_KEY" is the documented way to keep the
+        # secret out of the config file — and `lmm secrets` explicitly
+        # promises "lmm reads them at call time". Until this line existed,
+        # nothing did: the literal string "$OPENAI_API_KEY" went out as the
+        # bearer token and auth failed with no hint why. Expansion happens
+        # here because this is the one gateway from config to providers; an
+        # UNSET variable stays as the literal "$NAME", which `lmm doctor`
+        # reports by name instead of letting the 401 be the only witness.
+        if isinstance(key, str) and "$" in key:
+            key = os.path.expandvars(key)
         provs[name] = {
-            "api_key": v.get("api_key", ""),
+            "api_key": key,
             "base_url": v.get("base_url", "https://api.openai.com/v1"),
             "model": v.get("model", ""),
             "kind": v.get("kind", "remote"),
@@ -2395,6 +2474,32 @@ def is_private(cfg, text):
     return any(k.lower() in low for k in merged_route(cfg).get("private", []))
 
 
+def pin_private(cfg, messages, targets):
+    """Enforce route.private as a PIN, not a preference.
+
+    Cross-examined, the old behaviour failed twice: with ask_order set the
+    privacy check was never consulted at all, so a private prompt went to
+    whichever cloud the user happened to list first; and with no local
+    provider it emitted a trace warning and sent the prompt anyway — a
+    warning printed after the request returns is a eulogy, not a guard.
+    "Pins to local" means: non-local targets are REMOVED, and when nothing
+    local remains the request is refused outright. The user opted in by
+    listing the keyword; refusing is respecting their own instruction.
+
+    Returns (targets, refusal_or_None).
+    """
+    if not targets:
+        return targets, None
+    if not is_private(cfg, messages_text(as_messages(messages))):
+        return targets, None
+    local = [(n, p) for n, p in targets if p.get("kind") == "local"]
+    if local:
+        return local, None
+    return [], ("prompt matches route.private but no local provider is "
+                "available — refusing to send it to a remote API. Start one "
+                "(`lmm serve <model>`) or adjust route.private.")
+
+
 def prompt_strength(cfg, prompt):
     """Score how likely a prompt needs the strong model. Returns (score, feats)
     where score is in [0,1] and feats is a list of (label, weight) for
@@ -2612,22 +2717,20 @@ def judge_answer(judge_prov, prompt, answer):
         return None
 
 
-def cascade_rungs(cfg, targets, prompt=None):
+def cascade_rungs(cfg, targets):
     """Order the rungs cheapest-first, which is what makes a cascade cheap.
     An explicit cascade.rungs list wins; otherwise it is derived from price, so
     a zero-config user still gets local -> cheap cloud -> expensive cloud.
 
-    Escalation must never leak: a prompt matching route.private stays on local
-    rungs, because "the cheap model did badly" is not a reason to ship a secret
-    to a cloud API.
+    Privacy is not this function's job: hub_complete runs pin_private BEFORE
+    building rungs, so a private prompt arrives here with non-local targets
+    already removed (or refused outright). This used to carry its own private
+    branch as defence in depth; on pinned input it was measured behaviourally
+    identical to the normal path, and a second authority that can drift is
+    worse than none — the same lesson as the second router.
     """
     casc = merged_cascade(cfg)
     cap = max(1, int(casc.get("max_rungs", 3)))
-    text = prompt if isinstance(prompt, str) else messages_text(prompt)
-    if text and is_private(cfg, text):
-        local = [t for t in targets if t[1].get("kind") == "local"]
-        if local:
-            return local[:cap]
     named = list(casc.get("rungs") or [])
     if named:
         by_name = dict(targets)
@@ -3000,14 +3103,14 @@ def hub_complete(cfg, messages, targets, opts=None):
     if not targets:
         return {"error": "no provider available"}, trace
 
-    # Privacy is pinned in order_targets/cascade_rungs, but only if a local
-    # provider exists at all. When none does, say so out loud rather than
-    # quietly shipping a prompt the user flagged as private to a remote API.
-    if (is_private(cfg, messages_text(as_messages(messages)))
-            and not any(t[1].get("kind") == "local" for t in targets)):
-        trace.append("[warn] prompt matches route.private but no local provider "
-                     "is running — it will be sent to a remote API "
-                     "(start one with `lmm serve <model>`)")
+    n_before = len(targets)
+    targets, refused = pin_private(cfg, messages, targets)
+    if refused:
+        return {"error": refused}, trace
+    if len(targets) != n_before:
+        trace.append("[private] %d non-local provider(s) excluded — "
+                     "route.private is a pin, not a preference"
+                     % (n_before - len(targets)))
 
     # The cache key identifies the REQUEST, not whoever ended up answering it:
     # a cascade may answer from rung 2, and next time that answer should be
@@ -3016,6 +3119,16 @@ def hub_complete(cfg, messages, targets, opts=None):
     cache_model = targets[0][1].get("model")
 
     # ---- (1) cache -----------------------------------------------------
+    # An explicit high temperature is a request for VARIETY. The store side
+    # always honoured that (a hot answer is never frozen into the cache); the
+    # lookup side did not, so a hot repeat of a cached question was served
+    # the frozen answer — the exact thing the caller asked not to get.
+    if (use_cache and req_temp is not None
+            and float(req_temp) > float(merged_cache(cfg).get("max_temp", 0.3))):
+        use_cache = False
+        trace.append("[cache] bypassed: temperature %.2f asks for variety"
+                     % float(req_temp))
+
     explore = None          # near neighbour awaiting a correctness label
     if use_cache:
         probe_model = cache_model
@@ -3034,7 +3147,7 @@ def hub_complete(cfg, messages, targets, opts=None):
                          "certified yet; answering for real and labelling it")
 
     # ---- (2)+(3) routing already applied; now walk the rungs -----------
-    rungs = cascade_rungs(cfg, targets, messages) if use_cascade else targets
+    rungs = cascade_rungs(cfg, targets) if use_cascade else targets
     judge = None
     if use_cascade and casc.get("judge"):
         judge = merged_providers(cfg).get(casc["judge"])
@@ -3174,11 +3287,20 @@ def hub_stream(cfg, messages, targets, opts=None):
 
     breaker = opts.get("breaker")
     targets = order_targets(cfg, messages, targets)
+    targets, refused = pin_private(cfg, messages, targets)
+    if refused:
+        yield sse_frame({"error": {"message": refused}})
+        yield SSE_DONE
+        return
     if not targets:
         yield sse_frame({"error": {"message": "no provider available"}})
         yield SSE_DONE
         return
     cache_model = targets[0][1].get("model")
+
+    if (use_cache and req_temp is not None
+            and float(req_temp) > float(merged_cache(cfg).get("max_temp", 0.3))):
+        use_cache = False                # variety requested; see hub_complete
 
     explore = None          # near neighbour awaiting a correctness label
     if use_cache:
@@ -3378,6 +3500,8 @@ def bench_once(prov, prompt, max_tokens=128):
     tpot = (e2e - ttft) / (out - 1) if out > 1 else 0.0
     return {"ttft_ms": ttft * 1000, "tpot_ms": tpot * 1000, "e2e_ms": e2e * 1000,
             "out_tokens": out, "tok_per_s": out / e2e if e2e > 0 else 0.0,
+            "in_tokens": (usage or {}).get("prompt_tokens")
+            or estimate_tokens(prompt),
             "estimated": usage is None}
 
 
@@ -3618,9 +3742,21 @@ def route_and_verify(task, cfg, ask_order=None, max_tries=3):
     if not targets:
         return None, "no reachable backend", None
     tried = []
-    for name, prov in order_targets(cfg, task, targets)[:max_tries]:
+    pricing = merged_pricing(cfg)
+    ordered = order_targets(cfg, task, targets)
+    ordered, refused = pin_private(cfg, task, ordered)
+    if refused:
+        return None, refused, None
+    if merged_breaker(cfg).get("enabled", True):
+        live = [(n, p) for n, p in ordered if HUB_BREAKER.available(n)]
+        if live:                        # never skip the last one standing
+            ordered = live
+    for name, prov in ordered[:max_tries]:
+        t0 = time.time()
         r = call_provider(prov, task, stream=False)
+        elapsed_ms = int((time.time() - t0) * 1000)
         if isinstance(r, dict) and r.get("error"):
+            HUB_BREAKER.record_failure(name)
             tried.append(f"{name} error: {r['error']}")
             continue
         try:
@@ -3629,6 +3765,15 @@ def route_and_verify(task, cfg, ask_order=None, max_tries=3):
             tried.append(f"{name} bad response")
             continue
         ok, vreason = verify_reply(task, reply)
+        # Metered whether the gate accepts the reply or not: a rejected
+        # answer was still generated and still billed. Leaving this loop
+        # unmetered contradicted the product's first claim — every call lmm
+        # makes shows up in the bill.
+        HUB_BREAKER.record_success(name)   # a real reply closes the circuit,
+                                            # whatever the quality gate says
+        meter_call(name, prov, prov.get("model"), r, pricing,
+                   source="verify", cache="miss", accepted=bool(ok),
+                   ms=elapsed_ms)
         if ok:
             return name, f"verified ok ({vreason})", reply
         tried.append(f"{name} failed verify: {vreason}")
