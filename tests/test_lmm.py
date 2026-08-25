@@ -2521,14 +2521,14 @@ class TestUsageCompaction(unittest.TestCase):
         with temp_state():
             self.seed()
             before = self.totals(lmm.hub_cost_stats())
-            self.assertTrue(lmm.usage_compact(keep=10))
+            self.assertTrue(compact(keep=10))
             after = self.totals(lmm.hub_cost_stats())
         self.assertEqual(before, after)
 
     def test_the_tail_stays_raw_and_the_file_shrinks_to_keep_plus_one(self):
         with temp_state():
             self.seed()
-            lmm.usage_compact(keep=10)
+            compact(keep=10)
             with open(lmm.USAGE_LOG, encoding="utf-8") as fh:
                 lines = [json.loads(l) for l in fh if l.strip()]
         self.assertEqual(len(lines), 11)              # rollup + 10 raw
@@ -2539,8 +2539,8 @@ class TestUsageCompaction(unittest.TestCase):
         with temp_state():
             self.seed()
             before = self.totals(lmm.hub_cost_stats())
-            lmm.usage_compact(keep=20)
-            lmm.usage_compact(keep=5)
+            compact(keep=20)
+            compact(keep=5)
             after = self.totals(lmm.hub_cost_stats())
             with open(lmm.USAGE_LOG, encoding="utf-8") as fh:
                 rollups = [l for l in fh if json.loads(l).get("rollup")]
@@ -2556,7 +2556,7 @@ class TestUsageCompaction(unittest.TestCase):
         # carry them; the STREAM TTFT line reads from the raw tail.
         with temp_state():
             self.seed()
-            lmm.usage_compact(keep=10)
+            compact(keep=10)
             st = lmm.hub_cost_stats()
         self.assertLessEqual(len(st["ttfts"]), 10)
 
@@ -2568,7 +2568,7 @@ class TestUsageCompaction(unittest.TestCase):
             before = io.StringIO()
             with contextlib.redirect_stdout(before):
                 frontend.cmd_cache({})
-            lmm.usage_compact(keep=5)
+            compact(keep=5)
             after = io.StringIO()
             with contextlib.redirect_stdout(after):
                 frontend.cmd_cache({})
@@ -2593,12 +2593,12 @@ class TestUsageCompaction(unittest.TestCase):
         with temp_state():
             lmm.log_usage({"provider": "p", "kind": "remote", "in": 1, "out": 1,
                            "usd": 0.1, "cache": "miss"})
-            self.assertFalse(lmm.usage_compact(keep=10))
+            self.assertFalse(compact(keep=10))
 
     def test_report_names_the_rollup(self):
         with temp_state():
             self.seed()
-            lmm.usage_compact(keep=5)
+            compact(keep=5)
             block = "\n".join(lmm.hub_cost_block({}, lmm.merged_pricing({})))
         self.assertIn("includes a rollup of older events", block)
 
@@ -2812,7 +2812,14 @@ class StubBackend(object):
 
         self.httpd = S(("127.0.0.1", 0), H)
         self.port = self.httpd.server_address[1]
-        self.thread = threading.Thread(target=self.httpd.serve_forever, daemon=True)
+        # poll_interval is not a tuning knob here, it is the teardown cost:
+        # shutdown() blocks until serve_forever notices, which happens on a
+        # poll boundary. The stdlib default of 0.5 s made every stop() cost
+        # ~0.48 s, and the suite creates one of these per test — measured at
+        # 16 s of a 25 s run, spent entirely on waiting to stop.
+        self.thread = threading.Thread(
+            target=lambda: self.httpd.serve_forever(poll_interval=0.01),
+            daemon=True)
         self.thread.start()
 
     @property
@@ -2872,9 +2879,6 @@ except ImportError:
     HAS_OPENAI = False
 
 
-@unittest.skipUnless(HAS_OPENAI, "openai SDK not installed — the suite stays "
-                     "zero-dependency; this class runs only where the real "
-                     "client library happens to be available")
 class TestTrayWiring(unittest.TestCase):
     """setup_tray existed with zero callers after the merge — the minimize-
     to-tray feature was silently severed. Headless CI cannot click a tray
@@ -3047,6 +3051,9 @@ class TestPerModelRouting(unittest.TestCase):
                 lmm.local_ollama_provider = saved
 
 
+@unittest.skipUnless(HAS_OPENAI, "openai SDK not installed — the suite stays "
+                     "zero-dependency; this class runs only where the real "
+                     "client library happens to be available")
 class TestOpenAISdkCompat(unittest.TestCase):
     """The README's core claim is "point your apps at the hub". Apps do not
     speak hand-rolled curl — they speak the OpenAI client library, which has
@@ -3691,6 +3698,124 @@ class TestPackaging(unittest.TestCase):
         self.assertNotIn("git show", text,
                          "the hook is testing lone blobs again")
 
+    def test_nothing_is_defined_with_no_callers(self):
+        """A function nobody calls is either dead weight or — twice in this
+        repo's history — a SEVERED FEATURE: the code survived, its call site
+        did not, and the feature silently stopped existing.
+
+        `setup_tray` lost its caller in a merge and minimize-to-tray simply
+        vanished. `resolve_provider_by_model` lost its caller and the hub
+        went back to ignoring which model you asked for. `cache_prune` and
+        `gui_ask` were plain dead weight. All four were found by running
+        this sweep BY HAND, three separate times. Automating the audit is
+        the last step of the method it came from: a check performed
+        repeatedly by a person is a check that will eventually be skipped.
+
+        Anything genuinely entry-point-like (main, __init__, dunders) is
+        exempt; everything else must be reachable from the product itself.
+        """
+        import ast
+        srcs = {}
+        for name in self.modules:
+            with open(os.path.join(self.root, name), encoding="utf-8") as f:
+                srcs[name] = f.read()
+        trees = {n: ast.parse(src) for n, src in srcs.items()}
+
+        # Real references only. A regex over source text counts the symbol's
+        # own docstring and the comment explaining it, which is how the first
+        # two versions of this test passed the setup_tray mutation they
+        # existed to catch: unwiring the call left the comment behind, and
+        # the comment looked like life support.
+        referenced = set()
+        for n, tree in trees.items():
+            for node in ast.walk(tree):
+                if isinstance(node, ast.Name):
+                    referenced.add(node.id)
+                elif isinstance(node, ast.Attribute):
+                    referenced.add(node.attr)
+
+        EXEMPT = {"main"}
+        orphans = []
+        for name, tree in trees.items():
+            for node in tree.body:
+                if not isinstance(node, (ast.FunctionDef, ast.ClassDef)):
+                    continue
+                sym = node.name
+                if sym in EXEMPT or sym.startswith("__"):
+                    continue
+                if sym not in referenced:
+                    orphans.append("%s:%s" % (name, sym))
+        self.assertEqual(orphans, [],
+                         "defined but never called — dead weight, or a "
+                         "feature whose call site was severed")
+
+    def test_conditional_skips_decorate_the_class_they_name(self):
+        """A decorator sits above a class, so inserting a new class between
+        them silently moves it. That happened here: two classes were added
+        above `TestOpenAISdkCompat` and inherited its
+        `skipUnless(HAS_OPENAI)`. The consequences were invisible locally,
+        where the SDK is installed and everything ran — but on any machine
+        without it (CI, every contributor) the tray tests were skipped and
+        never ran at all, while the SDK tests lost their guard and errored
+        with NameError. Only the SDK class may carry that skip.
+        """
+        import ast
+        path = os.path.join(self.root, "tests", "test_lmm.py")
+        with open(path, encoding="utf-8") as f:
+            tree = ast.parse(f.read())
+        for node in tree.body:
+            if not isinstance(node, ast.ClassDef):
+                continue
+            for dec in node.decorator_list:
+                names = {n.id for n in ast.walk(dec)
+                         if isinstance(n, ast.Name)}
+                if "HAS_OPENAI" not in names:
+                    continue
+                self.assertIn("Sdk", node.name,
+                              "the openai skip drifted onto %s, which has "
+                              "nothing to do with the SDK" % node.name)
+
+    def test_no_server_uses_the_default_poll_interval(self):
+        """serve_forever's poll_interval decides how long shutdown blocks,
+        not how fast the server answers. The stdlib default is 0.5 s, so
+        every omission is half a second of latency on stopping — measured
+        at 16 s of a 25 s test run, and a visibly sticky Ctrl-C on the hub.
+        Pin the class, not the instance: every call must say what it wants.
+        """
+        import ast
+        offenders = []
+        for name in self.modules + ["tests/test_lmm.py"]:
+            path = os.path.join(self.root, name)
+            with open(path, encoding="utf-8") as f:
+                tree = ast.parse(f.read())
+            called_here = set()
+            for node in ast.walk(tree):
+                if not isinstance(node, ast.Call):
+                    continue
+                fn = node.func
+                if isinstance(fn, ast.Attribute):
+                    called_here.add(id(fn))
+                    if fn.attr != "serve_forever":
+                        continue
+                elif getattr(fn, "id", None) != "serve_forever":
+                    continue
+                kws = {k.arg for k in node.keywords}
+                if "poll_interval" not in kws and not node.args:
+                    offenders.append("%s:%d (default)" % (name, node.lineno))
+            # A bare REFERENCE is the dangerous form: handing
+            # `x.serve_forever` to Thread(target=...) means someone else
+            # calls it, with every default intact. The first version of this
+            # test only inspected calls and therefore passed the mutation it
+            # was written to catch — a test that cannot fail is not a test.
+            for node in ast.walk(tree):
+                if (isinstance(node, ast.Attribute)
+                        and node.attr == "serve_forever"
+                        and id(node) not in called_here):
+                    offenders.append("%s:%d (bare reference)"
+                                     % (name, node.lineno))
+        self.assertEqual(offenders, [],
+                         "serve_forever called with the default poll_interval")
+
     def test_a_lone_entry_point_explains_itself(self):
         """Copying lmm.py by itself must not end in an import traceback."""
         import subprocess
@@ -3958,8 +4083,9 @@ class TestClaimsSurviveElenchus(unittest.TestCase):
 
             self.httpd = S(("127.0.0.1", 0), H)
             self.port = self.httpd.server_address[1]
-            threading.Thread(target=self.httpd.serve_forever,
-                             daemon=True).start()
+            threading.Thread(
+                target=lambda: self.httpd.serve_forever(poll_interval=0.01),
+                daemon=True).start()
 
         @property
         def base_url(self):
@@ -4637,7 +4763,15 @@ class TestSelftestGate(unittest.TestCase):
     def _run(self, *args):
         import subprocess
         root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-        env = dict(os.environ, LMM_SELFTEST_SKIP_LIVE="1")
+        # NO_SUITE, or each of these spawns a selftest that runs the whole
+        # suite again: three tests x 8 s turned a 7.7 s run into 33.7 s,
+        # undoing the acceleration round two commits earlier. These tests
+        # are about the gate's OWN behaviour — its banner, its exit code,
+        # its doctor check — not about the suite it carries. That the gate
+        # really runs the suite is proven where it matters: by guard.sh in
+        # pre-commit, pre-push and CI, on every single run.
+        env = dict(os.environ, LMM_SELFTEST_SKIP_LIVE="1",
+                   LMM_SELFTEST_NO_SUITE="1")
         return subprocess.run([sys.executable, os.path.join(root, "lmm.py"),
                                "selftest"] + list(args), cwd=root, env=env,
                               stdout=subprocess.PIPE, stderr=subprocess.PIPE,
@@ -4657,6 +4791,40 @@ class TestSelftestGate(unittest.TestCase):
         self.assertIn("SELFTEST PASS", out)
         self.assertIn("[PASS]", out)
 
+    def test_the_gate_carries_the_unit_suite(self):
+        """Until this existed, the 367 tests were gated NOWHERE: pre-commit,
+        pre-push and CI all ran `selftest` and nothing else, so the suite
+        that carries every claim in the README executed only when a human
+        remembered to type the command. selftest is the one gate all three
+        share, and the one this repo is allowed to edit — the workflow file
+        needs a permission the App does not have."""
+        import ast
+        import inspect
+        src = inspect.getsource(frontend.cmd_selftest)
+        tree = ast.parse(src.lstrip())
+        consts = {n.value for n in ast.walk(tree)
+                  if isinstance(n, ast.Constant) and isinstance(n.value, str)}
+        self.assertIn("unittest", consts,
+                      "the gate no longer runs the unit suite")
+        self.assertIn("discover", consts)
+
+    def test_the_gate_cannot_fork_itself_forever(self):
+        """The suite spawns `selftest` (TestSelftestGate), and selftest now
+        spawns the suite. The env flag is what stops that being a fork bomb;
+        it is inherited by the subprocess, so the inner run skips."""
+        import subprocess
+        root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        env = dict(os.environ, LMM_SELFTEST_SKIP_LIVE="1",
+                   LMM_SELFTEST_NO_SUITE="1")
+        r = subprocess.run([sys.executable, os.path.join(root, "lmm.py"),
+                            "selftest"], cwd=root, env=env,
+                           stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                           timeout=300)
+        out = r.stdout.decode("utf-8", "ignore")
+        self.assertEqual(r.returncode, 0, out)
+        self.assertIn("already inside one", out,
+                      "the recursion guard did not engage")
+
     def test_a_machine_without_a_backend_does_not_fail_the_gate(self):
         """`doctor` grades the machine; `selftest` grades lmm.
 
@@ -4668,6 +4836,15 @@ class TestSelftestGate(unittest.TestCase):
         out = r.stdout.decode("utf-8", "ignore")
         self.assertIn("doctor command runs", out)
         self.assertNotIn("[FAIL] doctor", out)
+
+
+def compact(keep=None):
+    """Force a compaction from a test, taking the writer lock exactly as the
+    hub does. This used to be a public `usage_compact` in the product, but
+    nothing in the product ever called it — the tests were its only reason
+    to exist, so it lives here now, where its one caller is."""
+    with lmm._USAGE_LOCK:
+        return lmm._usage_compact_locked(keep)
 
 
 class temp_state(object):

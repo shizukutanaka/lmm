@@ -52,8 +52,10 @@ the merge of the managed-routing line of work into the same tool.
     The two HTTP model-list readers merged the same way: `fetch_models`
     delegates its OpenAI-compatible branch to `probe_models`, which learned
     to send auth.
-  - `cache_prune` (a public wrapper with zero callers anywhere — every
-    internal site already goes through the locked variant).
+  - `cache_prune`, and later its exact twin `usage_compact` — public
+    locked wrappers with zero callers in the product, kept alive only by
+    the tests that called them. The second was found by the automated
+    orphan sweep, after three hand-runs had missed it.
   - `cascade_rungs`'s private branch and its `prompt` parameter: privacy is
     `pin_private`'s job, enforced before rungs are built, and on pinned
     input the branch was measured behaviourally identical to the normal
@@ -67,6 +69,32 @@ the merge of the managed-routing line of work into the same tool.
     now" list had already been built.
 
 ### Added
+- **A misplaced decorator had silently disabled two test classes** — found
+  by the new gate on its very first CI run, on an interpreter without the
+  `openai` SDK. Inserting two classes above `TestOpenAISdkCompat` moved its
+  `skipUnless(HAS_OPENAI)` onto the first of them: the tray tests were
+  skipped on every machine lacking the SDK (so they never ran in CI at
+  all), and the SDK tests lost their guard and errored outright. Locally,
+  where the SDK is installed, everything ran and the suite was green — the
+  bug was only visible from the outside. The decorator is reattached, and a
+  structural test asserts that only the SDK class may carry that skip.
+  Verified on 3.10, 3.11 and 3.13.
+- **The test suite now gates what ships.** It gated nothing: pre-commit,
+  pre-push and GitHub Actions all ran `lmm selftest` and stopped there, so
+  the 367 tests carrying every claim in this file ran only when a human
+  remembered to type the command. `selftest` is the one gate all three
+  share — and the one this repo can edit, since the workflow file needs a
+  permission the App does not have — so it now runs the suite whenever a
+  `tests/` directory sits beside it. All three gates went from 12 checks to
+  12 checks plus 367 tests, for about 8 s. A deliberately broken test was
+  used to confirm the gate actually turns red.
+- **The audit that kept finding severed features is now a test.** Twice this
+  release a feature stopped existing without anything failing: `setup_tray`
+  lost its caller in a merge and minimize-to-tray vanished;
+  `resolve_provider_by_model` lost its caller and the hub went back to
+  ignoring which model you asked for. Both were found by sweeping for
+  zero-caller symbols BY HAND. That sweep now runs with the suite — and
+  immediately found `usage_compact`, which three hand-runs had missed.
 - The managed-routing commands: `chat` (a REPL that keeps history), `config`
   (init/list/get/set/unset, so settings need no hand-edited JSON), `priority`
   (show `ask_order`, or `--optimize` it from measured results), `pull`, `log`,
@@ -100,6 +128,22 @@ the merge of the managed-routing line of work into the same tool.
   suite stays zero-dependency.
 
 ### Fixed
+- **Two thirds of the test suite was spent waiting to stop.** The suite ran
+  365 tests in 24.9 s, with an odd cluster of tests at ~0.5 s each. The
+  cause was one line: `serve_forever()` inherits a 0.5 s `poll_interval`,
+  and `shutdown()` blocks until the loop next looks — so every stub
+  backend's teardown cost ~0.48 s, and the suite creates one per test.
+  Measured in isolation: 0.451 s at the default, 0.001 s at 0.01 s (450x).
+  The fixtures now say what they want: **24.9 s -> 7.4 s (3.4x)** for the
+  same 365 tests, zero failures. A structural test forbids the default
+  returning — and its own first version was rejected for inspecting only
+  *calls*, when the dangerous form is handing `x.serve_forever` to a
+  thread as a bare reference; it passed the mutation it was written to
+  catch until it learned to see that.
+  The hub's own `serve_forever` is left at 0.5 s deliberately, now written
+  down rather than inherited: Ctrl-C measured 0.000 s there because SIGINT
+  raises through the poll instead of waiting for it, so lowering it would
+  buy nothing and only add wakeups.
 - **The variety request was half-honoured.** `cache.max_temp` promises
   that an explicitly high temperature means "the caller wants variety, not
   a cache". The store side kept that promise (a hot answer was never

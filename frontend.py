@@ -531,7 +531,14 @@ def cmd_serve_hub(cfg, host, port, quiet=False):
     quiet or print(f"[hub] backends: {', '.join(provs)}")
     quiet or print("[hub] Ctrl+C to stop.")
     try:
-        httpd.serve_forever()
+        # The interval is the stdlib default, written down rather than
+        # inherited: it bounds how long a shutdown() from another thread
+        # waits, NOT how fast Ctrl-C works. Measured here at 0.000 s,
+        # because SIGINT raises through the poll rather than waiting for
+        # it — so lowering this would buy nothing and only add wakeups.
+        # It matters enormously for a server something else stops, which
+        # is why the test fixtures set it to 0.01.
+        httpd.serve_forever(poll_interval=0.5)
     except KeyboardInterrupt:
         print("")
         print("[hub] stopped.")
@@ -2053,7 +2060,54 @@ def cmd_selftest(cfg, guard=False):
     except Exception as e:
         chk("secrets command runs", False, str(e))
 
-    # 8) stats command runs (reads the structured hub log without crashing)
+    # 8) the unit suite, when it is standing next to us
+    #
+    # Until this existed, the suite that carries every claim in the README
+    # was gated NOWHERE: pre-commit, pre-push and CI all ran `selftest` and
+    # nothing else, so 367 tests executed only when a human remembered to
+    # type the command. selftest is the one gate all three share and the one
+    # this repo can edit (the workflow file needs a permission the App does
+    # not have), so the proof belongs here.
+    #
+    # Users get three files and no tests/ directory; for them this check
+    # simply does not apply. LMM_SELFTEST_NO_SUITE stops the recursion when
+    # the suite itself spawns `selftest` — the flag is inherited by that
+    # subprocess, so the inner run skips this check instead of forking
+    # forever.
+    tests_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                             "tests")
+    if os.environ.get("LMM_SELFTEST_NO_SUITE"):
+        note("  [SKIP] unit suite -- already inside one")
+    elif not os.path.isdir(tests_dir):
+        note("  [SKIP] unit suite -- not a source checkout")
+    else:
+        try:
+            r = _sp.run([sys.executable, "-m", "unittest", "discover",
+                         "-s", "tests"],
+                        cwd=os.path.dirname(tests_dir),
+                        env=dict(os.environ, LMM_SELFTEST_NO_SUITE="1"),
+                        stdout=_sp.PIPE, stderr=_sp.STDOUT, timeout=900)
+            tail = r.stdout.decode("utf-8", "ignore").strip().splitlines()
+            ran = next((l for l in tail if l.startswith("Ran ")), "")
+            if r.returncode == 0:
+                detail = ran
+            else:
+                # A gate that says "something failed" without saying WHAT
+                # sends you to re-run the suite by hand to find out — which
+                # is exactly the manual step this check exists to remove.
+                # Name the failures; the first CI run of this gate went red
+                # on an interpreter with no openai SDK, and the bare "Ran
+                # 369 tests" told nobody why.
+                named = [l for l in tail
+                         if l.startswith("FAIL:") or l.startswith("ERROR:")]
+                detail = "%s | %s" % (ran, "; ".join(named[:3]) or tail[-1])
+                if len(named) > 3:
+                    detail += " (+%d more)" % (len(named) - 3)
+            chk("unit suite passes", r.returncode == 0, detail)
+        except Exception as e:
+            chk("unit suite passes", False, str(e))
+
+    # 9) stats command runs (reads the structured hub log without crashing)
     try:
         _buf = _io.StringIO()
         with _cl.redirect_stdout(_buf):

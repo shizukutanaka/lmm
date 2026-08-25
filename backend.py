@@ -1835,13 +1835,6 @@ def log_usage(event):
         pass
 
 
-def usage_compact(keep=None):
-    """Public entry: see _usage_compact_locked. Takes the writer lock so a
-    manual compaction cannot race the hub's own appends."""
-    with _USAGE_LOCK:
-        return _usage_compact_locked(keep)
-
-
 def _usage_compact_locked(keep=None):
     """Fold everything but the newest `keep` events into one rollup line.
     Caller must hold _USAGE_LOCK.
@@ -2078,7 +2071,8 @@ def hub_cost_stats(days=None, events=None):
           "partial_calls": 0, "ttfts": [], "measured": 0.0, "calls": 0}
     for ev in events or []:
         if ev.get("rollup"):
-            # An exact-total fold of older events (see usage_compact). Totals
+            # An exact-total fold of older events (see _usage_compact_locked).
+            # Totals
             # merge losslessly; the TTFT series deliberately does not — it
             # cannot be reconstructed from percentiles, so it stays tail-only.
             for name, a in (ev.get("providers") or {}).items():
