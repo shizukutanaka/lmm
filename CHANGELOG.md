@@ -69,6 +69,15 @@ the merge of the managed-routing line of work into the same tool.
     now" list had already been built.
 
 ### Added
+- **The test suite now gates what ships.** It gated nothing: pre-commit,
+  pre-push and GitHub Actions all ran `lmm selftest` and stopped there, so
+  the 367 tests carrying every claim in this file ran only when a human
+  remembered to type the command. `selftest` is the one gate all three
+  share — and the one this repo can edit, since the workflow file needs a
+  permission the App does not have — so it now runs the suite whenever a
+  `tests/` directory sits beside it. All three gates went from 12 checks to
+  12 checks plus 367 tests, for about 8 s. A deliberately broken test was
+  used to confirm the gate actually turns red.
 - **The audit that kept finding severed features is now a test.** Twice this
   release a feature stopped existing without anything failing: `setup_tray`
   lost its caller in a merge and minimize-to-tray vanished;

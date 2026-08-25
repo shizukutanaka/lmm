@@ -2060,7 +2060,41 @@ def cmd_selftest(cfg, guard=False):
     except Exception as e:
         chk("secrets command runs", False, str(e))
 
-    # 8) stats command runs (reads the structured hub log without crashing)
+    # 8) the unit suite, when it is standing next to us
+    #
+    # Until this existed, the suite that carries every claim in the README
+    # was gated NOWHERE: pre-commit, pre-push and CI all ran `selftest` and
+    # nothing else, so 367 tests executed only when a human remembered to
+    # type the command. selftest is the one gate all three share and the one
+    # this repo can edit (the workflow file needs a permission the App does
+    # not have), so the proof belongs here.
+    #
+    # Users get three files and no tests/ directory; for them this check
+    # simply does not apply. LMM_SELFTEST_NO_SUITE stops the recursion when
+    # the suite itself spawns `selftest` — the flag is inherited by that
+    # subprocess, so the inner run skips this check instead of forking
+    # forever.
+    tests_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                             "tests")
+    if os.environ.get("LMM_SELFTEST_NO_SUITE"):
+        note("  [SKIP] unit suite -- already inside one")
+    elif not os.path.isdir(tests_dir):
+        note("  [SKIP] unit suite -- not a source checkout")
+    else:
+        try:
+            r = _sp.run([sys.executable, "-m", "unittest", "discover",
+                         "-s", "tests"],
+                        cwd=os.path.dirname(tests_dir),
+                        env=dict(os.environ, LMM_SELFTEST_NO_SUITE="1"),
+                        stdout=_sp.PIPE, stderr=_sp.STDOUT, timeout=900)
+            tail = r.stdout.decode("utf-8", "ignore").strip().splitlines()
+            ran = next((l for l in tail if l.startswith("Ran ")), "")
+            chk("unit suite passes", r.returncode == 0,
+                ran or (tail[-1] if tail else ""))
+        except Exception as e:
+            chk("unit suite passes", False, str(e))
+
+    # 9) stats command runs (reads the structured hub log without crashing)
     try:
         _buf = _io.StringIO()
         with _cl.redirect_stdout(_buf):

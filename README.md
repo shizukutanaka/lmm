@@ -674,9 +674,13 @@ being true:
   `lmm cli` exited 2, both because those two lists disagreed.
 - **The layers stay apart** — the engine may not grow a `cmd_*` handler.
 
-Two workflows cover CI. **`.github/workflows/guard.yml`** already runs
+Two workflows cover CI. **`.github/workflows/guard.yml`** runs
 `lmm selftest --guard`: the tool proving itself on one interpreter, which is
-also what `guard.sh` and the pre-push hook run locally. The matrix that runs
+also what `guard.sh` and the pre-push hook run locally. Since `selftest`
+runs the unit suite whenever a `tests/` directory sits beside it, all three
+gates carry all of it — a checkout cannot be committed, pushed or merged
+with a failing test. (Users get three files and no `tests/`, so for them the
+check simply does not apply.) The matrix that runs
 the suite on Python 3.8 through 3.13 lives at **`ci/github-actions-ci.yml`**
 and is not yet in `.github/workflows/`, because pushes from this repo's GitHub
 App are rejected without `workflows` permission. Enabling it is a one-line copy

@@ -4737,7 +4737,15 @@ class TestSelftestGate(unittest.TestCase):
     def _run(self, *args):
         import subprocess
         root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-        env = dict(os.environ, LMM_SELFTEST_SKIP_LIVE="1")
+        # NO_SUITE, or each of these spawns a selftest that runs the whole
+        # suite again: three tests x 8 s turned a 7.7 s run into 33.7 s,
+        # undoing the acceleration round two commits earlier. These tests
+        # are about the gate's OWN behaviour — its banner, its exit code,
+        # its doctor check — not about the suite it carries. That the gate
+        # really runs the suite is proven where it matters: by guard.sh in
+        # pre-commit, pre-push and CI, on every single run.
+        env = dict(os.environ, LMM_SELFTEST_SKIP_LIVE="1",
+                   LMM_SELFTEST_NO_SUITE="1")
         return subprocess.run([sys.executable, os.path.join(root, "lmm.py"),
                                "selftest"] + list(args), cwd=root, env=env,
                               stdout=subprocess.PIPE, stderr=subprocess.PIPE,
@@ -4756,6 +4764,40 @@ class TestSelftestGate(unittest.TestCase):
         self.assertEqual(r.returncode, 0, out)
         self.assertIn("SELFTEST PASS", out)
         self.assertIn("[PASS]", out)
+
+    def test_the_gate_carries_the_unit_suite(self):
+        """Until this existed, the 367 tests were gated NOWHERE: pre-commit,
+        pre-push and CI all ran `selftest` and nothing else, so the suite
+        that carries every claim in the README executed only when a human
+        remembered to type the command. selftest is the one gate all three
+        share, and the one this repo is allowed to edit — the workflow file
+        needs a permission the App does not have."""
+        import ast
+        import inspect
+        src = inspect.getsource(frontend.cmd_selftest)
+        tree = ast.parse(src.lstrip())
+        consts = {n.value for n in ast.walk(tree)
+                  if isinstance(n, ast.Constant) and isinstance(n.value, str)}
+        self.assertIn("unittest", consts,
+                      "the gate no longer runs the unit suite")
+        self.assertIn("discover", consts)
+
+    def test_the_gate_cannot_fork_itself_forever(self):
+        """The suite spawns `selftest` (TestSelftestGate), and selftest now
+        spawns the suite. The env flag is what stops that being a fork bomb;
+        it is inherited by the subprocess, so the inner run skips."""
+        import subprocess
+        root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        env = dict(os.environ, LMM_SELFTEST_SKIP_LIVE="1",
+                   LMM_SELFTEST_NO_SUITE="1")
+        r = subprocess.run([sys.executable, os.path.join(root, "lmm.py"),
+                            "selftest"], cwd=root, env=env,
+                           stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                           timeout=300)
+        out = r.stdout.decode("utf-8", "ignore")
+        self.assertEqual(r.returncode, 0, out)
+        self.assertIn("already inside one", out,
+                      "the recursion guard did not engage")
 
     def test_a_machine_without_a_backend_does_not_fail_the_gate(self):
         """`doctor` grades the machine; `selftest` grades lmm.
