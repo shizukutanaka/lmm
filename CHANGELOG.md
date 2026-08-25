@@ -100,6 +100,22 @@ the merge of the managed-routing line of work into the same tool.
   suite stays zero-dependency.
 
 ### Fixed
+- **Two thirds of the test suite was spent waiting to stop.** The suite ran
+  365 tests in 24.9 s, with an odd cluster of tests at ~0.5 s each. The
+  cause was one line: `serve_forever()` inherits a 0.5 s `poll_interval`,
+  and `shutdown()` blocks until the loop next looks — so every stub
+  backend's teardown cost ~0.48 s, and the suite creates one per test.
+  Measured in isolation: 0.451 s at the default, 0.001 s at 0.01 s (450x).
+  The fixtures now say what they want: **24.9 s -> 7.4 s (3.4x)** for the
+  same 365 tests, zero failures. A structural test forbids the default
+  returning — and its own first version was rejected for inspecting only
+  *calls*, when the dangerous form is handing `x.serve_forever` to a
+  thread as a bare reference; it passed the mutation it was written to
+  catch until it learned to see that.
+  The hub's own `serve_forever` is left at 0.5 s deliberately, now written
+  down rather than inherited: Ctrl-C measured 0.000 s there because SIGINT
+  raises through the poll instead of waiting for it, so lowering it would
+  buy nothing and only add wakeups.
 - **The variety request was half-honoured.** `cache.max_temp` promises
   that an explicitly high temperature means "the caller wants variety, not
   a cache". The store side kept that promise (a hot answer was never

@@ -2812,7 +2812,14 @@ class StubBackend(object):
 
         self.httpd = S(("127.0.0.1", 0), H)
         self.port = self.httpd.server_address[1]
-        self.thread = threading.Thread(target=self.httpd.serve_forever, daemon=True)
+        # poll_interval is not a tuning knob here, it is the teardown cost:
+        # shutdown() blocks until serve_forever notices, which happens on a
+        # poll boundary. The stdlib default of 0.5 s made every stop() cost
+        # ~0.48 s, and the suite creates one of these per test — measured at
+        # 16 s of a 25 s run, spent entirely on waiting to stop.
+        self.thread = threading.Thread(
+            target=lambda: self.httpd.serve_forever(poll_interval=0.01),
+            daemon=True)
         self.thread.start()
 
     @property
@@ -3691,6 +3698,47 @@ class TestPackaging(unittest.TestCase):
         self.assertNotIn("git show", text,
                          "the hook is testing lone blobs again")
 
+    def test_no_server_uses_the_default_poll_interval(self):
+        """serve_forever's poll_interval decides how long shutdown blocks,
+        not how fast the server answers. The stdlib default is 0.5 s, so
+        every omission is half a second of latency on stopping — measured
+        at 16 s of a 25 s test run, and a visibly sticky Ctrl-C on the hub.
+        Pin the class, not the instance: every call must say what it wants.
+        """
+        import ast
+        offenders = []
+        for name in self.modules + ["tests/test_lmm.py"]:
+            path = os.path.join(self.root, name)
+            with open(path, encoding="utf-8") as f:
+                tree = ast.parse(f.read())
+            called_here = set()
+            for node in ast.walk(tree):
+                if not isinstance(node, ast.Call):
+                    continue
+                fn = node.func
+                if isinstance(fn, ast.Attribute):
+                    called_here.add(id(fn))
+                    if fn.attr != "serve_forever":
+                        continue
+                elif getattr(fn, "id", None) != "serve_forever":
+                    continue
+                kws = {k.arg for k in node.keywords}
+                if "poll_interval" not in kws and not node.args:
+                    offenders.append("%s:%d (default)" % (name, node.lineno))
+            # A bare REFERENCE is the dangerous form: handing
+            # `x.serve_forever` to Thread(target=...) means someone else
+            # calls it, with every default intact. The first version of this
+            # test only inspected calls and therefore passed the mutation it
+            # was written to catch — a test that cannot fail is not a test.
+            for node in ast.walk(tree):
+                if (isinstance(node, ast.Attribute)
+                        and node.attr == "serve_forever"
+                        and id(node) not in called_here):
+                    offenders.append("%s:%d (bare reference)"
+                                     % (name, node.lineno))
+        self.assertEqual(offenders, [],
+                         "serve_forever called with the default poll_interval")
+
     def test_a_lone_entry_point_explains_itself(self):
         """Copying lmm.py by itself must not end in an import traceback."""
         import subprocess
@@ -3958,8 +4006,9 @@ class TestClaimsSurviveElenchus(unittest.TestCase):
 
             self.httpd = S(("127.0.0.1", 0), H)
             self.port = self.httpd.server_address[1]
-            threading.Thread(target=self.httpd.serve_forever,
-                             daemon=True).start()
+            threading.Thread(
+                target=lambda: self.httpd.serve_forever(poll_interval=0.01),
+                daemon=True).start()
 
         @property
         def base_url(self):

@@ -531,7 +531,14 @@ def cmd_serve_hub(cfg, host, port, quiet=False):
     quiet or print(f"[hub] backends: {', '.join(provs)}")
     quiet or print("[hub] Ctrl+C to stop.")
     try:
-        httpd.serve_forever()
+        # The interval is the stdlib default, written down rather than
+        # inherited: it bounds how long a shutdown() from another thread
+        # waits, NOT how fast Ctrl-C works. Measured here at 0.000 s,
+        # because SIGINT raises through the poll rather than waiting for
+        # it — so lowering this would buy nothing and only add wakeups.
+        # It matters enormously for a server something else stops, which
+        # is why the test fixtures set it to 0.01.
+        httpd.serve_forever(poll_interval=0.5)
     except KeyboardInterrupt:
         print("")
         print("[hub] stopped.")
