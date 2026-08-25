@@ -4640,6 +4640,114 @@ class TestBreakerSurvivesElenchus(unittest.TestCase):
                 os.path.exists(os.path.join(lmm.LMM_DIR, "breaker.json")))
 
 
+class TestHubDoesNotLeak(unittest.TestCase):
+    """The hub is a long-lived proxy, and nothing had ever measured what it
+    accumulates. Under sustained load its RSS, file descriptors and thread
+    count are flat, but the Python object graph grows ~2 objects per request
+    and survives gc.collect() — which looks exactly like a slow leak.
+
+    It is not lmm's. The identical growth appears with lmm removed from the
+    loop entirely (a bare http.client talking to the same in-process stub),
+    so the residual belongs to the test harness's own HTTP server. Measuring
+    lmm against an absolute number would therefore pin stdlib behaviour and
+    break on an interpreter upgrade; this compares lmm's path to that
+    baseline instead, which is sharp against a real leak in the hub and
+    indifferent to what the stdlib does around it.
+    """
+
+    def _objects(self):
+        import gc
+        gc.collect()
+        return len(gc.get_objects())
+
+    def test_the_hub_path_adds_nothing_over_a_bare_client(self):
+        import http.client
+        stub = StubBackend()
+        try:
+            with temp_state():
+                cfg = {"providers": {"stub": {
+                    "api_key": "k", "base_url": stub.base_url,
+                    "model": "m", "kind": "local"}}, "ask_order": ["stub"]}
+                targets = lmm.resolve_ask_targets(cfg, "x", None)
+
+                def through_lmm(i):
+                    lmm.hub_complete(cfg, "q%d" % i, targets,
+                                     {"cache": False, "source": "hub"})
+
+                def bare(i):
+                    c = http.client.HTTPConnection(
+                        "127.0.0.1", stub.port, timeout=30)
+                    c.request("POST", "/v1/chat/completions",
+                              json.dumps({"model": "m", "messages": [
+                                  {"role": "user", "content": "q%d" % i}]}),
+                              {"Content-Type": "application/json"})
+                    c.getresponse().read()
+                    c.close()
+
+                # N is set from measurement, not taste: at N=60 the noise
+                # swamped a real injected leak of one list per request, and
+                # the first version of this test passed the very mutation it
+                # was written to catch. At N=300 lmm's excess over the
+                # baseline measures +0.000/request, so a margin of 0.5
+                # convicts a 1-object leak while leaving room for jitter.
+                N = 300
+                for i in range(40):          # warm both paths first
+                    through_lmm(i)
+                    bare(i)
+
+                a = self._objects()
+                for i in range(N):
+                    through_lmm(1000 + i)
+                lmm_growth = (self._objects() - a) / float(N)
+
+                b = self._objects()
+                for i in range(N):
+                    bare(2000 + i)
+                base_growth = (self._objects() - b) / float(N)
+
+                # Generous margin: this must catch a real per-request leak
+                # (a retained payload, an unbounded list), not normal jitter.
+                self.assertLess(
+                    lmm_growth, base_growth + 0.5,
+                    "the hub retains %.2f objects per request against a "
+                    "baseline of %.2f — something on the request path is "
+                    "holding on" % (lmm_growth, base_growth))
+        finally:
+            stub.stop()
+
+    def test_sustained_load_does_not_leak_threads_or_descriptors(self):
+        """RSS is noisy, but threads and file descriptors are not: a hub that
+        loses one of either per request dies in production."""
+        stub = StubBackend()
+        try:
+            with temp_state():
+                cfg = {"providers": {"stub": {
+                    "api_key": "k", "base_url": stub.base_url,
+                    "model": "m", "kind": "local"}}, "ask_order": ["stub"]}
+                targets = lmm.resolve_ask_targets(cfg, "x", None)
+                import threading
+
+                def fds():
+                    try:
+                        return len(os.listdir("/proc/self/fd"))
+                    except OSError:
+                        self.skipTest("no /proc on this platform")
+
+                for i in range(20):
+                    lmm.hub_complete(cfg, "warm%d" % i, targets,
+                                     {"cache": False, "source": "hub"})
+                fd0, th0 = fds(), threading.active_count()
+                for i in range(120):
+                    lmm.hub_complete(cfg, "q%d" % i, targets,
+                                     {"cache": False, "source": "hub"})
+                self.assertLessEqual(fds(), fd0 + 2,
+                                     "descriptors grew under sustained load")
+                self.assertLessEqual(threading.active_count(), th0 + 2,
+                                     "threads grew under sustained load")
+        finally:
+            stub.stop()
+
+
 class TestClosedLoop(unittest.TestCase):
     """The product's core claim: routing outcomes are measured, and the
     measurements are readable. The merge silently broke this — the readers
