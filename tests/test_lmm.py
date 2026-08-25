@@ -2879,9 +2879,6 @@ except ImportError:
     HAS_OPENAI = False
 
 
-@unittest.skipUnless(HAS_OPENAI, "openai SDK not installed — the suite stays "
-                     "zero-dependency; this class runs only where the real "
-                     "client library happens to be available")
 class TestTrayWiring(unittest.TestCase):
     """setup_tray existed with zero callers after the merge — the minimize-
     to-tray feature was silently severed. Headless CI cannot click a tray
@@ -3054,6 +3051,9 @@ class TestPerModelRouting(unittest.TestCase):
                 lmm.local_ollama_provider = saved
 
 
+@unittest.skipUnless(HAS_OPENAI, "openai SDK not installed — the suite stays "
+                     "zero-dependency; this class runs only where the real "
+                     "client library happens to be available")
 class TestOpenAISdkCompat(unittest.TestCase):
     """The README's core claim is "point your apps at the hub". Apps do not
     speak hand-rolled curl — they speak the OpenAI client library, which has
@@ -3748,6 +3748,32 @@ class TestPackaging(unittest.TestCase):
         self.assertEqual(orphans, [],
                          "defined but never called — dead weight, or a "
                          "feature whose call site was severed")
+
+    def test_conditional_skips_decorate_the_class_they_name(self):
+        """A decorator sits above a class, so inserting a new class between
+        them silently moves it. That happened here: two classes were added
+        above `TestOpenAISdkCompat` and inherited its
+        `skipUnless(HAS_OPENAI)`. The consequences were invisible locally,
+        where the SDK is installed and everything ran — but on any machine
+        without it (CI, every contributor) the tray tests were skipped and
+        never ran at all, while the SDK tests lost their guard and errored
+        with NameError. Only the SDK class may carry that skip.
+        """
+        import ast
+        path = os.path.join(self.root, "tests", "test_lmm.py")
+        with open(path, encoding="utf-8") as f:
+            tree = ast.parse(f.read())
+        for node in tree.body:
+            if not isinstance(node, ast.ClassDef):
+                continue
+            for dec in node.decorator_list:
+                names = {n.id for n in ast.walk(dec)
+                         if isinstance(n, ast.Name)}
+                if "HAS_OPENAI" not in names:
+                    continue
+                self.assertIn("Sdk", node.name,
+                              "the openai skip drifted onto %s, which has "
+                              "nothing to do with the SDK" % node.name)
 
     def test_no_server_uses_the_default_poll_interval(self):
         """serve_forever's poll_interval decides how long shutdown blocks,

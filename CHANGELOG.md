@@ -69,6 +69,16 @@ the merge of the managed-routing line of work into the same tool.
     now" list had already been built.
 
 ### Added
+- **A misplaced decorator had silently disabled two test classes** — found
+  by the new gate on its very first CI run, on an interpreter without the
+  `openai` SDK. Inserting two classes above `TestOpenAISdkCompat` moved its
+  `skipUnless(HAS_OPENAI)` onto the first of them: the tray tests were
+  skipped on every machine lacking the SDK (so they never ran in CI at
+  all), and the SDK tests lost their guard and errored outright. Locally,
+  where the SDK is installed, everything ran and the suite was green — the
+  bug was only visible from the outside. The decorator is reattached, and a
+  structural test asserts that only the SDK class may carry that skip.
+  Verified on 3.10, 3.11 and 3.13.
 - **The test suite now gates what ships.** It gated nothing: pre-commit,
   pre-push and GitHub Actions all ran `lmm selftest` and stopped there, so
   the 367 tests carrying every claim in this file ran only when a human

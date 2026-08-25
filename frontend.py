@@ -2089,8 +2089,21 @@ def cmd_selftest(cfg, guard=False):
                         stdout=_sp.PIPE, stderr=_sp.STDOUT, timeout=900)
             tail = r.stdout.decode("utf-8", "ignore").strip().splitlines()
             ran = next((l for l in tail if l.startswith("Ran ")), "")
-            chk("unit suite passes", r.returncode == 0,
-                ran or (tail[-1] if tail else ""))
+            if r.returncode == 0:
+                detail = ran
+            else:
+                # A gate that says "something failed" without saying WHAT
+                # sends you to re-run the suite by hand to find out — which
+                # is exactly the manual step this check exists to remove.
+                # Name the failures; the first CI run of this gate went red
+                # on an interpreter with no openai SDK, and the bare "Ran
+                # 369 tests" told nobody why.
+                named = [l for l in tail
+                         if l.startswith("FAIL:") or l.startswith("ERROR:")]
+                detail = "%s | %s" % (ran, "; ".join(named[:3]) or tail[-1])
+                if len(named) > 3:
+                    detail += " (+%d more)" % (len(named) - 3)
+            chk("unit suite passes", r.returncode == 0, detail)
         except Exception as e:
             chk("unit suite passes", False, str(e))
 
