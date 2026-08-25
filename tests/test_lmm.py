@@ -2521,14 +2521,14 @@ class TestUsageCompaction(unittest.TestCase):
         with temp_state():
             self.seed()
             before = self.totals(lmm.hub_cost_stats())
-            self.assertTrue(lmm.usage_compact(keep=10))
+            self.assertTrue(compact(keep=10))
             after = self.totals(lmm.hub_cost_stats())
         self.assertEqual(before, after)
 
     def test_the_tail_stays_raw_and_the_file_shrinks_to_keep_plus_one(self):
         with temp_state():
             self.seed()
-            lmm.usage_compact(keep=10)
+            compact(keep=10)
             with open(lmm.USAGE_LOG, encoding="utf-8") as fh:
                 lines = [json.loads(l) for l in fh if l.strip()]
         self.assertEqual(len(lines), 11)              # rollup + 10 raw
@@ -2539,8 +2539,8 @@ class TestUsageCompaction(unittest.TestCase):
         with temp_state():
             self.seed()
             before = self.totals(lmm.hub_cost_stats())
-            lmm.usage_compact(keep=20)
-            lmm.usage_compact(keep=5)
+            compact(keep=20)
+            compact(keep=5)
             after = self.totals(lmm.hub_cost_stats())
             with open(lmm.USAGE_LOG, encoding="utf-8") as fh:
                 rollups = [l for l in fh if json.loads(l).get("rollup")]
@@ -2556,7 +2556,7 @@ class TestUsageCompaction(unittest.TestCase):
         # carry them; the STREAM TTFT line reads from the raw tail.
         with temp_state():
             self.seed()
-            lmm.usage_compact(keep=10)
+            compact(keep=10)
             st = lmm.hub_cost_stats()
         self.assertLessEqual(len(st["ttfts"]), 10)
 
@@ -2568,7 +2568,7 @@ class TestUsageCompaction(unittest.TestCase):
             before = io.StringIO()
             with contextlib.redirect_stdout(before):
                 frontend.cmd_cache({})
-            lmm.usage_compact(keep=5)
+            compact(keep=5)
             after = io.StringIO()
             with contextlib.redirect_stdout(after):
                 frontend.cmd_cache({})
@@ -2593,12 +2593,12 @@ class TestUsageCompaction(unittest.TestCase):
         with temp_state():
             lmm.log_usage({"provider": "p", "kind": "remote", "in": 1, "out": 1,
                            "usd": 0.1, "cache": "miss"})
-            self.assertFalse(lmm.usage_compact(keep=10))
+            self.assertFalse(compact(keep=10))
 
     def test_report_names_the_rollup(self):
         with temp_state():
             self.seed()
-            lmm.usage_compact(keep=5)
+            compact(keep=5)
             block = "\n".join(lmm.hub_cost_block({}, lmm.merged_pricing({})))
         self.assertIn("includes a rollup of older events", block)
 
@@ -3698,6 +3698,57 @@ class TestPackaging(unittest.TestCase):
         self.assertNotIn("git show", text,
                          "the hook is testing lone blobs again")
 
+    def test_nothing_is_defined_with_no_callers(self):
+        """A function nobody calls is either dead weight or — twice in this
+        repo's history — a SEVERED FEATURE: the code survived, its call site
+        did not, and the feature silently stopped existing.
+
+        `setup_tray` lost its caller in a merge and minimize-to-tray simply
+        vanished. `resolve_provider_by_model` lost its caller and the hub
+        went back to ignoring which model you asked for. `cache_prune` and
+        `gui_ask` were plain dead weight. All four were found by running
+        this sweep BY HAND, three separate times. Automating the audit is
+        the last step of the method it came from: a check performed
+        repeatedly by a person is a check that will eventually be skipped.
+
+        Anything genuinely entry-point-like (main, __init__, dunders) is
+        exempt; everything else must be reachable from the product itself.
+        """
+        import ast
+        srcs = {}
+        for name in self.modules:
+            with open(os.path.join(self.root, name), encoding="utf-8") as f:
+                srcs[name] = f.read()
+        trees = {n: ast.parse(src) for n, src in srcs.items()}
+
+        # Real references only. A regex over source text counts the symbol's
+        # own docstring and the comment explaining it, which is how the first
+        # two versions of this test passed the setup_tray mutation they
+        # existed to catch: unwiring the call left the comment behind, and
+        # the comment looked like life support.
+        referenced = set()
+        for n, tree in trees.items():
+            for node in ast.walk(tree):
+                if isinstance(node, ast.Name):
+                    referenced.add(node.id)
+                elif isinstance(node, ast.Attribute):
+                    referenced.add(node.attr)
+
+        EXEMPT = {"main"}
+        orphans = []
+        for name, tree in trees.items():
+            for node in tree.body:
+                if not isinstance(node, (ast.FunctionDef, ast.ClassDef)):
+                    continue
+                sym = node.name
+                if sym in EXEMPT or sym.startswith("__"):
+                    continue
+                if sym not in referenced:
+                    orphans.append("%s:%s" % (name, sym))
+        self.assertEqual(orphans, [],
+                         "defined but never called — dead weight, or a "
+                         "feature whose call site was severed")
+
     def test_no_server_uses_the_default_poll_interval(self):
         """serve_forever's poll_interval decides how long shutdown blocks,
         not how fast the server answers. The stdlib default is 0.5 s, so
@@ -4717,6 +4768,15 @@ class TestSelftestGate(unittest.TestCase):
         out = r.stdout.decode("utf-8", "ignore")
         self.assertIn("doctor command runs", out)
         self.assertNotIn("[FAIL] doctor", out)
+
+
+def compact(keep=None):
+    """Force a compaction from a test, taking the writer lock exactly as the
+    hub does. This used to be a public `usage_compact` in the product, but
+    nothing in the product ever called it — the tests were its only reason
+    to exist, so it lives here now, where its one caller is."""
+    with lmm._USAGE_LOCK:
+        return lmm._usage_compact_locked(keep)
 
 
 class temp_state(object):

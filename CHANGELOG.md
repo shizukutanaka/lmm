@@ -52,8 +52,10 @@ the merge of the managed-routing line of work into the same tool.
     The two HTTP model-list readers merged the same way: `fetch_models`
     delegates its OpenAI-compatible branch to `probe_models`, which learned
     to send auth.
-  - `cache_prune` (a public wrapper with zero callers anywhere — every
-    internal site already goes through the locked variant).
+  - `cache_prune`, and later its exact twin `usage_compact` — public
+    locked wrappers with zero callers in the product, kept alive only by
+    the tests that called them. The second was found by the automated
+    orphan sweep, after three hand-runs had missed it.
   - `cascade_rungs`'s private branch and its `prompt` parameter: privacy is
     `pin_private`'s job, enforced before rungs are built, and on pinned
     input the branch was measured behaviourally identical to the normal
@@ -67,6 +69,13 @@ the merge of the managed-routing line of work into the same tool.
     now" list had already been built.
 
 ### Added
+- **The audit that kept finding severed features is now a test.** Twice this
+  release a feature stopped existing without anything failing: `setup_tray`
+  lost its caller in a merge and minimize-to-tray vanished;
+  `resolve_provider_by_model` lost its caller and the hub went back to
+  ignoring which model you asked for. Both were found by sweeping for
+  zero-caller symbols BY HAND. That sweep now runs with the suite — and
+  immediately found `usage_compact`, which three hand-runs had missed.
 - The managed-routing commands: `chat` (a REPL that keeps history), `config`
   (init/list/get/set/unset, so settings need no hand-edited JSON), `priority`
   (show `ask_order`, or `--optimize` it from measured results), `pull`, `log`,
