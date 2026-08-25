@@ -69,6 +69,16 @@ the merge of the managed-routing line of work into the same tool.
     now" list had already been built.
 
 ### Added
+- **The hub was never measured for leaks** — it is a long-lived proxy, and
+  nothing had ever checked what it accumulates. Under sustained load its
+  RSS, descriptors and thread count are flat, but the object graph grows
+  ~2 per request and survives `gc.collect()`, which looks exactly like a
+  slow leak. It is not lmm's: the identical growth appears with lmm removed
+  from the loop entirely (a bare `http.client` against the same in-process
+  stub), so the residual is the test harness's own HTTP server. Measured at
+  N=300, lmm's excess over that baseline is **+0.000 objects per request**.
+  Pinned as a differential test rather than an absolute one, so it stays
+  sharp against a real leak and indifferent to stdlib behaviour.
 - **A misplaced decorator had silently disabled two test classes** — found
   by the new gate on its very first CI run, on an interpreter without the
   `openai` SDK. Inserting two classes above `TestOpenAISdkCompat` moved its
