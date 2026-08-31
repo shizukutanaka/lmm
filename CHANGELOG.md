@@ -17,6 +17,22 @@ Reading models from disk, a cache that can prove it's safe to reuse an answer,
 the round of fixes that took the hub from "works" to "holds up under load", and
 the merge of the managed-routing line of work into the same tool.
 
+### Fixed
+- **Corrupt state files no longer kill the bill.** `~/.lmm/usage.jsonl` and
+  `cache.jsonl` are plain text a user (or a torn write) can mangle. Line-level
+  JSON errors were already skipped, but a *field* with the wrong type was not:
+  measured before the fix, `{"usd": "abc"}` killed `lmm cost` and `lmm status`
+  with a `ValueError` traceback, a non-numeric `ttl_hours` killed `lmm cache`,
+  and one bad `at` timestamp in `cache.jsonl` silently discarded every entry
+  after it. All untrusted field reads now go through one coercion authority
+  (`_num`/`_int`): a bad field costs itself, not the command and not the rest
+  of the file. Each regression test was mutation-verified — reverting any one
+  guard turns its test red.
+- The bill's arithmetic is now a known-answer regression: at a published
+  $3/M-in, $15/M-out rate, 1M+1M tokens must report **exactly $18.0000** end
+  to end (`price_for → usage_cost → log_usage → hub_cost_stats →
+  cost_report`). It did; now it must keep doing so.
+
 ### Changed
 - **`lmm` is now three files**: `lmm.py` (entry point) over `backend.py` (the
   engine — no CLI, no GUI, so it is testable without a terminal or a display)

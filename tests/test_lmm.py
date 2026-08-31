@@ -4991,5 +4991,80 @@ class temp_state(object):
         return False
 
 
+class TestBillArithmeticSurvivesElenchus(unittest.TestCase):
+    """The product's first promise is "a bill you can actually see". The
+    fragments (usage_cost, price_for) were each tested, but no test walked the
+    whole chain — published rate -> metered event -> aggregate -> report — and
+    asserted an exact dollar figure. This is that known-answer walk: at
+    $3/M in and $15/M out, 1M+1M tokens is $18.000000, end to end."""
+
+    RATE = {"in": 3.0, "out": 15.0, "cw": 0.0, "cr": 0.0}
+    PROV = {"kind": "remote", "price": RATE}
+
+    def test_published_rate_to_report_is_exactly_18_dollars(self):
+        rate = lmm.price_for(self.PROV, "m", lmm.merged_pricing({}))
+        usd = lmm.usage_cost({"prompt_tokens": 1_000_000,
+                              "completion_tokens": 1_000_000}, rate)
+        self.assertAlmostEqual(usd, 18.0, places=6)
+        with temp_state():
+            lmm.log_usage({"provider": "p", "kind": "remote",
+                           "in": 1_000_000, "out": 1_000_000,
+                           "usd": round(usd, 6)})
+            st = lmm.hub_cost_stats()
+            report = lmm.cost_report({}, days=None)
+        self.assertAlmostEqual(st["measured"], 18.0, places=6)
+        self.assertIn("$18.0000", report)
+        self.assertIn("in=1,000,000 out=1,000,000", report)
+
+
+class TestCorruptStateSurvivesElenchus(unittest.TestCase):
+    """~/.lmm/*.jsonl are plain text the README invites the user to look at —
+    and therefore to touch. Claim on trial: "the readers survive corrupt state
+    files". Verdict before the fix, measured: `lmm cost` and `lmm status` died
+    on one type-mangled field (ValueError at float()), and one bad `at` value
+    in cache.jsonl silently discarded every entry AFTER it. A bad field must
+    cost itself, not the command and not the rest of the file."""
+
+    HOSTILE_USAGE = [
+        {"provider": "good1", "kind": "remote", "in": 100, "out": 100, "usd": 0.5},
+        {"provider": "bad", "usd": "abc", "in": "5", "out": []},
+        {"rollup": 1, "providers": []},
+        {"rollup": 1, "providers": {"x": {"calls": "many", "usd": "??"}, "y": 3}},
+        {"provider": "bad2", "stream": True, "ttft_ms": "x", "usd": 0.1},
+        {"provider": "good2", "kind": "remote", "in": 200, "out": 200, "usd": 1.5},
+    ]
+
+    def test_cost_survives_and_keeps_lines_after_the_bad_one(self):
+        with temp_state():
+            for ev in self.HOSTILE_USAGE:
+                lmm.log_usage(dict(ev))
+            st = lmm.hub_cost_stats()          # must not raise
+            report = lmm.cost_report({}, days=None)
+        # good2 sits AFTER every hostile line; if it is missing, the reader
+        # aborted the file instead of the field.
+        self.assertIn("good2", report)
+        self.assertAlmostEqual(st["measured"], 0.5 + 0.1 + 1.5, places=6)
+        self.assertEqual(st["ttfts"], [])      # "x" is not a latency
+
+    def test_cache_reader_keeps_entries_after_a_bad_timestamp(self):
+        far = time.time() + 3600
+        with temp_state():
+            for e in ({"prompt": "good-before", "reply": "a", "at": far},
+                      {"prompt": "bad", "reply": "b", "at": "soon"},
+                      {"prompt": "good-after", "reply": "c", "at": far}):
+                with open(lmm.CACHE_LOG, "a", encoding="utf-8") as fh:
+                    fh.write(json.dumps(e) + "\n")
+            names = [e.get("prompt") for e in lmm.cache_entries({})]
+        self.assertIn("good-after", names)     # the fix: field-local failure
+
+    def test_cache_survives_a_non_numeric_ttl_in_config(self):
+        far = time.time() + 3600
+        with temp_state():
+            with open(lmm.CACHE_LOG, "a", encoding="utf-8") as fh:
+                fh.write(json.dumps({"prompt": "p", "reply": "r", "at": far}) + "\n")
+            entries = lmm.cache_entries({"ttl_hours": "week"})   # must not raise
+        self.assertEqual([e.get("prompt") for e in entries], ["p"])
+
+
 if __name__ == "__main__":
     unittest.main()

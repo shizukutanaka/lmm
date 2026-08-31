@@ -633,6 +633,13 @@ Two append-only JSONL files under `~/.lmm/`, both plain text you can `cat`:
   and near-miss similarities always come from the recent raw tail, where
   recency is the point.
 - `cache.jsonl` — cached answers (and embeddings, if the semantic tier is on).
+
+Both files are yours to edit, and the readers assume you will: a line that is
+not JSON is skipped, and a field with the wrong type (`"usd": "abc"`) costs
+only itself — the command still runs and every other line still counts.
+Before this was measured, one mangled field killed `lmm cost` and `lmm status`
+with a traceback, and one bad timestamp silently discarded every cache entry
+after it.
   Drop it any time with `lmm cache --clear`.
 
 Still no secrets: API keys live in your config, are used, and are never copied
