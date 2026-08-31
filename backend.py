@@ -1814,6 +1814,26 @@ def usage_cost(usage, rate):
             + cached / 1e6 * rate.get("cr", 0.0))
 
 
+def _num(v, default=0.0):
+    """Untrusted JSON field -> float. The state files under ~/.lmm are plain
+    text a user (or a torn write) can corrupt; a reader that raises on one bad
+    field turns the bill into a traceback, and a reader that lets the outer
+    except swallow it silently discards every line after the bad one. One
+    coercion authority, so every reader fails the same way: field-local."""
+    try:
+        return float(v)
+    except (TypeError, ValueError):
+        return default
+
+
+def _int(v, default=0):
+    """Untrusted JSON field -> int (see _num)."""
+    try:
+        return int(v)
+    except (TypeError, ValueError):
+        return default
+
+
 def log_usage(event):
     """Append one metering event to ~/.lmm/usage.jsonl. Never raises: telemetry
     must not be able to break the call it is measuring."""
@@ -1986,10 +2006,10 @@ def measured_tokens(days=None):
                             if isinstance(o, dict):
                                 if isinstance(o.get("usage"), dict):
                                     u = o["usage"]
-                                    yield (u.get("input_tokens", 0),
-                                           u.get("output_tokens", 0),
-                                           u.get("cache_creation_input_tokens", 0),
-                                           u.get("cache_read_input_tokens", 0))
+                                    yield (_int(u.get("input_tokens", 0)),
+                                           _int(u.get("output_tokens", 0)),
+                                           _int(u.get("cache_creation_input_tokens", 0)),
+                                           _int(u.get("cache_read_input_tokens", 0)))
                                     return          # this record is accounted for
                                 for v in o.values():
                                     yield from walk(v)
@@ -2075,25 +2095,28 @@ def hub_cost_stats(days=None, events=None):
             # Totals
             # merge losslessly; the TTFT series deliberately does not — it
             # cannot be reconstructed from percentiles, so it stays tail-only.
-            for name, a in (ev.get("providers") or {}).items():
+            provs = ev.get("providers")
+            for name, a in (provs.items() if isinstance(provs, dict) else ()):
+                if not isinstance(a, dict):
+                    continue
                 t = st["providers"].setdefault(
                     name, {"calls": 0, "in": 0, "out": 0, "usd": 0.0,
                            "kind": a.get("kind", "remote")})
-                t["calls"] += a.get("calls", 0)
-                t["in"] += a.get("in", 0)
-                t["out"] += a.get("out", 0)
-                t["usd"] += a.get("usd", 0.0)
-                st["measured"] += a.get("usd", 0.0)
-                st["calls"] += a.get("calls", 0)
-            rh = ev.get("hits") or {}
-            st["hits"]["exact"] += rh.get("exact", 0)
-            st["hits"]["semantic"] += rh.get("semantic", 0)
-            st["saved_cache"] += ev.get("saved_usd", 0.0) or 0.0
-            st["est_usd"] += ev.get("est_usd", 0.0) or 0.0
-            st["partial_usd"] += ev.get("partial_usd", 0.0) or 0.0
-            st["partial_calls"] += ev.get("partial_calls", 0) or 0
-            st["local_calls"] += ev.get("local_calls", 0) or 0
-            st["local_tokens"] += ev.get("local_tokens", 0) or 0
+                t["calls"] += _int(a.get("calls", 0))
+                t["in"] += _int(a.get("in", 0))
+                t["out"] += _int(a.get("out", 0))
+                t["usd"] += _num(a.get("usd", 0.0))
+                st["measured"] += _num(a.get("usd", 0.0))
+                st["calls"] += _int(a.get("calls", 0))
+            rh = ev.get("hits") if isinstance(ev.get("hits"), dict) else {}
+            st["hits"]["exact"] += _int(rh.get("exact", 0))
+            st["hits"]["semantic"] += _int(rh.get("semantic", 0))
+            st["saved_cache"] += _num(ev.get("saved_usd", 0.0))
+            st["est_usd"] += _num(ev.get("est_usd", 0.0))
+            st["partial_usd"] += _num(ev.get("partial_usd", 0.0))
+            st["partial_calls"] += _int(ev.get("partial_calls", 0))
+            st["local_calls"] += _int(ev.get("local_calls", 0))
+            st["local_tokens"] += _int(ev.get("local_tokens", 0))
             st["rollups"] = st.get("rollups", 0) + 1
             continue
         if ev.get("event"):
@@ -2101,7 +2124,7 @@ def hub_cost_stats(days=None, events=None):
         hit = ev.get("cache")
         if hit in st["hits"]:
             st["hits"][hit] += 1
-            st["saved_cache"] += float(ev.get("saved_usd", 0.0) or 0.0)
+            st["saved_cache"] += _num(ev.get("saved_usd", 0.0))
             continue
         if hit == "near-miss":
             continue                         # a probe, not a call — see `lmm cache`
@@ -2109,10 +2132,10 @@ def hub_cost_stats(days=None, events=None):
         a = st["providers"].setdefault(name, {"calls": 0, "in": 0, "out": 0,
                                               "usd": 0.0,
                                               "kind": ev.get("kind", "remote")})
-        usd = float(ev.get("usd", 0.0) or 0.0)
+        usd = _num(ev.get("usd", 0.0))
         a["calls"] += 1
-        a["in"] += ev.get("in", 0) or 0
-        a["out"] += ev.get("out", 0) or 0
+        a["in"] += _int(ev.get("in", 0))
+        a["out"] += _int(ev.get("out", 0))
         a["usd"] += usd
         st["measured"] += usd
         st["calls"] += 1
@@ -2123,11 +2146,11 @@ def hub_cost_stats(days=None, events=None):
             st["partial_calls"] += 1
         # TTFT only means something where tokens arrived incrementally; a
         # buffered cascade has a first-byte time but not a first-TOKEN one.
-        if ev.get("stream") and not ev.get("buffered") and ev.get("ttft_ms"):
-            st["ttfts"].append(float(ev["ttft_ms"]))
+        if ev.get("stream") and not ev.get("buffered") and _num(ev.get("ttft_ms")) > 0:
+            st["ttfts"].append(_num(ev["ttft_ms"]))
         if ev.get("kind") == "local":
             st["local_calls"] += 1
-            st["local_tokens"] += (ev.get("in", 0) or 0) + (ev.get("out", 0) or 0)
+            st["local_tokens"] += _int(ev.get("in", 0)) + _int(ev.get("out", 0))
     return st
 
 
@@ -2785,7 +2808,7 @@ def cache_entries(conf):
     """Live (unexpired) cache entries, oldest first."""
     if not os.path.isfile(CACHE_LOG):
         return []
-    ttl = float(conf.get("ttl_hours", 168)) * 3600
+    ttl = _num(conf.get("ttl_hours", 168), 168.0) * 3600
     now = time.time()
     out = []
     try:
@@ -2798,7 +2821,7 @@ def cache_entries(conf):
                     e = json.loads(line)
                 except Exception:
                     continue
-                if ttl > 0 and now - float(e.get("at", 0)) > ttl:
+                if ttl > 0 and now - _num(e.get("at", 0)) > ttl:
                     continue
                 out.append(e)
     except Exception:
