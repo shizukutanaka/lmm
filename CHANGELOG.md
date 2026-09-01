@@ -18,6 +18,22 @@ the round of fixes that took the hub from "works" to "holds up under load", and
 the merge of the managed-routing line of work into the same tool.
 
 ### Fixed
+- **The cache no longer answers a question the caller did not ask.** The key
+  was the prompt and the model, but the hub is an OpenAI-compatible endpoint
+  that forwards the caller's parameters — and those decide what a correct
+  answer even looks like. Measured: one provider call served three
+  incompatible requests. A `max_tokens: 4000` request was handed the answer
+  produced for `max_tokens: 5`, and a `response_format: {"type":
+  "json_object"}` request was handed a cached prose answer, on which the
+  client's `json.loads` raised. The key (and the semantic tier's neighbour
+  filter) now covers every parameter except those that cannot change an
+  answer's content — `stream`, `stream_options`, `user`, `metadata`, `store`,
+  and `temperature`, which already has its own `cache.max_temp` policy on both
+  sides. A deny-list, deliberately: an unfamiliar parameter costs a cache
+  miss, never a wrong answer. Identical repeats still hit on the first call
+  (verified), and existing cache entries simply age out as misses.
+
+### Fixed
 - **Metering survives concurrent lmm processes.** The state-file writers were
   serialised by a `threading.Lock`, which orders threads inside one
   interpreter — but lmm ships as a resident `serve --hub` plus separate `lmm

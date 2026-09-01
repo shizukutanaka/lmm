@@ -1446,9 +1446,9 @@ class TestStreamingRegressions(unittest.TestCase):
                        "price": {"in": 2.0, "out": 4.0}})]
 
     def count_calls(self):
-        def _lookup(cfg, messages, model):
+        def _lookup(cfg, messages, model, extra=None):
             self.lookups.append(model)
-            return self._lookup(cfg, messages, model)
+            return self._lookup(cfg, messages, model, extra)
 
         def _order(cfg, prompt, targets):
             self.orders.append(1)
@@ -5183,6 +5183,105 @@ for i in range(n):
         accounted = sum(e.get("events", 1) if e.get("rollup") else 1
                         for e in events)
         self.assertEqual(accounted, 160)
+
+
+class TestCacheAnswersTheAskedQuestionSurvivesElenchus(unittest.TestCase):
+    """The cache's claim is that reuse is free. Reuse is only free if the
+    reused answer answers the question that was actually asked -- and the hub
+    is an OpenAI-compatible endpoint that forwards the caller's parameters.
+
+    Measured before the fix, keyed on prompt+model alone: a request with
+    `max_tokens: 4000` was served the answer produced for `max_tokens: 5`,
+    and a `response_format: {"type": "json_object"}` request was served a
+    cached prose answer, on which the client's json.loads raised. One
+    provider call served three incompatible requests.
+    """
+
+    TARGETS = [("p", {"kind": "remote", "base": "http://x", "model": "m",
+                      "key": "k"})]
+    MSGS = [{"role": "user", "content": "count the primes under 10"}]
+    CFG = {"cache": {"enabled": True, "semantic": False}}
+
+    def setUp(self):
+        self.calls = []
+        self.saved = lmm.call_provider
+
+        def fake(prov, prompt, temperature=0.7, extra=None, messages=None,
+                 stream=False):
+            self.calls.append(dict(extra or {}))
+            e = extra or {}
+            body = ('{"n": 4}' if e.get("response_format")
+                    else "short" if e.get("max_tokens") == 5
+                    else "a long prose answer " * 6)
+            return {"choices": [{"message": {"content": body}}],
+                    "usage": {"prompt_tokens": 10, "completion_tokens": 20}}
+        lmm.call_provider = fake
+
+    def tearDown(self):
+        lmm.call_provider = self.saved
+
+    def ask(self, extra):
+        r = lmm.hub_complete(self.CFG, self.MSGS, list(self.TARGETS),
+                             {"extra": dict(extra), "cascade": False,
+                              "cache": True})
+        r = r[0] if isinstance(r, tuple) else r
+        return r["choices"][0]["message"]["content"]
+
+    def test_a_token_ceiling_does_not_share_an_answer_with_a_wider_one(self):
+        with temp_state():
+            first = self.ask({"max_tokens": 5})
+            second = self.ask({"max_tokens": 4000})
+        self.assertEqual(first, "short")
+        self.assertNotEqual(second, first)
+        self.assertEqual(len(self.calls), 2)
+
+    def test_json_mode_is_never_served_a_cached_prose_answer(self):
+        with temp_state():
+            self.ask({"max_tokens": 4000})              # prose, cached
+            body = self.ask({"response_format": {"type": "json_object"}})
+        json.loads(body)          # the client's parse must not raise
+
+    def test_identical_requests_still_hit_the_cache(self):
+        """The fix must not fragment the cache it exists to fill."""
+        with temp_state():
+            for _ in range(5):
+                self.ask({"max_tokens": 100, "stream": False, "user": "a"})
+        self.assertEqual(len(self.calls), 1)
+
+    def test_parameters_that_cannot_change_an_answer_do_not_fragment_it(self):
+        with temp_state():
+            self.ask({"max_tokens": 100, "stream": False, "user": "alice"})
+            self.ask({"max_tokens": 100, "stream": True, "user": "bob",
+                      "metadata": {"x": 1}})
+        self.assertEqual(len(self.calls), 1)
+
+    def test_an_unknown_parameter_fails_toward_a_miss_not_a_wrong_answer(self):
+        """A deny-list, not an allow-list: a parameter this code has never
+        heard of must cost a cache miss, never a wrong answer."""
+        a = lmm.cache_key(self.MSGS, "m", {"reasoning_effort": "low"})
+        b = lmm.cache_key(self.MSGS, "m", {"reasoning_effort": "high"})
+        self.assertNotEqual(a, b)
+
+    def test_the_semantic_tier_also_refuses_a_differently_shaped_neighbour(self):
+        """A near-identical prompt is still the wrong answer if it was
+        produced under different parameters."""
+        conf = {"enabled": True, "semantic": True, "similarity": 0.5,
+                "ttl_hours": 168, "max_entries": 100}
+        cfg = {"cache": conf}
+        saved_embed = lmm.embed_text
+        lmm.embed_text = lambda text, model: [1.0, 0.0, 0.0]
+        try:
+            with temp_state():
+                lmm.cache_store(cfg, [{"role": "user", "content": "x"}], "m",
+                                {"choices": [{"message": {"content": "prose"}}]},
+                                0.0, None, {"max_tokens": 5})
+                entry, how, _sim, _x = lmm.cache_lookup(
+                    cfg, [{"role": "user", "content": "y"}], "m",
+                    {"response_format": {"type": "json_object"}})
+        finally:
+            lmm.embed_text = saved_embed
+        self.assertIsNone(entry)
+        self.assertNotEqual(how, "semantic")
 
 
 if __name__ == "__main__":

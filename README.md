@@ -120,6 +120,14 @@ threshold cannot bound false cache hits, so the semantic tier is **opt-in**, its
 default threshold is a strict `0.95`, and every near miss is logged so you can
 tune it from evidence (`lmm cache`).
 
+An answer is only reusable for a request that would accept it, so the cache key
+covers the caller's answer-shaping parameters — `max_tokens`, `response_format`,
+`stop`, `tools`, `seed` and anything else a client sends — not just the prompt
+and the model. Only parameters that cannot change an answer's content (`stream`,
+`user`, `metadata`) are ignored, so repeats still hit. It is a deny-list on
+purpose: a parameter this code has never heard of costs a cache miss, never a
+wrong answer.
+
 #### Verified mode: let each entry earn the right to answer
 
 A static threshold answers *"are these two prompts close?"* when the question is
