@@ -2842,8 +2842,37 @@ def normalize_prompt(text):
     return "\n".join(l for i, l in enumerate(lines) if l or (i and lines[i - 1]))
 
 
-def cache_key(messages, model):
-    payload = normalize_prompt(messages_text(messages)) + "\x00" + (model or "")
+# Request parameters that cannot change the CONTENT of a correct answer, and
+# so must not fragment the cache. Everything ELSE the caller sends is folded
+# into the key: `max_tokens`, `response_format`, `stop`, `tools`, `seed`,
+# `top_p` and the rest all change what a correct answer even looks like, and
+# a cache keyed on the prompt alone answered a question the caller had not
+# asked -- measured, a `response_format: json_object` request was served a
+# cached prose answer and the client's json.loads failed on it.
+#
+# A DENY-list, deliberately, not an allow-list: a parameter nobody here has
+# heard of yet (a new provider extension, a future OpenAI field) then lands in
+# the key and costs at most a cache miss -- a correct answer, slightly slower.
+# An allow-list would fail the other way, silently serving the wrong answer.
+# `temperature` is denied because the cache already has a policy for it: above
+# cache.max_temp the caller wants variety and the cache is bypassed on both
+# sides, and below it every value is treated as "deterministic enough" to
+# share an answer. Putting it in the key would contradict that on purpose.
+CACHE_KEY_IGNORED = frozenset((
+    "stream", "stream_options", "user", "metadata", "store", "temperature",
+))
+
+
+def cache_shape(extra):
+    """Canonical digest of the answer-shaping request parameters."""
+    shape = {k: v for k, v in (extra or {}).items()
+             if k not in CACHE_KEY_IGNORED and v is not None}
+    return json.dumps(shape, sort_keys=True, default=str)
+
+
+def cache_key(messages, model, extra=None):
+    payload = (normalize_prompt(messages_text(messages)) + "\x00" + (model or "")
+               + "\x00" + cache_shape(extra))
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
@@ -3058,7 +3087,7 @@ def label_exploration(cfg, candidate, sim, result, trace=None):
                      % (sim, "agreed" if agree else "disagreed"))
 
 
-def cache_lookup(cfg, messages, model):
+def cache_lookup(cfg, messages, model, extra=None):
     """Return (entry, how, similarity, candidate).
 
     `entry` is non-None ONLY when it may actually be served — that separation
@@ -3073,7 +3102,8 @@ def cache_lookup(cfg, messages, model):
     entries = cache_entries(conf)
     if not entries:
         return None, None, 0.0, None
-    key = cache_key(messages, model)
+    key = cache_key(messages, model, extra)
+    shape = cache_shape(extra)
     for e in reversed(entries):                  # newest wins
         if e.get("key") == key:
             return e, "exact", 1.0, None
@@ -3087,6 +3117,11 @@ def cache_lookup(cfg, messages, model):
     for e in entries:
         if e.get("model") != model or not e.get("emb"):
             continue
+        if e.get("shape", "{}") != shape:
+            continue          # a near-identical PROMPT is still the wrong
+                              # answer if it was produced under different
+                              # parameters (json mode, a token ceiling, tools)
+
         sim = cosine(emb, e["emb"])
         if sim > best_sim:
             best, best_sim = e, sim
@@ -3107,7 +3142,8 @@ def cache_lookup(cfg, messages, model):
     return None, None, best_sim, None
 
 
-def cache_store(cfg, messages, model, result, usd=0.0, temperature=None):
+def cache_store(cfg, messages, model, result, usd=0.0, temperature=None,
+                extra=None):
     """Store one answer. `temperature` is the caller's EXPLICIT setting, or
     None if they never set one — only an explicit high temperature means the
     caller wants a fresh sample every time."""
@@ -3117,7 +3153,8 @@ def cache_store(cfg, messages, model, result, usd=0.0, temperature=None):
     if temperature is not None and float(temperature) > float(conf.get("max_temp", 0.3)):
         return                                   # caller wants variety, not reuse
     text = normalize_prompt(messages_text(messages))
-    entry = {"at": time.time(), "key": cache_key(messages, model), "model": model,
+    entry = {"at": time.time(), "key": cache_key(messages, model, extra),
+             "model": model, "shape": cache_shape(extra),
              "usd": round(usd, 6), "result": result}
     if conf.get("semantic"):
         emb = embed_text(text, conf.get("embed_model", "nomic-embed-text"))
@@ -3218,7 +3255,7 @@ def hub_complete(cfg, messages, targets, opts=None):
     explore = None          # near neighbour awaiting a correctness label
     if use_cache:
         probe_model = cache_model
-        entry, how, sim, explore = cache_lookup(cfg, messages, probe_model)
+        entry, how, sim, explore = cache_lookup(cfg, messages, probe_model, extra)
         if entry:
             saved = float(entry.get("usd", 0.0) or 0.0)
             log_usage({"provider": "cache", "model": probe_model, "kind": "local",
@@ -3301,7 +3338,7 @@ def hub_complete(cfg, messages, targets, opts=None):
             if stats is not None:
                 stats["spent"] = usd
             if use_cache:
-                cache_store(cfg, messages, cache_model, res, usd, req_temp)
+                cache_store(cfg, messages, cache_model, res, usd, req_temp, extra)
                 label_exploration(cfg, explore, sim, res, trace)
             return res, trace
 
@@ -3322,7 +3359,7 @@ def hub_complete(cfg, messages, targets, opts=None):
             if stats is not None:
                 stats["spent"] = spent
             if use_cache:
-                cache_store(cfg, messages, cache_model, res, spent, req_temp)
+                cache_store(cfg, messages, cache_model, res, spent, req_temp, extra)
                 label_exploration(cfg, explore, sim, res, trace)
             trace.append(f"[cascade] total ${spent:.4f} over {i + 1} rung(s)")
             return res, trace
@@ -3336,7 +3373,8 @@ def hub_complete(cfg, messages, targets, opts=None):
         if stats is not None:
             stats["spent"] = spent
         if use_cache:
-            cache_store(cfg, messages, cache_model, best[1], spent, req_temp)
+            cache_store(cfg, messages, cache_model, best[1], spent, req_temp,
+                        extra)
             label_exploration(cfg, explore, sim, best[1], trace)
         return best[1], trace
     return {"error": last_err or "all providers failed"}, trace
@@ -3390,7 +3428,7 @@ def hub_stream(cfg, messages, targets, opts=None):
 
     explore = None          # near neighbour awaiting a correctness label
     if use_cache:
-        entry, how, sim, explore = cache_lookup(cfg, messages, cache_model)
+        entry, how, sim, explore = cache_lookup(cfg, messages, cache_model, extra)
         if entry:
             saved = float(entry.get("usd", 0.0) or 0.0)
             try:
@@ -3432,7 +3470,7 @@ def hub_stream(cfg, messages, targets, opts=None):
             return
         if use_cache and text:
             cache_store(cfg, messages, cache_model, res,
-                        casc_stats.get("spent", 0.0), req_temp)
+                        casc_stats.get("spent", 0.0), req_temp, extra)
             label_exploration(cfg, explore, sim, res)
         for frame in synth_stream(text, cache_model,
                                   res.get("usage") if want_usage else None):
@@ -3508,7 +3546,7 @@ def hub_stream(cfg, messages, targets, opts=None):
                                  ttft_ms=ttft_ms)
                 # Never cache a truncated answer.
                 if completed and use_cache and text:
-                    cache_store(cfg, messages, cache_model, res, usd, req_temp)
+                    cache_store(cfg, messages, cache_model, res, usd, req_temp, extra)
                     label_exploration(cfg, explore, sim, res)
         if breaker:
             # A stream that produced bytes counts as up even if the client cut
