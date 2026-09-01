@@ -18,6 +18,8 @@ import time
 import shutil
 import struct
 import tempfile
+import threading
+import subprocess
 import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -5064,6 +5066,123 @@ class TestCorruptStateSurvivesElenchus(unittest.TestCase):
                 fh.write(json.dumps({"prompt": "p", "reply": "r", "at": far}) + "\n")
             entries = lmm.cache_entries({"ttl_hours": "week"})   # must not raise
         self.assertEqual([e.get("prompt") for e in entries], ["p"])
+
+
+class TestConcurrentWritersSurviveElenchus(unittest.TestCase):
+    """backend.py claims writers serialise, citing 21.9% of metering events
+    lost under concurrency as the bug the lock fixed. Derive the consequence:
+    then two concurrent lmm PROCESSES must not lose events either — which is
+    exactly how the product ships, a resident `serve --hub` alongside `lmm
+    ask`, `lmm bench` and the GUI. Measured with only the threading.Lock,
+    800 submitted events came back as 639: 20.1% erased by compaction's
+    os.replace. A threading.Lock cannot reach across a process boundary; the
+    lock has to be a file lock too.
+    """
+
+    RACER = r'''
+import sys, os, time
+sys.path.insert(0, %r)
+import backend as lmm
+role, n, d = sys.argv[1], int(sys.argv[2]), sys.argv[3]
+lmm.LMM_DIR = d
+lmm.USAGE_LOG = os.path.join(d, "usage.jsonl")
+lmm.USAGE_MAX_BYTES = 20000        # force compaction to run constantly
+lmm.USAGE_KEEP_TAIL = 20
+# Start barrier. Without it the two interpreters spend most of their lives
+# importing, they barely overlap, and an unlocked run loses nothing -- the
+# test passes the very mutation it exists to catch. Measured with the
+# barrier and the cross-process lock removed, n=150 lost ~50 of 300 events
+# on every trial; n=60 was flaky.
+open(os.path.join(d, "ready." + role), "w").close()
+while not all(os.path.exists(os.path.join(d, "ready." + r))
+              for r in ("A", "B")):
+    time.sleep(0.005)
+for i in range(n):
+    lmm.log_usage({"provider": role, "kind": "remote", "in": 1, "out": 1,
+                   "usd": 0.001, "seq": i})
+    if role == "B" and i %% 5 == 0:
+        with lmm._USAGE_LOCK, lmm._xlock("usage"):
+            lmm._usage_compact_locked()
+''' % os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+    def test_two_processes_racing_compaction_lose_no_events(self):
+        n = 150
+        with temp_state():
+            script = os.path.join(lmm.LMM_DIR, "racer.py")
+            os.makedirs(lmm.LMM_DIR, exist_ok=True)
+            with open(script, "w", encoding="utf-8") as fh:
+                fh.write(self.RACER)
+            procs = [subprocess.Popen(
+                [sys.executable, script, role, str(n), lmm.LMM_DIR],
+                stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+                for role in ("A", "B")]
+            try:
+                for p in procs:
+                    self.assertEqual(p.wait(timeout=300), 0, p.stdout.read())
+                events = lmm.read_usage()
+            finally:
+                for p in procs:
+                    p.stdout.close()
+                for extra in ("racer.py", ".usage.lock",
+                              "ready.A", "ready.B"):
+                    try:
+                        os.remove(os.path.join(lmm.LMM_DIR, extra))
+                    except OSError:
+                        pass
+        accounted = sum(e.get("events", 1) if e.get("rollup") else 1
+                        for e in events)
+        self.assertEqual(accounted, 2 * n)     # the whole point: nothing lost
+
+    def test_state_writes_still_work_where_no_file_lock_exists(self):
+        """A no-op lock is the documented fallback: telemetry must never be
+        able to break the call it is measuring."""
+        f, m = lmm._fcntl, lmm._msvcrt
+        try:
+            lmm._fcntl = lmm._msvcrt = None
+            with temp_state():
+                lmm.log_usage({"provider": "p", "kind": "remote", "in": 1,
+                               "out": 1, "usd": 0.25})
+                events = lmm.read_usage()
+        finally:
+            lmm._fcntl, lmm._msvcrt = f, m
+        self.assertEqual(len(events), 1)
+        self.assertAlmostEqual(events[0]["usd"], 0.25, places=6)
+
+    def test_the_lock_file_is_not_a_state_file(self):
+        """The rewrites end in os.replace, so a lock held on usage.jsonl
+        itself would be thrown away with the old inode mid-rewrite."""
+        with temp_state():
+            with lmm._xlock("usage"):
+                pass
+            names = set(os.listdir(lmm.LMM_DIR))
+        self.assertIn(".usage.lock", names)
+        self.assertNotEqual(os.path.basename(lmm.USAGE_LOG), ".usage.lock")
+
+    def test_hub_threads_and_compaction_do_not_deadlock_in_one_process(self):
+        """The file lock nests inside the threading.Lock; several hub threads
+        appending while compaction runs must still finish."""
+        with temp_state():
+            lmm.USAGE_MAX_BYTES, keep = 20000, lmm.USAGE_KEEP_TAIL
+            lmm.USAGE_KEEP_TAIL = 20
+            try:
+                def work(tag):
+                    for i in range(40):
+                        lmm.log_usage({"provider": tag, "kind": "remote",
+                                       "in": 1, "out": 1, "usd": 0.001})
+                ts = [threading.Thread(target=work, args=(str(i),))
+                      for i in range(4)]
+                for t in ts:
+                    t.start()
+                for t in ts:
+                    t.join(timeout=120)
+                    self.assertFalse(t.is_alive(), "writer thread hung")
+                events = lmm.read_usage()
+            finally:
+                lmm.USAGE_MAX_BYTES = 4_000_000
+                lmm.USAGE_KEEP_TAIL = keep
+        accounted = sum(e.get("events", 1) if e.get("rollup") else 1
+                        for e in events)
+        self.assertEqual(accounted, 160)
 
 
 if __name__ == "__main__":
