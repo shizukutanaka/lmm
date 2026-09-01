@@ -18,6 +18,21 @@ the round of fixes that took the hub from "works" to "holds up under load", and
 the merge of the managed-routing line of work into the same tool.
 
 ### Fixed
+- **Metering survives concurrent lmm processes.** The state-file writers were
+  serialised by a `threading.Lock`, which orders threads inside one
+  interpreter — but lmm ships as a resident `serve --hub` plus separate `lmm
+  ask`, `lmm bench` and GUI processes writing the same files, and compaction
+  and cache pruning are read-modify-replace rewrites. Measured with two
+  concurrent processes (one appending, one compacting): **161 of 800 metering
+  events silently erased, 20.1%** — essentially the same 21.9% the in-process
+  lock was added to stop, just one boundary further out. Writers now also take
+  a cross-process lock file (`~/.lmm/.usage.lock`, `.cache.lock` — a separate
+  inode, since the state files themselves are replaced mid-rewrite): the same
+  race now accounts for **800 of 800**. Where neither `fcntl` nor `msvcrt`
+  exists the lock is a no-op, preserving the rule that telemetry can never
+  break the call it measures.
+
+### Fixed
 - **Corrupt state files no longer kill the bill.** `~/.lmm/usage.jsonl` and
   `cache.jsonl` are plain text a user (or a torn write) can mangle. Line-level
   JSON errors were already skipped, but a *field* with the wrong type was not:

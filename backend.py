@@ -37,6 +37,7 @@ import argparse
 import subprocess
 import threading
 import datetime
+import contextlib
 import html
 import webbrowser
 import ctypes
@@ -79,6 +80,71 @@ _USAGE_LOCK = threading.Lock()
 
 
 _CACHE_LOCK = threading.Lock()
+
+
+# ...but a threading.Lock only orders threads inside ONE interpreter, and lmm
+# does not ship as one process: a resident `lmm serve --hub` writes this file
+# while the user runs `lmm ask`, `lmm bench` and the GUI's 5-second refresh in
+# separate processes. Measured with the in-process lock alone, two concurrent
+# lmm processes (one appending, one compacting) lost 161 of 800 metering
+# events -- 20.1%, essentially the same 21.9% the in-process lock was added to
+# stop. The lock has to reach across the process boundary too.
+#
+# The lock file is a SEPARATE inode from the state files on purpose: the
+# rewrites finish with os.replace, so a lock held on the state file itself
+# would be discarded along with the old inode mid-critical-section.
+try:
+    import fcntl as _fcntl
+except ImportError:
+    _fcntl = None
+try:
+    import msvcrt as _msvcrt
+except ImportError:
+    _msvcrt = None
+
+
+@contextlib.contextmanager
+def _xlock(name="state"):
+    """Serialise writers ACROSS PROCESSES on ~/.lmm/.<name>.lock.
+
+    Advisory and best-effort by design: where neither fcntl nor msvcrt exists
+    this is a no-op, because telemetry must never be able to break the call it
+    is measuring. Nest it inside the matching threading.Lock -- that keeps the
+    common single-process case on a cheap in-memory lock and means only one
+    thread per process ever queues for the file lock.
+    """
+    fh = None
+    try:
+        os.makedirs(LMM_DIR, exist_ok=True)
+        fh = open(os.path.join(LMM_DIR, ".%s.lock" % name), "a+b")
+        if _fcntl is not None:
+            _fcntl.flock(fh.fileno(), _fcntl.LOCK_EX)
+        elif _msvcrt is not None:
+            fh.seek(0)
+            _msvcrt.locking(fh.fileno(), _msvcrt.LK_LOCK, 1)
+    except Exception:
+        if fh is not None:
+            try:
+                fh.close()
+            except Exception:
+                pass
+            fh = None
+    try:
+        yield
+    finally:
+        if fh is not None:
+            try:
+                if _fcntl is not None:
+                    _fcntl.flock(fh.fileno(), _fcntl.LOCK_UN)
+                elif _msvcrt is not None:
+                    fh.seek(0)
+                    _msvcrt.locking(fh.fileno(), _msvcrt.LK_UNLCK, 1)
+            except Exception:
+                pass
+            try:
+                fh.close()
+            except Exception:
+                pass
 
 
 CACHE_LOG = os.path.join(LMM_DIR, "cache.jsonl")
@@ -1838,7 +1904,7 @@ def log_usage(event):
     """Append one metering event to ~/.lmm/usage.jsonl. Never raises: telemetry
     must not be able to break the call it is measuring."""
     try:
-        with _USAGE_LOCK:
+        with _USAGE_LOCK, _xlock("usage"):
             os.makedirs(LMM_DIR, exist_ok=True)
             event = dict(event)
             event.setdefault("ts",
@@ -1857,7 +1923,9 @@ def log_usage(event):
 
 def _usage_compact_locked(keep=None):
     """Fold everything but the newest `keep` events into one rollup line.
-    Caller must hold _USAGE_LOCK.
+    Caller must hold _USAGE_LOCK *and* _xlock("usage") -- this is a
+    read-modify-replace, and an append from ANY process landing between the
+    read and the os.replace is erased by it.
 
     The rollup preserves the TOTALS exactly — spend, tokens, calls, hits,
     savings, and the estimated/partial breakdowns — so `lmm cost` reports the
@@ -2934,7 +3002,7 @@ def record_observation(cfg, key, sim, correct):
     capped at cache.max_entries, so this stays a small rewrite.
     """
     conf = merged_cache(cfg)
-    with _CACHE_LOCK:
+    with _CACHE_LOCK, _xlock("cache"):
         return _record_observation_locked(conf, key, sim, correct)
 
 
@@ -3056,7 +3124,7 @@ def cache_store(cfg, messages, model, result, usd=0.0, temperature=None):
         if emb:
             entry["emb"] = emb
     try:
-        with _CACHE_LOCK:
+        with _CACHE_LOCK, _xlock("cache"):
             os.makedirs(LMM_DIR, exist_ok=True)
             with open(CACHE_LOG, "a", encoding="utf-8") as fh:
                 fh.write(json.dumps(entry, ensure_ascii=False) + "\n")
@@ -3067,8 +3135,9 @@ def cache_store(cfg, messages, model, result, usd=0.0, temperature=None):
 
 def _cache_prune_locked(conf):
     """Rewrite the log when it outgrows max_entries, keeping the newest.
-    Caller must hold _CACHE_LOCK: this is a read-modify-replace, and an append
-    landing between the read and the os.replace would be erased."""
+    Caller must hold _CACHE_LOCK *and* _xlock("cache"): this is a
+    read-modify-replace, and an append from any process landing between the
+    read and the os.replace would be erased."""
     cap = int(conf.get("max_entries", 2000))
     try:
         entries = cache_entries(conf)

@@ -634,6 +634,15 @@ Two append-only JSONL files under `~/.lmm/`, both plain text you can `cat`:
   recency is the point.
 - `cache.jsonl` — cached answers (and embeddings, if the semantic tier is on).
 
+Both files are maintained by read-modify-replace rewrites (compaction, cache
+pruning), and lmm is a multi-process tool: a resident `lmm serve --hub` writes
+while you run `lmm ask`, `lmm bench` and the GUI in separate processes. Writers
+therefore take a lock file (`~/.lmm/.usage.lock`, `.cache.lock`) that holds
+across processes, not just across the hub's threads. Measured with two
+concurrent lmm processes — one appending, one compacting — 800 submitted events
+came back as 639 before the file lock (20.1% erased by the rewrite) and 800 of
+800 after.
+
 Both files are yours to edit, and the readers assume you will: a line that is
 not JSON is skipped, and a field with the wrong type (`"usd": "abc"`) costs
 only itself — the command still runs and every other line still counts.
