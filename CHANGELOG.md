@@ -251,6 +251,21 @@ the merge of the managed-routing line of work into the same tool.
   cost_report`). It did; now it must keep doing so.
 
 ### Changed
+- **Invariants are checked as a table, not as one hand-written AST sweep per
+  rule.** Five consecutive defects here were the same shape — an invariant
+  honoured at some call sites and not all of them — and each was caught only
+  afterwards, by a walker written specially for it; two of those walkers were
+  near-identical. One `_unreached(trigger, requirement, exempt)` helper now
+  answers "which functions do X without ever reaching Y", and the rules are
+  rows: prompt paths must reach `pin_private`, `os.replace` writers must
+  reach `_xlock`, and (added while building it, and **acquitted** — no
+  offenders) every path that bills a provider answer must reach
+  `meter_call`. Adding the next rule is four lines instead of forty. The
+  sweep is itself tested against a planted violation, exemptions must name
+  functions that still exist, and an exempt `_locked` helper must state the
+  contract in its docstring — planting a loss of that wording fails.
+
+### Changed
 - **`lmm` is now three files**: `lmm.py` (entry point) over `backend.py` (the
   engine — no CLI, no GUI, so it is testable without a terminal or a display)
   and `frontend.py` (argument parsing, the `cmd_*` handlers, the dashboard).
