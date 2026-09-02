@@ -633,6 +633,12 @@ because it is one word pays the expensive model for the questions the cheap
 one gets right; whether an answer is too short is judged against what the
 prompt asked for, not against a word count.
 
+`lmm config validate` exits non-zero on a bad config, and checks the values
+that would otherwise fail silently — a `cache.similarity` no cosine can reach,
+a `max_temp` below every temperature, a `route_threshold` outside the range the
+router can produce, a provider name in `ask_order` or `cascade.order` that
+resolves to nothing.
+
 ## What the hub forwards
 
 Everything your client sent, except the handful of fields the hub genuinely

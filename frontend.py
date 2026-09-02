@@ -1643,34 +1643,35 @@ def cmd_validate_config(cfg):
     else:
         ok("providers", "absent")
 
-    # 4. ask_order -----------------------------------------------------------
-    if "ask_order" in cfg:
-        order = cfg.get("ask_order")
+    # 4. provider name lists -------------------------------------------------
+    # ask_order and cascade.order are the same kind of list and were not
+    # treated as one: a typo in ask_order was caught, the identical typo in
+    # cascade.order passed silently and the cascade simply never ran.
+    known = set(k.lower() for k in merged_providers(cfg))
+    running = []
+    try:
+        for it in backend.discover(cfg):
+            nm = (it.get("name") or "")
+            if it.get("running"):
+                running.append(nm)
+                known.add(nm.lower())
+    except Exception as e:
+        print(f"[..] provider lists -- discover() failed: {e}")
+
+    def check_order(label, order):
         if not isinstance(order, list):
-            fail("ask_order", f"expected list, got {type(order).__name__}")
+            fail(label, f"expected list, got {type(order).__name__}")
+            return
+        unresolved = [n for n in order
+                      if not (isinstance(n, str) and n.lower() in known)]
+        if unresolved:
+            fail(label, f"UNRESOLVED: {unresolved} (known providers="
+                        f"{sorted(merged_providers(cfg))}, running={running})")
         else:
-            known = set()
-            for k in merged_providers(cfg):
-                known.add(k.lower())
-            running = []
-            try:
-                for it in backend.discover(cfg):
-                    nm = (it.get("name") or "")
-                    if it.get("running"):
-                        running.append(nm)
-                        known.add(nm.lower())
-            except Exception as e:
-                print(f"[..] ask_order -- discover() failed: {e}")
-            # (implicit local bases surface via discover() running=True)
-            unresolved = [n for n in order
-                          if not (isinstance(n, str) and n.lower() in known)]
-            if unresolved:
-                fail("ask_order",
-                     f"UNRESOLVED: {unresolved} (known providers="
-                     f"{sorted(merged_providers(cfg))}, running={running})")
-            else:
-                ok("ask_order",
-                   f"{len(order)} entry(ies) all resolve (running={running})")
+            ok(label, f"{len(order)} entry(ies) all resolve (running={running})")
+
+    if "ask_order" in cfg:
+        check_order("ask_order", cfg.get("ask_order"))
     else:
         ok("ask_order", "absent (default order applies)")
 
@@ -1695,6 +1696,81 @@ def cmd_validate_config(cfg):
                 ok("route", "private/heavy are lists of strings")
     else:
         ok("route", "absent (defaults apply)")
+
+    # 6. route_threshold -----------------------------------------------------
+    # Checked because it was NOT: a config carrying route_threshold: 1.7 was
+    # reported as "[OK] route -- absent (defaults apply)". `route` and
+    # `route_threshold` are different keys, and saying nothing about the one
+    # that is present, under the name of the one that is missing, is worse
+    # than saying nothing at all.
+    if "route_threshold" in cfg:
+        rt = cfg.get("route_threshold")
+        if not is_num(rt):
+            fail("route_threshold", f"not numeric ({rt!r})")
+        elif not 0.0 <= float(rt) <= 1.0:
+            fail("route_threshold",
+                 f"{rt} is outside 0.0-1.0; prompt_strength() cannot reach it, "
+                 "so routing is stuck on one side")
+        else:
+            ok("route_threshold", f"{rt} is within 0.0-1.0")
+    else:
+        ok("route_threshold", "absent (default applies)")
+
+    # 7. cache ---------------------------------------------------------------
+    # Every check here is a value that SILENTLY DISABLES the feature the user
+    # turned on, measured: similarity above 1.0 can never be reached by a
+    # cosine, so the semantic tier never hits; a negative max_temp makes the
+    # store side refuse every call, so nothing is ever cached; a negative
+    # ttl_hours turns expiry off rather than on.
+    if "cache" in cfg:
+        cache = cfg.get("cache")
+        if not isinstance(cache, dict):
+            fail("cache", f"expected dict, got {type(cache).__name__}")
+        else:
+            bad = []
+            sim = cache.get("similarity")
+            if sim is not None:
+                if not is_num(sim):
+                    bad.append(f"similarity: not numeric ({sim!r})")
+                elif not 0.0 < float(sim) <= 1.0:
+                    bad.append(f"similarity: {sim} is not a reachable cosine "
+                               "(0.0 < x <= 1.0); the semantic tier can never hit")
+            mt = cache.get("max_temp")
+            if mt is not None:
+                if not is_num(mt):
+                    bad.append(f"max_temp: not numeric ({mt!r})")
+                elif float(mt) < 0:
+                    bad.append(f"max_temp: {mt} is below every temperature, "
+                               "so no answer is ever stored")
+            ttl = cache.get("ttl_hours")
+            if ttl is not None:
+                if not is_num(ttl):
+                    bad.append(f"ttl_hours: not numeric ({ttl!r})")
+                elif float(ttl) < 0:
+                    bad.append(f"ttl_hours: {ttl} disables expiry rather than "
+                               "shortening it; use 0 to keep entries forever")
+            me = cache.get("max_entries")
+            if me is not None and (not is_num(me) or float(me) <= 0):
+                bad.append(f"max_entries: {me!r} must be a positive number")
+            if bad:
+                fail("cache", "; ".join(bad))
+            else:
+                ok("cache", "thresholds are within their reachable ranges")
+    else:
+        ok("cache", "absent (defaults apply)")
+
+    # 8. cascade -------------------------------------------------------------
+    if "cascade" in cfg:
+        casc = cfg.get("cascade")
+        if not isinstance(casc, dict):
+            fail("cascade", f"expected dict, got {type(casc).__name__}")
+        else:
+            if "order" in casc:
+                check_order("cascade.order", casc.get("order"))
+            else:
+                ok("cascade.order", "absent (ask_order applies)")
+    else:
+        ok("cascade", "absent (defaults apply)")
 
     if errors:
         print(f"config: INVALID ({len(errors)} error(s))")

@@ -5777,5 +5777,112 @@ class TestGraderRulesActuallyBiteSurvivesElenchus(unittest.TestCase):
                 self.assertIn("truncated mid-sentence", why)
 
 
+class TestValidatorCatchesSilentDisablesSurvivesElenchus(unittest.TestCase):
+    """`lmm config validate` promises the config lmm "actually relies on".
+    Derive the consequence: a value that silently switches OFF a feature the
+    user explicitly switched ON must be caught -- that is precisely the
+    mistake no runtime error will ever reveal.
+
+    Measured against a config carrying six real mistakes, it reported three
+    and stayed silent about `route_threshold: 1.7`, `cache.similarity: 1.5`,
+    `cache.max_temp: -1`, `cache.ttl_hours: -5` and an unresolved
+    `cascade.order` -- while printing "[OK] route -- absent (defaults
+    apply)", naming the key that was missing rather than the one that was
+    there.
+
+    (Acquitted in the same round, by measurement: the exit status DOES carry
+    the verdict -- an earlier reading of 0 was `tail`'s status, not the
+    command's -- and `hub.allow_remote` without a token is already warned
+    about at bind time by hub_bind_check.)
+    """
+
+    BAD = {
+        "providers": {"p": {"api_key": "k", "base_url": "http://127.0.0.1/v1",
+                            "model": "m", "kind": "local"}},
+        "route_threshold": 1.7,
+        "cache": {"enabled": True, "similarity": 1.5, "max_temp": -1,
+                  "ttl_hours": -5},
+        "cascade": {"enabled": True, "order": ["also-missing"]},
+    }
+    GOOD = {
+        "providers": {"p": {"api_key": "k", "base_url": "http://127.0.0.1/v1",
+                            "model": "m", "kind": "local"}},
+        "ask_order": ["p"],
+        "route_threshold": 0.55,
+        "cache": {"enabled": True, "similarity": 0.95, "max_temp": 0.3,
+                  "ttl_hours": 168, "max_entries": 2000},
+        "cascade": {"enabled": True, "order": ["p"]},
+    }
+
+    def _validate(self, cfg):
+        import io
+        import contextlib
+        saved = lmm.discover
+        lmm.discover = lambda c, **kw: []          # no machine dependence
+        buf, code = io.StringIO(), 0
+        try:
+            with contextlib.redirect_stdout(buf):
+                try:
+                    frontend.cmd_validate_config(cfg)
+                except SystemExit as e:
+                    code = e.code or 0
+        finally:
+            lmm.discover = saved
+        return code, buf.getvalue()
+
+    def test_it_names_every_silently_disabling_value(self):
+        code, out = self._validate(dict(self.BAD))
+        self.assertNotEqual(code, 0)
+        for needle in ("route_threshold", "similarity", "max_temp",
+                       "ttl_hours", "cascade.order"):
+            self.assertIn(needle, out, "validator stayed silent about %r" % needle)
+        # and it must not report a key as absent while it is present
+        self.assertNotIn("[OK] route_threshold -- absent", out)
+
+    def test_a_typo_in_cascade_order_is_caught_like_one_in_ask_order(self):
+        """The same check existed for one list and not the other, so the
+        identical typo passed in cascade.order and the cascade never ran."""
+        cfg = dict(self.GOOD, cascade={"enabled": True, "order": ["typo"]})
+        code, out = self._validate(cfg)
+        self.assertNotEqual(code, 0)
+        self.assertIn("cascade.order", out)
+        self.assertIn("UNRESOLVED", out)
+
+    def test_a_correct_config_is_still_valid(self):
+        """The other direction: a validator that rejects everything would
+        satisfy every assertion above."""
+        code, out = self._validate(dict(self.GOOD))
+        self.assertEqual(code, 0, out)
+        self.assertIn("config: VALID", out)
+        self.assertNotIn("[FAIL]", out)
+
+    def test_boundary_values_are_accepted(self):
+        """0.0, 1.0 and a zero ttl are legal; the check must bound the range,
+        not narrow it."""
+        cfg = dict(self.GOOD, route_threshold=1.0,
+                   cache={"enabled": True, "similarity": 1.0, "max_temp": 0.0,
+                          "ttl_hours": 0})
+        code, out = self._validate(cfg)
+        self.assertEqual(code, 0, out)
+
+    def test_the_verdict_reaches_the_shell(self):
+        """Measured, not assumed: an earlier reading of exit 0 was `tail`'s
+        status. The command itself must exit non-zero on an invalid config."""
+        root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        home = tempfile.mkdtemp(prefix="lmm-validate-")
+        try:
+            os.makedirs(os.path.join(home, ".lmm"))
+            with open(os.path.join(home, ".lmm", "config.json"), "w",
+                      encoding="utf-8") as fh:
+                json.dump(self.BAD, fh)
+            env = dict(os.environ, HOME=home, USERPROFILE=home)
+            r = subprocess.run([sys.executable, os.path.join(root, "lmm.py"),
+                                "config", "validate"],
+                               capture_output=True, timeout=120, env=env)
+            self.assertEqual(r.returncode, 1, r.stdout.decode()[:400])
+        finally:
+            shutil.rmtree(home, ignore_errors=True)
+
+
 if __name__ == "__main__":
     unittest.main()
