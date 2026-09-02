@@ -2122,16 +2122,44 @@ def read_usage(days=None):
     return out
 
 
-def meter_call(prov_name, prov, model, res, pricing, **extra):
-    """Price one provider response and record it. Returns the USD charged."""
+def meter_call(prov_name, prov, model, res, pricing, prompt=None, **extra):
+    """Price one provider response and record it. Returns the USD charged.
+
+    A provider that omits `usage` is priced from estimate_tokens() and the
+    event is flagged `estimated`, exactly as the streaming path already did.
+    Measured before this: with a provider that returns no usage block, the
+    streamed path logged in=4 out=7 $0.000117 estimated=True while the
+    NON-streamed path logged in=0 out=0 **$0.00** with no flag -- a real paid
+    call booked as free, and `lmm cost` showed $0. One estimator, one
+    metering authority, so both paths guess or measure the same way and say
+    which they did.
+    """
     usage = (res or {}).get("usage") if isinstance(res, dict) else None
     rate = price_for(prov, model, pricing)
+    estimated = bool(extra.pop("estimated", False))
+    if not usage and isinstance(res, dict):
+        text = ""
+        try:
+            msg = (res.get("choices") or [{}])[0].get("message") or {}
+            text = msg.get("content") or ""
+            for tc in (msg.get("tool_calls") or []):
+                text += (tc.get("function") or {}).get("arguments", "") or ""
+        except (AttributeError, IndexError, TypeError):
+            text = ""
+        if text or prompt is not None:
+            ptext = (prompt if isinstance(prompt, str)
+                     else messages_text(prompt) if prompt is not None else "")
+            usage = {"prompt_tokens": estimate_tokens(ptext),
+                     "completion_tokens": estimate_tokens(text)}
+            estimated = True
     usd = usage_cost(usage, rate)
     ev = {"provider": prov_name, "model": model,
           "kind": (prov or {}).get("kind", "remote"),
           "in": (usage or {}).get("prompt_tokens", 0) or 0,
           "out": (usage or {}).get("completion_tokens", 0) or 0,
           "usd": round(usd, 6)}
+    if estimated:
+        ev["estimated"] = True
     ev.update(extra)
     log_usage(ev)
     return usd
@@ -3480,6 +3508,7 @@ def hub_complete(cfg, messages, targets, opts=None):
 
         if not use_cascade:
             usd = meter_call(name, prov, prov.get("model"), res, pricing,
+                             prompt=messages,
                              source=source, cache="miss", rung=i, accepted=True,
                              ms=elapsed_ms, stream=streamed, buffered=streamed,
                              ttft_ms=elapsed_ms if streamed else None)
@@ -3494,6 +3523,7 @@ def hub_complete(cfg, messages, targets, opts=None):
         score, why = verify_answer(messages, answer, cfg, judge, tool_calls=calls)
         accept = score >= threshold or i == len(rungs) - 1
         usd = meter_call(name, prov, prov.get("model"), res, pricing,
+                         prompt=messages,
                          source=source, cache="miss", rung=i,
                          score=round(score, 3), accepted=bool(accept),
                          ms=elapsed_ms, stream=streamed, buffered=streamed,
@@ -4044,7 +4074,7 @@ def route_and_verify(task, cfg, ask_order=None, max_tries=3):
         # makes shows up in the bill.
         HUB_BREAKER.record_success(name)   # a real reply closes the circuit,
                                             # whatever the quality gate says
-        meter_call(name, prov, prov.get("model"), r, pricing,
+        meter_call(name, prov, prov.get("model"), r, pricing, prompt=task,
                    source="verify", cache="miss", accepted=bool(ok),
                    ms=elapsed_ms)
         if ok:

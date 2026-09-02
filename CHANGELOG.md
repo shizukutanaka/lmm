@@ -18,6 +18,20 @@ the round of fixes that took the hub from "works" to "holds up under load", and
 the merge of the managed-routing line of work into the same tool.
 
 ### Fixed
+- **No paid call is booked as free.** Providers are allowed to omit `usage`,
+  and plenty of local runtimes and proxies do. Measured against one that
+  does, the two hub paths disagreed: the streamed path logged
+  `in=4 out=7 $0.000117 estimated=True`, while the non-streamed path logged
+  `in=0 out=0` **`$0.00`** with no flag — a real paid call recorded as free,
+  and `lmm cost` showed `$0`. The streaming path already knew how to
+  estimate; `estimate_tokens()` has been lifted into `meter_call()`, the one
+  metering authority every path goes through, so both now guess or measure
+  the same way and say which they did (tool-call arguments included, since
+  they are billed output that never reaches `content`). `estimated` is
+  written only when the number *is* a guess — absence means measured, which
+  is how every reader already asks.
+
+### Fixed
 - **`lmm config validate` now catches the mistakes that disable a feature
   silently.** Fed a config with six real errors it reported three, and the
   three it missed were the ones no runtime error would ever reveal: a

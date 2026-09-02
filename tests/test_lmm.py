@@ -1304,7 +1304,11 @@ class TestHubStream(unittest.TestCase):
             events = lmm.read_usage()
         self.assertEqual(len(events), 1)
         self.assertTrue(events[0]["stream"])
-        self.assertFalse(events[0]["estimated"])
+        # `estimated` is written only when the number IS a guess; absence
+        # means the provider's own usage block was used. Stronger than the
+        # old `estimated: false`, and it is how every reader already asks
+        # (`ev.get("estimated")`).
+        self.assertNotIn("estimated", events[0])
         self.assertFalse(events[0]["partial"])
         self.assertEqual(events[0]["out"], 3)
         self.assertIsNotNone(events[0]["ttft_ms"])
@@ -5882,6 +5886,90 @@ class TestValidatorCatchesSilentDisablesSurvivesElenchus(unittest.TestCase):
             self.assertEqual(r.returncode, 1, r.stdout.decode()[:400])
         finally:
             shutil.rmtree(home, ignore_errors=True)
+
+
+class TestNoPaidCallIsBookedFreeSurvivesElenchus(unittest.TestCase):
+    """"A bill you can actually see" -- so a call that cost money must never
+    be recorded as costing nothing. Providers are allowed to omit `usage`;
+    plenty of local runtimes and proxies do.
+
+    Measured against a provider that returns no usage block, the two hub
+    paths disagreed:
+        stream=True  -> in=4 out=7 $0.000117 estimated=True
+        stream=False -> in=0 out=0 **$0.00**  no flag
+    The streaming path already knew how to estimate. The non-streaming path
+    booked a real paid call as free, and `lmm cost` reported $0. One
+    estimator, one metering authority: both paths now guess or measure the
+    same way, and say which they did.
+    """
+
+    RATE = {"in": 3.0, "out": 15.0, "cw": 0.0, "cr": 0.0}
+    PROV = {"kind": "remote", "base_url": "http://x/v1", "model": "m",
+            "price": RATE}
+    PROMPT = [{"role": "user", "content": "Capital of France?"}]
+    ANSWER = "Paris is the capital of France."
+
+    def _meter(self, res):
+        with temp_state():
+            usd = lmm.meter_call("p", self.PROV, "m", res,
+                                 lmm.merged_pricing({}), prompt=self.PROMPT,
+                                 source="test", cache="miss")
+            events = lmm.read_usage()
+        return usd, events[0]
+
+    def test_a_response_without_usage_is_priced_not_zeroed(self):
+        usd, ev = self._meter(
+            {"choices": [{"message": {"content": self.ANSWER}}]})
+        self.assertGreater(usd, 0.0, "a paid call was booked as free")
+        self.assertGreater(ev["in"], 0)
+        self.assertGreater(ev["out"], 0)
+        self.assertTrue(ev.get("estimated"),
+                        "a guess must never be reported as a measurement")
+
+    def test_a_response_with_usage_is_still_measured_exactly(self):
+        """The other direction: estimating must not override real numbers."""
+        usd, ev = self._meter(
+            {"choices": [{"message": {"content": self.ANSWER}}],
+             "usage": {"prompt_tokens": 11, "completion_tokens": 7}})
+        self.assertEqual((ev["in"], ev["out"]), (11, 7))
+        self.assertNotIn("estimated", ev)
+        self.assertAlmostEqual(usd, 11 / 1e6 * 3.0 + 7 / 1e6 * 15.0, places=9)
+
+    def test_tool_call_arguments_count_toward_the_estimate(self):
+        """Tool arguments are billed output even though they never reach
+        `content` -- the streaming path already counted them."""
+        bare = self._meter({"choices": [{"message": {"content": ""}}]})[1]
+        with_tools = self._meter({"choices": [{"message": {
+            "content": "",
+            "tool_calls": [{"function": {"name": "f",
+                                         "arguments": '{"city": "Paris"}'}}]}}]})[1]
+        self.assertGreater(with_tools["out"], bare["out"])
+
+    def test_both_hub_paths_agree_on_a_provider_that_omits_usage(self):
+        """End to end over real HTTP, both ways, same provider behaviour."""
+        stub = StubBackend()
+        cfg = {"providers": {"stub": {
+            "api_key": "k", "base_url": stub.base_url, "model": "m",
+            "kind": "remote", "price": self.RATE}}, "ask_order": ["stub"],
+            "cache": {"enabled": False}}
+        seen = {}
+        try:
+            for stream in (False, True):
+                with temp_state():
+                    hub = HubServer(cfg)
+                    hub.request("/v1/chat/completions",
+                                {"model": "stub", "stream": stream,
+                                 "messages": self.PROMPT})
+                    time.sleep(0.3)
+                    evs = [e for e in lmm.read_usage() if not e.get("event")]
+                seen[stream] = evs
+        finally:
+            stub.stop()
+        for stream, evs in seen.items():
+            self.assertEqual(len(evs), 1, "stream=%s billed %d times"
+                             % (stream, len(evs)))
+            self.assertGreater(evs[0]["usd"], 0.0,
+                               "stream=%s booked a paid call as free" % stream)
 
 
 if __name__ == "__main__":
