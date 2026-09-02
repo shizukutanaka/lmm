@@ -5562,5 +5562,68 @@ class TestStopKillsOnlyWhatItNamesSurvivesElenchus(unittest.TestCase):
             subprocess.run = saved
 
 
+class TestHubForwardsWhatItWasAskedSurvivesElenchus(unittest.TestCase):
+    """The hub's whole pitch is "point your app at it". Derive the
+    consequence: what the app asked for must reach the provider. It didn't.
+
+    Forwarding was an allow-list of the OpenAI fields this code happened to
+    know about. Measured against a provider that echoes its request, a client
+    sending logprobs, top_logprobs, logit_bias, parallel_tool_calls,
+    reasoning_effort and service_tier had all six dropped, with no error --
+    a proxy answering a different question than the one it was asked.
+
+    Same argument as the cache key: an unfamiliar field must fail toward
+    being FORWARDED (the provider either accepts it or rejects it by name)
+    rather than toward silence.
+    """
+
+    NEWER_THAN_THE_LIST = {"logprobs": True, "top_logprobs": 3,
+                           "logit_bias": {"123": -100},
+                           "parallel_tool_calls": False,
+                           "reasoning_effort": "high",
+                           "service_tier": "scale"}
+
+    def test_fields_the_hardcoded_list_never_heard_of_reach_the_provider(self):
+        stub = StubBackend()
+        try:
+            cfg = {"providers": {"stub": {
+                "api_key": "k", "base_url": stub.base_url, "model": "m",
+                "kind": "local"}}, "ask_order": ["stub"],
+                "cache": {"enabled": False}}
+            with temp_state():
+                hub = HubServer(cfg)
+                body = dict(self.NEWER_THAN_THE_LIST,
+                            model="stub", max_tokens=77,
+                            messages=[{"role": "user", "content": "hi"}])
+                code, _text = hub.request("/v1/chat/completions", body)
+            self.assertEqual(code, 200)
+            got = stub.seen[-1]
+        finally:
+            stub.stop()
+        for k, v in self.NEWER_THAN_THE_LIST.items():
+            self.assertIn(k, got, "the hub dropped %r" % k)
+            self.assertEqual(got[k], v, k)
+        self.assertEqual(got["max_tokens"], 77)
+
+    def test_the_hub_still_owns_the_fields_it_rewrites(self):
+        """The other direction: forwarding everything would break routing.
+        `model` is a provider alias here, not a model id the backend knows,
+        and lmm's own controls are meaningless to a provider."""
+        got = lmm.passthrough({"model": "stub", "messages": [],
+                               "stream": True, "stream_options": {"x": 1},
+                               "lmm_cascade": True, "lmm_no_cache": True,
+                               "max_tokens": 5})
+        self.assertEqual(got, {"max_tokens": 5})
+
+    def test_a_forwarded_field_also_reaches_the_cache_key(self):
+        """These two fixes have to agree: a field the hub forwards changes
+        the answer, so it must also split the cache. An allow-listed
+        forwarder made that impossible for anything it had not heard of."""
+        msgs = [{"role": "user", "content": "hi"}]
+        a = lmm.cache_key(msgs, "m", {"reasoning_effort": "low"})
+        b = lmm.cache_key(msgs, "m", {"reasoning_effort": "high"})
+        self.assertNotEqual(a, b)
+
+
 if __name__ == "__main__":
     unittest.main()

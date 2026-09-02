@@ -18,6 +18,20 @@ the round of fixes that took the hub from "works" to "holds up under load", and
 the merge of the managed-routing line of work into the same tool.
 
 ### Fixed
+- **The hub forwards what the client actually sent.** `PASSTHROUGH_KEYS` was
+  an allow-list of the OpenAI fields this code happened to know about, and
+  the failure direction was wrong. Measured against a provider that echoes
+  its request, a client sending `logprobs`, `top_logprobs`, `logit_bias`,
+  `parallel_tool_calls`, `reasoning_effort` and `service_tier` got **none of
+  the six forwarded and no error** — a proxy answering a different question
+  than the one it was asked, and (since the cache keys on the forwarded
+  fields) sharing one cached answer across all of them. Inverted to
+  `HUB_OWNED_KEYS`: only `model`, `messages`, `stream`, `stream_options` and
+  lmm's own `lmm_*` controls are withheld, because the hub rewrites those.
+  An unfamiliar field now reaches the provider, which either accepts it or
+  rejects it by name.
+
+### Fixed
 - **`lmm stop` stops what it names, and nothing else.** Detection and
   stopping both went through a shell — `pgrep -fl 'a' 'b' ...` and
   `pkill -f '<name>'` — and all three consequences were measured:
