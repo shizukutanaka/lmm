@@ -628,6 +628,17 @@ So **`models_cmd` runs only from your own config** (`~/.lmm/config.json` or
 `~/.config/lmm/config.json`); from a working-directory file it is ignored with a
 warning. Everything else in a local config still applies.
 
+## What the hub forwards
+
+Everything your client sent, except the handful of fields the hub genuinely
+owns: `model` (routing picks the provider and the real model id), `messages`,
+`stream` / `stream_options` (the hub chooses its own upstream mode), and its
+own `lmm_cascade` / `lmm_no_cache` controls. A field this code has never heard
+of is **forwarded**, not dropped — the provider either accepts it or rejects it
+by name, and both beat silence. Measured before this held: a client sending
+`logprobs`, `top_logprobs`, `logit_bias`, `parallel_tool_calls`,
+`reasoning_effort` and `service_tier` had all six silently discarded.
+
 ## What `lmm stop` stops
 
 `lmm stop <runtime>` matches the process **image name** exactly and signals

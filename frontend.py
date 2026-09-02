@@ -532,7 +532,7 @@ def cmd_serve_hub(cfg, host, port, quiet=False):
                 return
             no_cache = (bool(req.get("lmm_no_cache"))
                         or self.headers.get("X-LMM-No-Cache") is not None)
-            extra = {k: req[k] for k in PASSTHROUGH_KEYS if k in req}
+            extra = passthrough(req)
             hub_opts = {"cascade": bool(req.get("lmm_cascade")),
                         "cache": not no_cache, "extra": extra, "source": "hub",
                         "breaker": hub_breaker}

@@ -1453,9 +1453,35 @@ def chunk_tool_text(chunk):
 
 # Request fields we hand straight to the backend. Anything else in an incoming
 # hub request is lmm's business, not the provider's.
-PASSTHROUGH_KEYS = ("temperature", "max_tokens", "max_completion_tokens", "top_p",
-                    "stop", "presence_penalty", "frequency_penalty", "seed",
-                    "response_format", "tools", "tool_choice", "n", "user")
+# What the hub does NOT forward to the provider: the fields it owns itself
+# (the ones it rewrites, or its own `lmm_*` controls). Everything else the
+# client sent goes through untouched.
+#
+# This was an allow-list of the OpenAI fields we happened to know about, and
+# the failure direction was wrong. Measured against a provider that echoes
+# what it receives, a client sending `logprobs`, `top_logprobs`,
+# `logit_bias`, `parallel_tool_calls`, `reasoning_effort` and
+# `service_tier` got NONE of them forwarded and no error -- a proxy silently
+# answering a different question than the one it was asked. OpenAI adds
+# fields faster than a hardcoded list can track them.
+#
+# Inverted, an unknown field reaches the provider: either it works, or the
+# provider rejects it by name and the client can see why. Both are better
+# than silence. The fields below are excluded because the hub genuinely
+# owns them, not because they are unfamiliar.
+HUB_OWNED_KEYS = frozenset((
+    "model",            # routing decides this; a provider alias is not a model id
+    "messages",         # assembled by as_messages
+    "stream",           # the hub chooses its own upstream streaming mode
+    "stream_options",   # ditto: it always asks upstream for usage
+    "lmm_cascade",      # lmm's own controls, meaningless to a provider
+    "lmm_no_cache",
+))
+
+
+def passthrough(req):
+    """The caller's request minus the fields the hub owns (see above)."""
+    return {k: v for k, v in (req or {}).items() if k not in HUB_OWNED_KEYS}
 
 
 def as_messages(prompt):
@@ -1502,9 +1528,9 @@ def call_provider(prov, prompt, temperature=0.7, extra=None,
         "messages": as_messages(messages if messages is not None else prompt),
         "temperature": temperature,
     }
-    for k in PASSTHROUGH_KEYS:                  # caller-supplied params win
-        if extra and k in extra and extra[k] is not None:
-            payload[k] = extra[k]
+    for k, v in (extra or {}).items():          # caller-supplied params win
+        if k not in HUB_OWNED_KEYS and v is not None:
+            payload[k] = v
     if stream:
         payload["stream"] = True
         return http_post_stream(url, payload, prov.get("api_key", ""))
@@ -1561,9 +1587,9 @@ def call_provider_stream(prov, prompt, temperature=0.7, extra=None):
     payload = {"model": prov["model"], "messages": as_messages(prompt),
                "temperature": temperature, "stream": True,
                "stream_options": {"include_usage": True}}
-    for k in PASSTHROUGH_KEYS:
-        if extra and k in extra and extra[k] is not None:
-            payload[k] = extra[k]
+    for k, v in (extra or {}).items():
+        if k not in HUB_OWNED_KEYS and v is not None:
+            payload[k] = v
     for frame in http_stream_sse(url, payload, prov.get("api_key", "")):
         yield frame
 
