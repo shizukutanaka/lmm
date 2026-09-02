@@ -2853,14 +2853,31 @@ def verify_answer(prompt, answer, cfg=None, judge=None, tool_calls=None):
     ptext = (prompt if isinstance(prompt, str) else messages_text(prompt)) or ""
     score, why = 1.0, []
 
-    m = next((k for k in VERIFY_REFUSAL_MARKERS if k in low), None)
-    if m:
-        score -= 0.5; why.append(f"refusal marker ({m.strip()})")
-    m = next((k for k in VERIFY_HEDGE_MARKERS if k in low), None)
-    if m:
-        score -= 0.15; why.append(f"hedging ({m.strip()})")
+    # Count the markers, don't stop at the first. `next(...)` deducted once
+    # however many fired, so "I think it might be 4, but I'm not sure,
+    # probably, maybe." -- five hedges -- scored the same 0.85 as one hedge
+    # and PASSED the 0.75 gate. The rule exists to catch that reply.
+    hedges = [k for k in VERIFY_HEDGE_MARKERS if k in low]
+    refusals = [k for k in VERIFY_REFUSAL_MARKERS if k in low]
+    if refusals:
+        score -= min(0.5 * len(refusals), 0.75)
+        why.append("refusal marker%s (%s)"
+                   % ("s" if len(refusals) > 1 else "",
+                      ", ".join(k.strip() for k in refusals[:3])))
+    if hedges:
+        score -= min(0.15 * len(hedges), 0.45)
+        why.append("hedging x%d (%s)" % (len(hedges),
+                                         ", ".join(k.strip() for k in hedges[:3]))
+                   if len(hedges) > 1
+                   else "hedging (%s)" % hedges[0].strip())
     if text.count("```") % 2 == 1:
         score -= 0.25; why.append("unclosed code fence")
+    elif " " not in text.strip():
+        # A single token is not a truncated sentence. This rule charged
+        # "Bonjour", "404", "4" and "Paris" 0.25 for missing terminal
+        # punctuation, landing every one of them at exactly 0.75 -- correct
+        # answers balanced on the gate, one deduction from being escalated.
+        pass
     elif text[-1] not in ".!?)\"'`}】。！？」…":
         score -= 0.25; why.append("truncated mid-sentence")
     lines = [l.strip() for l in text.splitlines() if l.strip()]
@@ -2870,7 +2887,15 @@ def verify_answer(prompt, answer, cfg=None, judge=None, tool_calls=None):
     if wants_code and "```" not in text:
         score -= 0.30; why.append("code was asked for, none returned")
     if len(text) < len(ptext) * 0.1 and ptext.count(".") + ptext.count("?") > 1:
-        score -= 0.20; why.append("answer far shorter than a multi-part prompt")
+        # 0.30, not 0.20, and on the same scale as "code was asked for, none
+        # returned": a reply under a tenth the length of a multi-part prompt
+        # is under-delivery of the same order. At 0.20 this rule could not
+        # fail the 0.75 gate on its own -- "ok" answering a four-sentence
+        # prompt scored 0.80 once the single-token exemption above (rightly)
+        # stopped calling it truncated. Brevity is judged against the prompt;
+        # that means THIS rule has to carry the weight, not a punctuation
+        # check that happened to fire.
+        score -= 0.30; why.append("answer far shorter than a multi-part prompt")
 
     # Hallucination canary: a latin fragment fused to kana/kanji mid-word
     # ('propagレーション'). Only anomalous when the CONVERSATION isn't

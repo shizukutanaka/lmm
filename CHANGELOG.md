@@ -18,6 +18,22 @@ the round of fixes that took the hub from "works" to "holds up under load", and
 the merge of the managed-routing line of work into the same tool.
 
 ### Fixed
+- **The grader's own rules now bite.** On `--verify` the grader is the
+  gatekeeper, where a bad answer getting *through* is what costs, and two
+  rules were measured not doing their job. Markers were counted with
+  `next(...)`, so only the first ever scored — "I think it might be 4, but
+  I'm not sure, probably, maybe.", five hedge markers, scored the same 0.85
+  as one hedge and **passed the 0.75 gate**; both marker rules now count what
+  fired (capped, naming the first three), and a single marker still scores
+  exactly what it did. And "truncated mid-sentence" fired on complete
+  single-token answers: "Bonjour", "404", "4" and "Paris" each lost 0.25 and
+  landed on **exactly 0.75**, correct answers balanced on the gate. A single
+  token is not a truncated sentence. Removing that exemption exposed the
+  multi-part rule leaning on it — "ok" answering a four-sentence prompt then
+  scored 0.80 — so that rule now carries its own weight at 0.30, the same as
+  "code was asked for, none returned".
+
+### Fixed
 - **The answer grader no longer escalates correct answers.** The cascade
   exists to spend less: try the cheap model, stop when the answer is good
   enough. But `verify_answer` opened with `len(text.split()) < 3 -> 0.0,
