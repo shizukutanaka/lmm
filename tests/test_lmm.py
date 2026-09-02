@@ -6458,5 +6458,86 @@ class TestInvariantsHoldAtEveryCallSiteSurvivesElenchus(unittest.TestCase):
                                   "exempting a function that does not exist")
 
 
+class TestTheReadmeDocumentsWhatShipsSurvivesElenchus(unittest.TestCase):
+    """A command that exists but is not in the README is a feature nobody can
+    find; a README line that no longer runs is a broken promise. Both are
+    invisible to a suite that only tests functions.
+
+    Measured: every one of the 16 runnable `lmm ...` invocations the README
+    shows works as written (exit 0, or the honest non-zero of a command with
+    nothing to act on) -- that claim is ACQUITTED. But the parser registered
+    26 commands and the README's table listed 21: `doctor`, `selftest`,
+    `stats`, `log` and `secrets` shipped undiscoverable. `secrets` is the
+    sharpest of those: it exists to gate a commit, and nothing told anyone.
+
+    Only one direction is asserted. The reverse -- "every command named in
+    the README exists" -- looks equally reasonable and is not checkable
+    without lying: my first sweep flagged `lmm cli` from the sentence
+    "`lmm cli` exited 2, both because those two lists disagreed", which is
+    correct prose about a bug that was fixed. A test that cannot tell
+    documentation from history would demand that history be falsified.
+    """
+
+    def _registered(self):
+        import ast
+        root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        with open(os.path.join(root, "frontend.py"), encoding="utf-8") as fh:
+            tree = ast.parse(fh.read())
+        main = next(n for n in tree.body
+                    if isinstance(n, ast.FunctionDef) and n.name == "main")
+        return {n.args[0].value for n in ast.walk(main)
+                if isinstance(n, ast.Call)
+                and isinstance(n.func, ast.Attribute)
+                and n.func.attr == "add_parser" and n.args
+                and isinstance(n.args[0], ast.Constant)}
+
+    def _readme(self):
+        root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        with open(os.path.join(root, "README.md"), encoding="utf-8") as fh:
+            return fh.read()
+
+    def test_every_command_that_ships_is_in_the_readme(self):
+        import re
+        md = self._readme()
+        documented = (set(re.findall(r"^lmm ([a-z][a-z-]*)", md, re.M))
+                      | set(re.findall(r"`lmm ([a-z][a-z-]*)", md)))
+        missing = sorted(self._registered() - documented)
+        self.assertEqual(missing, [], "command(s) users cannot discover: %s"
+                         % missing)
+
+    def test_every_command_the_readme_shows_is_a_real_command(self):
+        """The other direction of the same promise, checked deterministically.
+
+        This began as a subprocess fan-out that ran all 16 documented
+        invocations for real. It duplicated TestCliSmoke (15 commands,
+        already stable) and cost 11 interpreter spawns, and it proved
+        unstable here: one run took 181s and errored, three consecutive runs
+        failed, eight later runs passed, always in step with the machine
+        being slow. "Could not reproduce" is not a root cause -- but neither
+        is a test that fails for reasons unrelated to its claim, and I said
+        as much about a sweep that cried wolf earlier in this same suite.
+        So the execution half is deleted (TestCliSmoke covers it) and the
+        claim is kept where it can be answered exactly: every command token
+        the README shows must be one the parser registers.
+        """
+        import re
+        registered = self._registered()
+        shown = set()
+        for block in re.findall(r"```(?:sh|bash|console)?\n(.*?)```",
+                                self._readme(), re.S):
+            for line in block.splitlines():
+                line = line.strip()
+                if not line.startswith("lmm "):
+                    continue
+                head = line.split("->")[0].split("#")[0].strip().split()
+                if len(head) > 1 and re.fullmatch(r"[a-z][a-z-]*", head[1]):
+                    shown.add(head[1])
+        self.assertTrue(shown, "the README's command block moved")
+        unreal = sorted(shown - registered)
+        self.assertEqual(unreal, [],
+                         "the README shows command(s) that do not exist: %s"
+                         % unreal)
+
+
 if __name__ == "__main__":
     unittest.main()

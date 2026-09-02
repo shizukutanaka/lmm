@@ -88,6 +88,14 @@ lmm dash            -> generate + open a self-contained HTML dashboard
 lmm gui             -> open the live GUI dashboard (Windows: minimizes to tray)
 lmm config <init|list|get|set|unset> [key] [value] -> manage hub settings (CLI)
 lmm examples        -> print a sample config file
+
+# --- checking your own setup ---
+lmm doctor          -> probe every configured provider and say what is wrong
+lmm selftest        -> the tool measuring itself (--guard: failures only, exit code is the verdict)
+lmm config validate -> check the config against the schema lmm relies on (exits 1 if invalid)
+lmm secrets         -> scan the config for stored credentials (exits 2 if any; gates a commit)
+lmm stats           -> routing outcomes per provider, from measured results
+lmm log [-n N]      -> the recent metering trail, one line per call
 ```
 
 ### The hub: one endpoint, and a cheaper bill
