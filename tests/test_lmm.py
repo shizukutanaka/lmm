@@ -6059,5 +6059,107 @@ class TestPrivacyPinCoversTheJudgeSurvivesElenchus(unittest.TestCase):
                          "a second privacy check appeared beside the pin")
 
 
+class TestEveryPromptPathAsksThePinSurvivesElenchus(unittest.TestCase):
+    """Having closed the judge's door, ask the same question of every other
+    door: which code paths send a user's prompt to a provider, and do they
+    all consult pin_private?
+
+    `lmm bench --prompt` did not. It is the widest fan-out in the tool -- the
+    prompt goes to EVERY configured provider -- and measured, a prompt
+    matching route.private reached the remote ones in full. Fixing the judge
+    while leaving this is the same "one door out of two" error.
+    """
+
+    SECRET = "my patient's diagnosis is confidential"
+    PROVS = {"local": {"api_key": "k", "base_url": "http://127.0.0.1:11434/v1",
+                       "model": "m", "kind": "local"},
+             "cloud": {"api_key": "k", "base_url": "https://api.example.com/v1",
+                       "model": "big", "kind": "remote"}}
+
+    def _bench(self, providers, prompt):
+        import io
+        import contextlib
+        sent = []
+
+        def fake_stream(prov, p, temperature=0.7, extra=None, messages=None):
+            sent.append((prov.get("kind"), str(p)))
+            yield (b"", {"choices": [{"delta": {"content": "ok"}}]})
+            yield (b"", {"choices": [{"delta": {}}],
+                         "usage": {"prompt_tokens": 1, "completion_tokens": 1}})
+            yield (None, None)
+
+        saved = (lmm.call_provider_stream, lmm.local_ollama_provider)
+        lmm.call_provider_stream = fake_stream
+        lmm.local_ollama_provider = lambda: None
+        out = io.StringIO()
+        try:
+            cfg = {"route": {"private": ["patient", "confidential"]},
+                   "providers": providers}
+            with temp_state(), contextlib.redirect_stdout(out), \
+                    contextlib.redirect_stderr(out):
+                rc = frontend.cmd_bench(cfg, None, 1, prompt, 8)
+        finally:
+            lmm.call_provider_stream, lmm.local_ollama_provider = saved
+        return rc, sent, out.getvalue()
+
+    def test_bench_does_not_fan_a_private_prompt_out_to_the_cloud(self):
+        _rc, sent, _out = self._bench(dict(self.PROVS), self.SECRET)
+        self.assertTrue(sent, "nothing was benchmarked at all")
+        for kind, payload in sent:
+            self.assertEqual(kind, "local",
+                             "a private prompt reached a %s provider: %r"
+                             % (kind, payload[:60]))
+
+    def test_bench_refuses_when_only_remote_providers_remain(self):
+        rc, sent, out = self._bench({"cloud": self.PROVS["cloud"]}, self.SECRET)
+        self.assertNotEqual(rc, 0)
+        self.assertEqual(sent, [])
+        self.assertIn("refusing", out)
+
+    def test_an_ordinary_prompt_still_benches_everything(self):
+        """The other direction: pinning everything would gut the command."""
+        _rc, sent, _out = self._bench(dict(self.PROVS), "Count from 1 to 40")
+        self.assertIn("remote", [k for k, _p in sent])
+        self.assertIn("local", [k for k, _p in sent])
+
+    def test_every_prompt_sending_path_consults_the_pin(self):
+        """Structural, so the NEXT path added cannot quietly skip it. Any
+        function that calls a provider with a caller-supplied prompt must
+        also reach pin_private -- directly, or via one that does."""
+        import ast
+        root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        senders, pinned, calls = set(), set(), {}
+        for mod in ("backend.py", "frontend.py"):
+            with open(os.path.join(root, mod), encoding="utf-8") as fh:
+                tree = ast.parse(fh.read())
+            for fn in [n for n in ast.walk(tree)
+                       if isinstance(n, ast.FunctionDef)]:
+                names = {n.func.id for n in ast.walk(fn)
+                         if isinstance(n, ast.Call)
+                         and isinstance(n.func, ast.Name)}
+                names |= {n.func.attr for n in ast.walk(fn)
+                          if isinstance(n, ast.Call)
+                          and isinstance(n.func, ast.Attribute)}
+                calls[fn.name] = names
+                if names & {"call_provider", "call_provider_stream",
+                            "call_with_retry"}:
+                    senders.add(fn.name)
+                if "pin_private" in names:
+                    pinned.add(fn.name)
+        # Reachability: a sender is covered if it pins, or if some pinning
+        # function calls it.
+        covered = set(pinned)
+        for _ in range(4):
+            for fn, names in calls.items():
+                if fn in covered:
+                    covered |= (names & senders)
+        # These send a FIXED prompt of their own, never the user's.
+        exempt = {"bench_once", "judge_answer", "cmd_selftest", "cmd_doctor"}
+        uncovered = senders - covered - exempt
+        self.assertEqual(uncovered, set(),
+                         "prompt-sending path(s) that never reach "
+                         "pin_private: %s" % sorted(uncovered))
+
+
 if __name__ == "__main__":
     unittest.main()
