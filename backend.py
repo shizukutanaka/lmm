@@ -3451,6 +3451,21 @@ def hub_complete(cfg, messages, targets, opts=None):
     judge = None
     if use_cascade and casc.get("judge"):
         judge = merged_providers(cfg).get(casc["judge"])
+        # The privacy pin filters TARGETS, and the judge is not a target --
+        # it is a second opinion that receives the prompt AND the answer in
+        # full. Measured: with route.private matching, pin_private correctly
+        # kept only the local provider, and the same prompt then went to a
+        # remote judge verbatim. A guard that stops one path out of two is
+        # not a guard. The pin is the single privacy authority, so the judge
+        # is asked through it: a non-local judge is dropped for a private
+        # prompt, and the answer is graded without a second opinion.
+        if judge is not None:
+            kept, _refused = pin_private(cfg, messages,
+                                         [(casc["judge"], judge)])
+            if not kept:
+                judge = None
+                trace.append("[private] judge %r is not local -- grading "
+                             "without a second opinion" % casc["judge"])
     threshold = float(casc.get("threshold", 0.6))
     retry = merged_retry(cfg)
     breaker = opts.get("breaker")

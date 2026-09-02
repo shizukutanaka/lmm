@@ -5972,5 +5972,92 @@ class TestNoPaidCallIsBookedFreeSurvivesElenchus(unittest.TestCase):
                                "stream=%s booked a paid call as free" % stream)
 
 
+class TestPrivacyPinCoversTheJudgeSurvivesElenchus(unittest.TestCase):
+    """`pin_private` is documented as the single privacy authority: a prompt
+    matching route.private has non-local targets REMOVED, and is refused
+    outright when nothing local remains. Derive the consequence -- then no
+    path may carry that prompt to a remote provider.
+
+    The judge is not a target. `verify_answer(..., judge=...)` sends the
+    prompt AND the answer verbatim to whatever provider `cascade.judge`
+    names, and that lookup went straight to merged_providers(). Measured:
+    pin_private correctly kept only the local provider, and the same private
+    prompt then went to a remote judge in full. A guard that stops one path
+    out of two is not a guard.
+    """
+
+    SECRET = "my patient's diagnosis is confidential"
+    PROVIDERS = {
+        "local": {"api_key": "k", "base_url": "http://127.0.0.1:11434/v1",
+                  "model": "m", "kind": "local"},
+        "cloudjudge": {"api_key": "k", "base_url": "https://api.example.com/v1",
+                       "model": "big", "kind": "remote"},
+        "localjudge": {"api_key": "k", "base_url": "http://127.0.0.1:11434/v1",
+                       "model": "j", "kind": "local"},
+    }
+
+    def _run(self, prompt, judge):
+        sent = []
+
+        def fake(prov, p, temperature=0.7, extra=None, messages=None,
+                 stream=False):
+            sent.append((prov.get("kind"), str(p)))
+            return {"choices": [{"message": {"content": "ok"}}],
+                    "usage": {"prompt_tokens": 1, "completion_tokens": 1}}
+
+        saved = lmm.call_provider
+        lmm.call_provider = fake
+        try:
+            cfg = {"providers": dict(self.PROVIDERS),
+                   "route": {"private": ["patient", "confidential"]},
+                   "cascade": {"enabled": True, "judge": judge,
+                               "threshold": 0.6},
+                   "cache": {"enabled": False}}
+            with temp_state():
+                lmm.hub_complete(cfg, [{"role": "user", "content": prompt}],
+                                 [("local", self.PROVIDERS["local"])],
+                                 {"cascade": True, "cache": False})
+        finally:
+            lmm.call_provider = saved
+        leaked = any(k != "local" and prompt in p for k, p in sent)
+        judged = any("Grade how well" in p for _k, p in sent)
+        return leaked, judged
+
+    def test_a_private_prompt_never_reaches_a_remote_judge(self):
+        leaked, judged = self._run(self.SECRET, "cloudjudge")
+        self.assertFalse(leaked, "the private prompt reached a remote judge")
+        self.assertFalse(judged, "it was graded remotely anyway")
+
+    def test_a_local_judge_still_grades_a_private_prompt(self):
+        """The other direction: dropping every judge would pass the test
+        above and quietly delete a feature."""
+        leaked, judged = self._run(self.SECRET, "localjudge")
+        self.assertFalse(leaked)
+        self.assertTrue(judged, "a local judge was refused for no reason")
+
+    def test_an_ordinary_prompt_still_uses_the_configured_judge(self):
+        leaked, judged = self._run("what is 2+2", "cloudjudge")
+        self.assertTrue(judged, "the judge was dropped for a public prompt")
+        self.assertTrue(leaked)      # it is simply the configured provider
+
+    def test_the_pin_is_still_the_one_authority(self):
+        """Structural: the judge decision must go through pin_private, not a
+        second private-prompt check written beside it."""
+        import ast
+        path = os.path.join(os.path.dirname(os.path.dirname(
+            os.path.abspath(__file__))), "backend.py")
+        with open(path, encoding="utf-8") as fh:
+            tree = ast.parse(fh.read())
+        fn = next(n for n in ast.walk(tree)
+                  if isinstance(n, ast.FunctionDef) and n.name == "hub_complete")
+        called = [n.func.id for n in ast.walk(fn)
+                  if isinstance(n, ast.Call) and isinstance(n.func, ast.Name)]
+        self.assertGreaterEqual(
+            called.count("pin_private"), 2,
+            "the judge must be asked through the same privacy authority")
+        self.assertNotIn("is_private", called,
+                         "a second privacy check appeared beside the pin")
+
+
 if __name__ == "__main__":
     unittest.main()

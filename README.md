@@ -633,6 +633,10 @@ because it is one word pays the expensive model for the questions the cheap
 one gets right; whether an answer is too short is judged against what the
 prompt asked for, not against a word count.
 
+A prompt pinned by `route.private` never leaves the machine — not to a
+provider, and not to `cascade.judge`, which sees the prompt and the answer in
+full. A non-local judge is dropped for such a prompt rather than consulted.
+
 `lmm config validate` exits non-zero on a bad config, and checks the values
 that would otherwise fail silently — a `cache.similarity` no cosine can reach,
 a `max_temp` below every temperature, a `route_threshold` outside the range the
