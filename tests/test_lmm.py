@@ -5714,5 +5714,68 @@ class TestGraderDoesNotEscalateCorrectAnswersSurvivesElenchus(unittest.TestCase)
                          "the cascade paid for the expensive rung anyway")
 
 
+class TestGraderRulesActuallyBiteSurvivesElenchus(unittest.TestCase):
+    """Last round fixed the grader escalating correct answers. The paired
+    consequence: on `--verify`, the same grader is the gatekeeper, and there
+    letting a bad answer THROUGH is what costs. Two rules that exist were
+    measured not doing their job.
+
+    1. Markers were counted with `next(...)`, so only the first ever scored.
+       "I think it might be 4, but I'm not sure, probably, maybe." -- five
+       hedge markers -- scored 0.85, exactly what one hedge scores, and
+       PASSED the 0.75 gate. The hedging rule exists to catch that reply.
+    2. "truncated mid-sentence" fired on any answer without terminal
+       punctuation, including complete single-token ones: "Bonjour", "404",
+       "4" and "Paris" each lost 0.25 and landed on exactly 0.75 -- correct
+       answers balanced on the gate, one deduction from being escalated.
+       A single token is not a truncated sentence.
+    """
+
+    def test_stacked_hedges_cost_more_than_one(self):
+        one = lmm.verify_answer("What is 2+2?",
+                                "I think the answer is 4 and that is correct.")[0]
+        many, why = lmm.verify_answer(
+            "What is 2+2?",
+            "I think it might be 4, but I'm not sure, probably, maybe.")
+        self.assertLess(many, one, "five hedges scored like one: %s" % why)
+        self.assertLess(many, lmm.VERIFY_GATE, "a hedged non-answer passed")
+
+    def test_stacked_refusal_markers_cost_more_than_one(self):
+        one = lmm.verify_answer("Name the CEO.",
+                                "I cannot help with that request, sorry.")[0]
+        many = lmm.verify_answer(
+            "Name the CEO.",
+            "I cannot help. I am unable to browse. As an AI, I don't have "
+            "access, sorry, i must decline.")[0]
+        self.assertLess(many, one)
+        self.assertGreaterEqual(many, 0.0)      # still clamped
+
+    def test_one_hedge_still_scores_what_it_always_did(self):
+        """Counting must not silently re-tune the single-marker case."""
+        score, why = lmm.verify_answer(
+            "What is 2+2?", "I think the answer is 4 and that is correct.")
+        self.assertAlmostEqual(score, 0.85, places=6)
+        self.assertEqual(why, ["hedging (i think)"])
+
+    def test_a_single_token_is_not_a_truncated_sentence(self):
+        for prompt, answer in (("Translate 'hello' to French.", "Bonjour"),
+                               ("HTTP status code for not found?", "404"),
+                               ("What is 2+2?", "4"),
+                               ("What is the capital of France?", "Paris")):
+            with self.subTest(answer=answer):
+                score, why = lmm.verify_answer(prompt, answer)
+                self.assertNotIn("truncated mid-sentence", why)
+                self.assertGreater(score, lmm.VERIFY_GATE,
+                                   "%r sits on the gate: %s" % (answer, why))
+
+    def test_a_real_truncation_is_still_caught(self):
+        """The other direction: a rule that never fires is not a rule."""
+        for answer in ("The answer is 4 because addition combines the two",
+                       "It works because the"):
+            with self.subTest(answer=answer):
+                _score, why = lmm.verify_answer("Explain addition.", answer)
+                self.assertIn("truncated mid-sentence", why)
+
+
 if __name__ == "__main__":
     unittest.main()
