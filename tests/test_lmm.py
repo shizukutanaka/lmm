@@ -1823,6 +1823,26 @@ class TestHubSecurity(unittest.TestCase):
             self.assertTrue(allowed, host)
             self.assertEqual(lines, [])
 
+    def test_an_empty_host_is_not_loopback_it_is_every_interface(self):
+        """Socratic consequence of "reachability is the entire security
+        boundary": whatever hub_bind_check calls loopback must actually be
+        unreachable from the network. Measured: HTTPServer(("", 0)) listens
+        on 0.0.0.0 and accepts a connection on the LAN address. "" was in
+        LOOPBACK_HOSTS, so `--host ""` bound everywhere with no token and no
+        warning."""
+        import socket
+        import http.server
+        srv = http.server.HTTPServer(("", 0), http.server.BaseHTTPRequestHandler)
+        try:
+            self.assertEqual(srv.server_address[0], "0.0.0.0")   # the fact
+        finally:
+            srv.server_close()
+        self.assertFalse(lmm.is_loopback(""))                    # the rule
+        allowed, lines = lmm.hub_bind_check("", lmm.merged_hub({}),
+                                            lambda: "SUGGESTED")
+        self.assertFalse(allowed)
+        self.assertIn("refusing", "\n".join(lines))
+
     def test_non_loopback_without_token_is_refused(self):
         allowed, lines = lmm.hub_bind_check("0.0.0.0", lmm.merged_hub({}),
                                             lambda: "SUGGESTED")

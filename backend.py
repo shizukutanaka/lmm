@@ -1136,7 +1136,12 @@ def merged_hub(cfg):
     return h
 
 
-LOOPBACK_HOSTS = ("127.0.0.1", "localhost", "::1", "")
+# "" is deliberately NOT here. It reads like "no host" but to the socket
+# layer it is INADDR_ANY: measured, a server bound to "" listened on 0.0.0.0
+# and accepted a connection on the machine's LAN address. Classifying it as
+# loopback let `--host ""` publish the hub -- and the API keys behind it --
+# with no token and no warning.
+LOOPBACK_HOSTS = ("127.0.0.1", "localhost", "::1")
 
 
 def is_loopback(host):
