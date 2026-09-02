@@ -2315,15 +2315,33 @@ class TestCliSmoke(unittest.TestCase):
             [sys.executable, os.path.join(self.root, "lmm.py")] + args,
             capture_output=True, timeout=120, env=env)
 
+    # Commands that ACT on a provider or a model have nothing to act on with
+    # zero configuration, and a CLI must say so through its exit status --
+    # `lmm ask` used to exit 0 with its failure on stdout, so a script could
+    # not tell an answer from an outage. These may exit non-zero; they may
+    # not crash.
+    NEEDS_A_TARGET = ("ask", "bench", "fit")
+
     def test_every_command_succeeds_with_no_config(self):
-        # The tool's core promise is that it works with zero configuration.
+        # The tool's core promise is that it works with zero configuration:
+        # every command runs, none traceback, and the ones that have
+        # something to show with no config at all exit 0.
         for args in self.COMMANDS:
             with self.subTest(cmd=" ".join(args)):
                 r = self.run_cmd(args)
-                self.assertEqual(r.returncode, 0,
-                                 "lmm %s exited %d\n%s" % (
-                                     " ".join(args), r.returncode,
-                                     r.stderr.decode()[:400]))
+                err = r.stderr.decode()
+                self.assertNotIn("Traceback", err, "lmm %s crashed\n%s"
+                                 % (" ".join(args), err[:400]))
+                if args[0] in self.NEEDS_A_TARGET:
+                    self.assertIn(r.returncode, (1, 2),
+                                  "lmm %s has nothing to act on and must say "
+                                  "so via its exit status, got %d"
+                                  % (" ".join(args), r.returncode))
+                else:
+                    self.assertEqual(r.returncode, 0,
+                                     "lmm %s exited %d\n%s" % (
+                                         " ".join(args), r.returncode,
+                                         err[:400]))
 
     def test_every_command_says_something(self):
         # Silence is how `lmm hide` hid a missing dispatch branch for months.
@@ -3507,12 +3525,15 @@ class TestMergedCommands(unittest.TestCase):
     """Behaviour that exists because two branches each solved half of it."""
 
     def _capture(self, fn, *a, **kw):
+        """Both streams, joined: diagnostics go to stderr now (stdout is the
+        answer and nothing else), and these tests assert on what is SAID,
+        not on which stream said it."""
         import io
         import contextlib
-        buf = io.StringIO()
-        with contextlib.redirect_stdout(buf):
+        out, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
             fn(*a, **kw)
-        return buf.getvalue()
+        return out.getvalue() + err.getvalue()
 
     def test_discover_save_seeds_ask_order_from_what_is_running(self):
         saved_home, saved_disc = lmm.HOME, lmm.discover
@@ -5282,6 +5303,139 @@ class TestCacheAnswersTheAskedQuestionSurvivesElenchus(unittest.TestCase):
             lmm.embed_text = saved_embed
         self.assertIsNone(entry)
         self.assertNotEqual(how, "semantic")
+
+
+class TestAskIsScriptableSurvivesElenchus(unittest.TestCase):
+    """The README places `lmm ask` on the same code path as the hub an app
+    points at. Derive the consequence: a CLI on that path must be usable FROM
+    a script -- `answer=$(lmm ask ...)` and `lmm ask ... || fallback` must
+    mean what they say. Exit status and the stdout/stderr split are the
+    contract a CLI has with the shell.
+
+    Measured before the fix, with no provider configured: `lmm ask hi` exited
+    0 and printed "[ask] no provider available" to STDOUT, so the shell
+    captured the failure as the answer and never took the fallback branch.
+    `lmm bench` also exited 0 with nothing measured. frontend.py contained
+    zero writes to sys.stderr.
+    """
+
+    NOPROV = {"providers": {}, "ask_order": []}
+
+    def _run(self, fn, *a, **k):
+        import io
+        import contextlib
+        out, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            rc = fn(*a, **k)
+        return rc, out.getvalue(), err.getvalue()
+
+    def test_a_failed_ask_exits_non_zero_and_keeps_stdout_clean(self):
+        saved = lmm.local_ollama_provider
+        lmm.local_ollama_provider = lambda: None       # no safety net
+        try:
+            with temp_state():
+                rc, out, err = self._run(frontend.cmd_ask, "hi", None, self.NOPROV)
+        finally:
+            lmm.local_ollama_provider = saved
+        self.assertNotEqual(rc, 0)
+        self.assertEqual(out, "")                      # $(lmm ask) gets nothing
+        self.assertIn("no provider available", err)    # the reason, on stderr
+
+    def test_an_unknown_provider_is_a_failure_too(self):
+        with temp_state():
+            rc, out, err = self._run(frontend.cmd_ask, "hi", "nope", self.NOPROV)
+        self.assertNotEqual(rc, 0)
+        self.assertEqual(out, "")
+        self.assertIn("unknown provider", err)
+
+    def test_a_successful_ask_exits_zero_with_only_the_answer_on_stdout(self):
+        stub = StubBackend()
+        try:
+            cfg = {"providers": {"stub": {
+                "api_key": "k", "base_url": stub.base_url, "model": "m",
+                "kind": "local"}}, "ask_order": ["stub"]}
+            with temp_state():
+                rc, out, err = self._run(frontend.cmd_ask, "2+2?", "stub", cfg,
+                                         explain=True)
+        finally:
+            stub.stop()
+        self.assertEqual(rc, 0)
+        self.assertIn("The answer is 4", out)
+        self.assertNotIn("[route]", out)               # trace lines are not the answer
+        self.assertNotIn("[warn]", out)
+
+    def test_an_empty_prompt_is_a_usage_error(self):
+        with temp_state():
+            rc, out, err = self._run(frontend.cmd_ask, "   ", None, self.NOPROV)
+        self.assertEqual(rc, 2)
+        self.assertIn("usage:", err)
+
+    def test_bench_with_nothing_to_measure_fails(self):
+        saved = lmm.local_ollama_provider
+        lmm.local_ollama_provider = lambda: None
+        try:
+            with temp_state():
+                rc, _out, err = self._run(frontend.cmd_bench, self.NOPROV)
+        finally:
+            lmm.local_ollama_provider = saved
+        self.assertNotEqual(rc, 0)
+        self.assertIn("no provider available", err)
+
+    def test_fit_that_cannot_size_the_model_fails(self):
+        saved = lmm.ollama_model_info
+        lmm.ollama_model_info = lambda name: None
+        try:
+            rc, out, _err = self._run(frontend.cmd_fit, "no-such-model:1b",
+                                      None, 8.0, "f16", False)
+        finally:
+            lmm.ollama_model_info = saved
+        self.assertNotEqual(rc, 0)
+        self.assertIn("no metadata", out)              # the table still prints
+
+    def test_main_carries_the_status_to_the_shell(self):
+        """The wiring, not just the function: main() must sys.exit with it."""
+        saved_argv, saved_lo = sys.argv, lmm.local_ollama_provider
+        saved_cfg = frontend.load_config
+        lmm.local_ollama_provider = lambda: None
+        frontend.load_config = lambda: dict(self.NOPROV)
+        try:
+            with temp_state():
+                sys.argv = ["lmm", "ask", "hi"]
+                with self.assertRaises(SystemExit) as cm:
+                    self._run(frontend.main)
+        finally:
+            sys.argv, lmm.local_ollama_provider = saved_argv, saved_lo
+            frontend.load_config = saved_cfg
+        self.assertNotEqual(cm.exception.code, 0)
+
+    def test_every_hub_error_has_the_one_shape_openai_clients_parse(self):
+        """Two error shapes for one server: 400 unknown-model used the
+        OpenAI object form, 502/404 used a bare string. The SDK reads
+        `error.message` and found nothing on the string."""
+        cfg = {"providers": {"dead": {
+            "api_key": "k", "base_url": "http://127.0.0.1:9/v1", "model": "m",
+            "kind": "local"}}, "ask_order": ["dead"]}
+        saved = lmm.local_ollama_provider
+        lmm.local_ollama_provider = lambda: None
+        try:
+            with temp_state():
+                hub = HubServer(cfg)
+                seen = []
+                for path, body in (("/v1/chat/completions",
+                                    {"model": "dead", "messages": [
+                                        {"role": "user", "content": "hi"}]}),
+                                   ("/v1/nope", {"x": 1}),
+                                   ("/v1/nothing", None)):
+                    code, text = hub.request(path, body)
+                    seen.append((path, code, json.loads(text)))
+        finally:
+            lmm.local_ollama_provider = saved
+        for path, code, body in seen:
+            self.assertGreaterEqual(code, 400, path)
+            self.assertIsInstance(body.get("error"), dict, (path, body))
+            self.assertIn("message", body["error"], path)
+            self.assertIn("type", body["error"], path)
+        self.assertEqual(seen[0][1], 502)
 
 
 if __name__ == "__main__":

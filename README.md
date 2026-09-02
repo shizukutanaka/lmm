@@ -628,6 +628,23 @@ So **`models_cmd` runs only from your own config** (`~/.lmm/config.json` or
 `~/.config/lmm/config.json`); from a working-directory file it is ignored with a
 warning. Everything else in a local config still applies.
 
+## Using lmm from a script
+
+`lmm ask` keeps the shell's contract: the answer is the only thing on stdout,
+diagnostics (`[warn]`, `--explain` traces, failures) go to stderr, and the exit
+status says whether you got an answer — `0` yes, `1` no, `2` usage. So these
+mean what they say:
+
+```sh
+answer=$(lmm ask "summarize $file")        # the answer, or empty
+lmm ask "$q" --provider local || lmm ask "$q" --provider openai   # fall back
+```
+
+`lmm bench` exits 1 when nothing could be measured and `lmm fit` exits 1 when
+the model could not be sized. Measured before this held: `lmm ask` with no
+provider exited 0 and put its failure on stdout, so a script captured
+"[ask] no provider available" as the answer and never took the fallback.
+
 ## What lmm stores
 
 Two append-only JSONL files under `~/.lmm/`, both plain text you can `cat`:
