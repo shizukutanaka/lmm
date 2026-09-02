@@ -250,6 +250,15 @@ the merge of the managed-routing line of work into the same tool.
   to end (`price_for → usage_cost → log_usage → hub_cost_stats →
   cost_report`). It did; now it must keep doing so.
 
+### Added
+- **The README now documents every command that ships.** `doctor`,
+  `selftest`, `config validate`, `secrets`, `stats` and `log` all worked and
+  none appeared in the command table — 26 commands registered, 21 listed.
+  `secrets` was the sharpest omission: it exists to gate a commit by exiting
+  2 when a credential is stored in the config, and nothing told anyone it was
+  there. A test now fails if a registered command is absent from the README,
+  or if the README shows a command the parser does not register.
+
 ### Changed
 - **Invariants are checked as a table, not as one hand-written AST sweep per
   rule.** Five consecutive defects here were the same shape — an invariant
