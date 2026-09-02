@@ -628,6 +628,16 @@ So **`models_cmd` runs only from your own config** (`~/.lmm/config.json` or
 `~/.config/lmm/config.json`); from a working-directory file it is ignored with a
 warning. Everything else in a local config still applies.
 
+## What `lmm stop` stops
+
+`lmm stop <runtime>` matches the process **image name** exactly and signals
+those pids — it never uses a shell, never matches on a command line, and never
+returns its own process. That matters: the previous implementation ran
+`pkill -f '<name>'`, and `-f` matches the whole command line, so `lmm stop
+ollama` could match `python lmm.py stop ollama` and the shell it was typed into.
+Runtime names from a working-directory config are ignored for the same reason
+`models_cmd` is: only your own config may name processes to terminate.
+
 ## Using lmm from a script
 
 `lmm ask` keeps the shell's contract: the answer is the only thing on stdout,

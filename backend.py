@@ -35,6 +35,7 @@ import hashlib
 import struct
 import argparse
 import subprocess
+import signal
 import threading
 import datetime
 import contextlib
@@ -511,19 +512,102 @@ def run(cmd, timeout=25):
         return None
 
 
+def proc_list(names):
+    """Running processes whose IMAGE NAME is one of `names`, as (pid, name).
+
+    One authority for "is X running" and "stop X", with no shell in the
+    loop. Detection used `pgrep -fl 'a' 'b' ...` and stopping used
+    `pkill -f '<name>'`, both through `sh -c`. Three things were wrong
+    with that, each measured before this replaced it:
+
+      - `pgrep` takes ONE pattern: `pgrep -fl 'ollama' 'ollama app'` exits
+        2 with "only one pattern can be provided". Every registry entry
+        lists two or more names, so runtime detection returned 0 on every
+        Linux and macOS machine, silently.
+      - `-f` matches the whole COMMAND LINE, not the program. Running
+        `pgrep -fl 'zzz-ollama-marker'` from a process whose own argv
+        contained that word listed three pids: our own interpreter, the
+        invoking bash, and the `sh -c` wrapper. As `pkill`, `lmm stop
+        ollama` would have killed lmm itself and the shell it was typed
+        into -- plus any editor or log tail whose command line said
+        "ollama".
+      - The names reached `sh -c` inside single quotes, so a `procs` entry
+        could close the quote: with an `extra_runtimes` entry in a
+        WORKING-DIRECTORY lmm.config.json, `lmm stop <name>` ran arbitrary
+        shell. Measured: the payload's `touch` marker appeared. `models_cmd`
+        already had a trusted-config gate; `procs` was the same hole
+        through a different door.
+
+    Matching the process IMAGE NAME exactly (case-insensitive, Windows
+    `.exe` tolerated), with argv lists rather than a shell, answers the
+    question the registry actually asks. Never returns this process.
+    """
+    wanted = set()
+    for n in names or []:
+        n = (n or "").strip().lower()
+        if n:
+            wanted.add(n)
+            if n.endswith(".exe"):
+                wanted.add(n[:-4])
+    if not wanted:
+        return []
+    me = os.getpid()
+    out = []
+    try:
+        if os.name == "nt":
+            r = subprocess.run(["tasklist.exe", "/FO", "CSV", "/NH"],
+                               capture_output=True, timeout=25)
+            for line in r.stdout.decode("utf-8", "ignore").splitlines():
+                cells = [c.strip('"') for c in line.split('","')]
+                if len(cells) < 2:
+                    continue
+                img = cells[0].lower()
+                try:
+                    pid = int(cells[1])
+                except ValueError:
+                    continue
+                if pid != me and (img in wanted or img[:-4] in wanted):
+                    out.append((pid, cells[0]))
+        else:
+            r = subprocess.run(["ps", "-eo", "pid=,comm="],
+                               capture_output=True, timeout=25)
+            for line in r.stdout.decode("utf-8", "ignore").splitlines():
+                parts = line.strip().split(None, 1)
+                if len(parts) != 2:
+                    continue
+                pid, comm = parts
+                try:
+                    pid = int(pid)
+                except ValueError:
+                    continue
+                img = os.path.basename(comm).lower()
+                if pid != me and img in wanted:
+                    out.append((pid, comm))
+    except Exception:
+        return out
+    return out
+
+
 def proc_count(names):
     """Count running processes whose image name matches any of `names`
     (case-insensitive). Cross-platform."""
-    names = [n.lower() for n in names]
-    if os.name == "nt":
-        total = 0
-        for n in names:
-            r = run(f'tasklist.exe /FI "IMAGENAME eq {n}" /FO CSV /NH')
-            if r and r.stdout:
-                total += sum(1 for line in r.stdout.splitlines() if n in line.lower())
-        return total
-    r = run("pgrep -fl " + " ".join(f"'{n}'" for n in names) + " || true")
-    return len([l for l in (r.stdout or "").splitlines() if l.strip()]) if r else 0
+    return len(proc_list(names))
+
+
+def stop_procs(names):
+    """Terminate every process named in `names` (never this one). Returns
+    the (pid, name) pairs signalled. No shell: see proc_list."""
+    hit = proc_list(names)
+    for pid, _name in hit:
+        try:
+            if os.name == "nt":
+                subprocess.run(["taskkill.exe", "/PID", str(pid), "/F"],
+                               capture_output=True, timeout=25)
+            else:
+                os.kill(pid, signal.SIGTERM)
+        except Exception:
+            pass
+    return hit
 
 
 def app_data():
