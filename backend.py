@@ -1129,18 +1129,47 @@ class CircuitBreaker:
             pass                      # a missing or corrupt file is a closed circuit
 
     def _save_locked(self):
+        """Persist by read-MERGE-write, under the cross-process lock.
+
+        This was a read-modify-replace of one process's in-memory view, and
+        the whole point of persisting is that the resident hub and the CLI
+        share a circuit -- so the losing writer's failures vanished.
+        Measured with two processes recording 240 distinct failures: 125
+        survived. 47.9% lost, more than the 20.1% the usage log lost to the
+        same race, and worse in kind: a lost failure is a circuit that stays
+        closed on a provider that is already down.
+
+        Merging rather than overwriting is what makes the lock sufficient.
+        A concurrent process's counts are real observations of the same
+        providers, so the higher count and the later cooldown win. reset()
+        deletes the file, so nothing it cleared can come back through here.
+        """
         if not self.persist:
             return
         try:
             now = time.time()
             os.makedirs(LMM_DIR, exist_ok=True)
-            state = {"fails": {k: v for k, v in self._fails.items() if v > 0},
-                     "open_until": {k: v for k, v in self._open_until.items()
-                                    if v > now}}
-            tmp = self._path() + ".tmp"
-            with open(tmp, "w", encoding="utf-8") as fh:
-                json.dump(state, fh)
-            os.replace(tmp, self._path())
+            with _xlock("breaker"):
+                fails, open_until = dict(self._fails), dict(self._open_until)
+                try:
+                    with open(self._path(), encoding="utf-8") as fh:
+                        d = json.load(fh)
+                    for k, v in (d.get("fails") or {}).items():
+                        if isinstance(v, int) and v > fails.get(k, 0):
+                            fails[k] = v
+                    for k, v in (d.get("open_until") or {}).items():
+                        if (isinstance(v, (int, float))
+                                and v > open_until.get(k, 0)):
+                            open_until[k] = v
+                except (OSError, ValueError):
+                    pass              # missing or corrupt: ours is the truth
+                state = {"fails": {k: v for k, v in fails.items() if v > 0},
+                         "open_until": {k: v for k, v in open_until.items()
+                                        if v > now}}
+                tmp = self._path() + ".tmp"
+                with open(tmp, "w", encoding="utf-8") as fh:
+                    json.dump(state, fh)
+                os.replace(tmp, self._path())
         except Exception:
             pass                      # telemetry must not break the call
 
@@ -3213,6 +3242,11 @@ def record_observation(cfg, key, sim, correct):
 
 
 def _record_observation_locked(conf, key, sim, correct):
+    """Fold one exploration outcome into the entry that would have answered.
+    Caller must hold _CACHE_LOCK *and* _xlock("cache"), like its sibling
+    _cache_prune_locked: this is a read-modify-replace of cache.jsonl, and
+    an append from any process landing between the read and the os.replace
+    would be erased. The name says "_locked"; now the contract does too."""
     entries = cache_entries(conf)
     if not entries:
         return

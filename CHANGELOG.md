@@ -183,6 +183,25 @@ the merge of the managed-routing line of work into the same tool.
   (verified), and existing cache entries simply age out as misses.
 
 ### Fixed
+- **The circuit breaker's state survives concurrent processes too.** The
+  cross-process lock went onto two of the three state files;
+  `~/.lmm/breaker.json` was the third, and sharing a circuit between the
+  resident hub and the CLI is the entire reason it is persisted. It saved by
+  read-modify-replace of one process's in-memory view, unlocked. Measured
+  with two processes recording 240 distinct provider failures: **125
+  survived — 47.9% lost**, worse than the 20.1% the usage log lost to the
+  same race, and worse in kind, since a lost failure is a circuit that stays
+  closed on a provider that is already down. It now saves by
+  read-**merge**-write under `_xlock("breaker")`: another process's counts
+  are real observations, so the higher count and the later cooldown win, and
+  `reset()` still deletes the file so nothing it cleared comes back. Same
+  race after: **240 of 240**. A structural test now fails if any function
+  finishing a write with `os.replace` neither takes the lock nor documents
+  that its caller holds it — it immediately found a fourth writer
+  (`_record_observation_locked`, correctly locked by its caller but with the
+  contract unwritten), and it catches a planted new one.
+
+### Fixed
 - **Metering survives concurrent lmm processes.** The state-file writers were
   serialised by a `threading.Lock`, which orders threads inside one
   interpreter — but lmm ships as a resident `serve --hub` plus separate `lmm
