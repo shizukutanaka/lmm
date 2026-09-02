@@ -580,18 +580,24 @@ def cmd_stop(runtime, cfg):
     table = {k: list(v.get("procs", [])) for k, v in RUNTIME_REGISTRY.items()}
     table.update(STOP_TABLE)
     for e in cfg.get("extra_runtimes", []):
+        if not backend.CONFIG_TRUSTED:
+            # Same rule as models_cmd: a working-directory config is whatever
+            # repo you cd'd into, and it must not get to choose what
+            # `lmm stop` terminates. Only the user's own config may.
+            print("[stop] ignoring extra_runtimes from %s: not your own config"
+                  % backend.CONFIG_PATH, file=sys.stderr)
+            break
         table[e["name"].lower()] = e.get("procs", [])
     names = table.get((runtime or "").lower())
     if not names:
-        print("unknown runtime. choices:", ", ".join(sorted(table)))
-        return
-    for n in names:
-        if os.name == "nt":
-            r = backend.run(f'taskkill.exe /IM "{n}" /F')
-        else:
-            r = backend.run(f"pkill -f '{n}' || true")
-        ok = (r and r.returncode == 0) if r else False
-        print(f"stop {n}: {'ok' if ok else 'no-process-or-failed'}")
+        return fail("unknown runtime. choices: " + ", ".join(sorted(table)))
+    hit = backend.stop_procs(names)
+    if not hit:
+        print(f"stop {runtime}: no such process running")
+        return 0
+    for pid, name in hit:
+        print(f"stop {name} (pid {pid}): terminated")
+    return 0
 
 
 def cmd_dash(cfg):
@@ -2390,7 +2396,7 @@ def main():
         else:
             cmd_serve(args.model)
     elif cmd == "stop":
-        cmd_stop(args.runtime, cfg)
+        sys.exit(cmd_stop(args.runtime, cfg))
     elif cmd == "cache":
         cmd_cache(cfg, getattr(args, "clear", False))
     elif cmd == "selftest":

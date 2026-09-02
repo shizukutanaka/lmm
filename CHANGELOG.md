@@ -18,6 +18,30 @@ the round of fixes that took the hub from "works" to "holds up under load", and
 the merge of the managed-routing line of work into the same tool.
 
 ### Fixed
+- **`lmm stop` stops what it names, and nothing else.** Detection and
+  stopping both went through a shell — `pgrep -fl 'a' 'b' ...` and
+  `pkill -f '<name>'` — and all three consequences were measured:
+  - `pgrep` takes one pattern (`pgrep -fl 'ollama' 'ollama app'` exits 2,
+    "only one pattern can be provided"), and every registry entry lists two
+    or more names, so **runtime detection returned 0 on every Linux and
+    macOS machine**, silently.
+  - `-f` matches the command line, not the program. Run from a process whose
+    argv held the pattern, `pgrep -fl` listed three pids: our own
+    interpreter, the invoking bash, and the `sh -c` wrapper. As `pkill`,
+    `lmm stop ollama` would have killed lmm and the user's shell.
+  - A `procs` entry could close the shell quote: with an `extra_runtimes`
+    entry in a **working-directory** `lmm.config.json`, `lmm stop <name>`
+    ran arbitrary shell — measured, the payload's marker file appeared.
+    `models_cmd` already had a trusted-config gate; `procs` was the same
+    hole through another door.
+
+  One authority now answers both questions — `proc_list()` reads the process
+  table with argv lists (`ps -eo pid=,comm=` / `tasklist /FO CSV /NH`),
+  matches the image name whole, and never returns the calling process;
+  `stop_procs()` signals those pids directly. `lmm stop` also honours the
+  trusted-config rule, and now exits non-zero on an unknown runtime.
+
+### Fixed
 - **`--host ""` no longer publishes the hub.** `hub_bind_check` treats
   reachability as the entire security boundary — the hub holds your API keys
   — and refuses to bind beyond loopback without a token. But `""` was listed

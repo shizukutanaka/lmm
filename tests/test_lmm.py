@@ -5458,5 +5458,109 @@ class TestAskIsScriptableSurvivesElenchus(unittest.TestCase):
         self.assertEqual(seen[0][1], 502)
 
 
+class TestStopKillsOnlyWhatItNamesSurvivesElenchus(unittest.TestCase):
+    """`lmm stop <runtime>` names a runtime; the claim is that it stops that
+    runtime. Cross-examined, the implementation said otherwise. It ran
+    `pkill -f '<name>'` and `pgrep -fl 'a' 'b' ...` through a shell, and all
+    three consequences were measured:
+
+      - `pgrep -fl 'ollama' 'ollama app'` exits 2, "only one pattern can be
+        provided" -- every registry entry lists 2+ names, so detection
+        returned 0 on all Linux and macOS machines.
+      - `-f` matches the command line: run from a process whose argv held
+        the pattern, `pgrep -fl` listed our own interpreter, the invoking
+        bash, and the `sh -c` wrapper. As `pkill`, `lmm stop ollama` would
+        have killed lmm and the user's shell.
+      - a `procs` entry from a WORKING-DIRECTORY config closed the quote and
+        ran arbitrary shell; the payload's marker file appeared.
+    """
+
+    def setUp(self):
+        self._saved = (lmm.CONFIG_PATH, lmm.CONFIG_TRUSTED)
+
+    def tearDown(self):
+        lmm.CONFIG_PATH, lmm.CONFIG_TRUSTED = self._saved
+
+    def test_a_procs_entry_cannot_run_a_shell_command(self):
+        """The one that was exploitable. Even from the user's OWN config --
+        no shell means no injection, trusted or not."""
+        d = tempfile.mkdtemp(prefix="lmm-inject-")
+        marker = os.path.join(d, "pwned")
+        payload = "[z]zz-nomatch'; touch %s; echo '" % marker
+        try:
+            lmm.CONFIG_PATH, lmm.CONFIG_TRUSTED = "/home/u/.lmm/config.json", True
+            cfg = {"extra_runtimes": [{"name": "evil", "procs": [payload]}]}
+            import io
+            import contextlib
+            with contextlib.redirect_stdout(io.StringIO()), \
+                    contextlib.redirect_stderr(io.StringIO()):
+                frontend.cmd_stop("evil", cfg)
+            self.assertFalse(os.path.exists(marker), "procs entry ran a shell")
+            self.assertEqual(lmm.proc_list([payload]), [])
+        finally:
+            shutil.rmtree(d, ignore_errors=True)
+
+    def test_an_untrusted_config_does_not_choose_what_stop_kills(self):
+        """Same rule `models_cmd` already had: a config from the directory
+        you happened to cd into must not name processes to terminate."""
+        import io
+        import contextlib
+        lmm.CONFIG_PATH, lmm.CONFIG_TRUSTED = "lmm.config.json", False
+        cfg = {"extra_runtimes": [{"name": "evil", "procs": ["python"]}]}
+        err = io.StringIO()
+        with contextlib.redirect_stdout(io.StringIO()), \
+                contextlib.redirect_stderr(err):
+            rc = frontend.cmd_stop("evil", cfg)
+        self.assertNotEqual(rc, 0)                    # "evil" never registered
+        self.assertIn("ignoring extra_runtimes", err.getvalue())
+
+    def test_proc_list_never_returns_the_process_asking(self):
+        """`lmm stop` runs inside a python process; a matcher that can see
+        itself is a matcher that can kill itself."""
+        me = os.getpid()
+        for name in ("python", "python3", os.path.basename(sys.executable)):
+            self.assertNotIn(me, [pid for pid, _n in lmm.proc_list([name])],
+                             "proc_list returned its own pid for %r" % name)
+
+    def test_it_still_finds_and_stops_a_real_process(self):
+        """The other direction: a guard that stops nothing would pass every
+        test above. Start a real child, find it by name, stop it."""
+        child = subprocess.Popen(["sleep", "60"])
+        try:
+            found = [pid for pid, _n in lmm.proc_list(["sleep"])]
+            self.assertIn(child.pid, found, "proc_list missed a live process")
+            self.assertGreaterEqual(lmm.proc_count(["sleep"]), 1)
+            lmm.stop_procs(["sleep"])
+            self.assertEqual(child.wait(timeout=30), -15)   # SIGTERM
+        finally:
+            if child.poll() is None:
+                child.kill()
+                child.wait(timeout=10)
+
+    def test_a_partial_name_does_not_match(self):
+        """`-f` substring matching is what made `stop` hit bystanders. The
+        image name must match whole."""
+        child = subprocess.Popen(["sleep", "60"])
+        try:
+            for partial in ("sle", "eep", "leep"):
+                self.assertEqual(
+                    [pid for pid, _n in lmm.proc_list([partial])
+                     if pid == child.pid], [],
+                    "%r matched a process named sleep" % partial)
+        finally:
+            child.kill()
+            child.wait(timeout=10)
+
+    def test_an_unusable_process_table_is_not_a_crash(self):
+        """Telemetry-grade rule: probing must never break the command."""
+        saved = subprocess.run
+        try:
+            subprocess.run = lambda *a, **k: (_ for _ in ()).throw(OSError("no ps"))
+            self.assertEqual(lmm.proc_list(["sleep"]), [])
+            self.assertEqual(lmm.proc_count(["sleep"]), 0)
+        finally:
+            subprocess.run = saved
+
+
 if __name__ == "__main__":
     unittest.main()
