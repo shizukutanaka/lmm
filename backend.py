@@ -1106,30 +1106,73 @@ class CircuitBreaker:
         self._loaded = False
         self._fails = {}
         self._open_until = {}
+        self._mtime = -1.0
         self._lock = threading.Lock()
 
     def _path(self):
         return os.path.join(LMM_DIR, "breaker.json")
 
     def _load_locked(self):
-        if self._loaded or not self.persist:
+        """Re-read the persisted state whenever the file has changed.
+
+        This was a one-shot latch, and it made the read half of "the hub and
+        the CLI share a circuit" false. The write half was fixed first;
+        measured after it, a long-lived process still reported `closed` for a
+        provider a concurrent CLI run had just tripped `open`, and kept
+        sending traffic to it -- because it had loaded the file once, at
+        startup, and would never look again. A guard that only learns at
+        startup is a guard that never learns.
+
+        An mtime check is one stat per call, not a poll: cheap enough for the
+        per-provider `available()` question (measured at 3.3 us) and honest
+        about staleness. The merge takes the HIGHER count and the LATER
+        cooldown, matching the save side -- a failure another process saw is
+        a real observation of the same provider, and neither view may
+        silently lower the other.
+
+        The asymmetry is deliberate: bad news crosses immediately, good news
+        does not. A key another process deleted stays in our view until its
+        cooldown expires and `state()` reports half-open on its own, because
+        accepting deletions here would let one process's success erase
+        another's freshly observed failures -- the overwrite bug this whole
+        design exists to avoid. Losing a failure risks traffic to a provider
+        that is down; holding one a little too long costs at most one
+        cooldown, which is bounded and self-healing.
+        """
+        if not self.persist:
             return
-        self._loaded = True
+        try:
+            mtime = os.path.getmtime(self._path())
+        except OSError:
+            self._loaded = True       # no file yet: nothing to merge
+            return
+        if self._loaded and mtime <= self._mtime:
+            return
+        self._loaded, self._mtime = True, mtime
         try:
             with open(self._path(), encoding="utf-8") as fh:
                 d = json.load(fh)
             now = time.time()
             for k, v in (d.get("open_until") or {}).items():
-                if isinstance(v, (int, float)) and v > now:
-                    self._open_until.setdefault(k, v)
+                if (isinstance(v, (int, float)) and v > now
+                        and v > self._open_until.get(k, 0)):
+                    self._open_until[k] = v
             for k, v in (d.get("fails") or {}).items():
-                if isinstance(v, int) and v > 0:
-                    self._fails.setdefault(k, v)
+                if isinstance(v, int) and v > self._fails.get(k, 0):
+                    self._fails[k] = v
         except Exception:
             pass                      # a missing or corrupt file is a closed circuit
 
-    def _save_locked(self):
+    def _save_locked(self, drop=()):
         """Persist by read-MERGE-write, under the cross-process lock.
+
+        `drop` names providers this process has just seen RECOVER. A
+        deletion is an observation too, and the merge must not undo it: the
+        first version of this merge (which had no `drop`) read our own
+        just-cleared failure back out of the file, so `record_success`
+        became a no-op and a recovered provider stayed open until its
+        cooldown expired. Measured, and a regression of my own making --
+        the overwrite it replaced got this right by accident.
 
         This was a read-modify-replace of one process's in-memory view, and
         the whole point of persisting is that the resident hub and the CLI
@@ -1155,9 +1198,13 @@ class CircuitBreaker:
                     with open(self._path(), encoding="utf-8") as fh:
                         d = json.load(fh)
                     for k, v in (d.get("fails") or {}).items():
+                        if k in drop:
+                            continue
                         if isinstance(v, int) and v > fails.get(k, 0):
                             fails[k] = v
                     for k, v in (d.get("open_until") or {}).items():
+                        if k in drop:
+                            continue
                         if (isinstance(v, (int, float))
                                 and v > open_until.get(k, 0)):
                             open_until[k] = v
@@ -1180,7 +1227,7 @@ class CircuitBreaker:
             self._fails.pop(name, None)
             self._open_until.pop(name, None)
             if changed:               # healthy steady state writes nothing
-                self._save_locked()
+                self._save_locked(drop=(name,))
 
     def record_failure(self, name, now=None):
         now = time.time() if now is None else now
@@ -1213,6 +1260,7 @@ class CircuitBreaker:
             self._fails.clear()
             self._open_until.clear()
             self._loaded = False
+            self._mtime = -1.0
             try:
                 os.remove(self._path())
             except OSError:

@@ -6276,5 +6276,109 @@ for i in range(n):
                          "cross-process lock: %s" % offenders)
 
 
+class TestBreakerIsSharedInBothDirectionsSurvivesElenchus(unittest.TestCase):
+    """Last round fixed the WRITE half of "the hub and the CLI share a
+    circuit" (240 of 240 failures now survive a race). The paired
+    consequence, unmeasured until now: the READ half.
+
+    `_load_locked` was a one-shot latch, so a long-lived process read
+    breaker.json once at startup and never again. Measured after the write
+    fix: a concurrent CLI run tripped a provider open, and the hub still
+    reported `closed` and `available == True` -- it would keep sending
+    traffic to a provider it had been told was down. A guard that only
+    learns at startup is a guard that never learns.
+
+    Fixing that exposed a second defect, this one mine: PR #19's
+    merge-on-save read our own just-cleared failure back out of the file, so
+    `record_success` became a no-op and a recovered provider stayed open
+    until its cooldown expired. The overwrite it replaced got that right by
+    accident. A deletion is an observation too.
+    """
+
+    def _in_another_process(self, d, body):
+        code = ("import sys;sys.path.insert(0,%r);import backend as lmm;"
+                "lmm.LMM_DIR=%r;"
+                "b=lmm.CircuitBreaker(threshold=2,cooldown_s=60,persist=True);"
+                % (os.path.dirname(os.path.dirname(os.path.abspath(__file__))), d)
+                + body)
+        r = subprocess.run([sys.executable, "-c", code], capture_output=True,
+                           timeout=120)
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+
+    def test_an_open_circuit_reaches_a_long_lived_process(self):
+        d = tempfile.mkdtemp(prefix="lmm-brk-share-")
+        saved = lmm.LMM_DIR
+        try:
+            lmm.LMM_DIR = d
+            hub = lmm.CircuitBreaker(threshold=2, cooldown_s=60, persist=True)
+            self.assertEqual(hub.state("dead"), "closed")
+            self.assertTrue(hub.available("dead"))
+            self._in_another_process(
+                d, "b.record_failure('dead');b.record_failure('dead')")
+            self.assertEqual(hub.state("dead"), "open",
+                             "the hub never re-read the shared state")
+            self.assertFalse(hub.available("dead"))
+        finally:
+            lmm.LMM_DIR = saved
+            shutil.rmtree(d, ignore_errors=True)
+
+    def test_our_own_recovery_is_not_undone_by_the_merge(self):
+        with temp_state():
+            b = lmm.CircuitBreaker(threshold=2, cooldown_s=60, persist=True)
+            b.record_failure("p")
+            b.record_failure("p")
+            self.assertEqual(b.state("p"), "open")
+            b.record_success("p")
+            self.assertEqual(b.state("p"), "closed",
+                             "merge-on-save resurrected a cleared failure")
+            with open(os.path.join(lmm.LMM_DIR, "breaker.json"),
+                      encoding="utf-8") as fh:
+                self.assertEqual(json.load(fh)["fails"], {})
+
+    def test_a_recovery_does_not_erase_another_process_observations(self):
+        """The other direction: `drop` must be scoped to the provider that
+        recovered, not a licence to overwrite the file.
+
+        Aimed at the window that actually matters -- another process writing
+        BETWEEN our load and our save. Driving record_success() end to end
+        cannot show this: it re-reads first, so the other process's failures
+        are already in memory and skipping the file entirely still writes
+        them back. Written that way, this test passed the very mutation it
+        exists to catch (verified). Calling _save_locked with a deliberately
+        stale in-memory view puts the race where it really is.
+        """
+        with temp_state():
+            path = os.path.join(lmm.LMM_DIR, "breaker.json")
+            os.makedirs(lmm.LMM_DIR, exist_ok=True)
+            b = lmm.CircuitBreaker(threshold=2, cooldown_s=60, persist=True)
+            b._fails, b._open_until = {"p": 1}, {}
+            b._loaded, b._mtime = True, time.time() + 60   # never re-read
+            # Another process lands its observations after our last load.
+            with open(path, "w", encoding="utf-8") as fh:
+                json.dump({"fails": {"p": 1, "other": 2},
+                           "open_until": {"other": time.time() + 60}}, fh)
+            b._fails.pop("p")                      # our recovery, in memory
+            b._save_locked(drop=("p",))
+            with open(path, encoding="utf-8") as fh:
+                state = json.load(fh)
+        self.assertEqual(state["fails"].get("other"), 2,
+                         "our recovery erased another process's failures")
+        self.assertIn("other", state["open_until"])
+        self.assertNotIn("p", state["fails"])      # and ours really cleared
+
+    def test_reading_the_shared_state_is_cheap_enough_to_do_per_request(self):
+        """An mtime stat per availability check, not a poll. If this ever
+        becomes a poll or a re-parse per call, this test says so."""
+        with temp_state():
+            b = lmm.CircuitBreaker(threshold=2, cooldown_s=60, persist=True)
+            b.record_failure("p")
+            t0 = time.time()
+            for _ in range(5000):
+                b.available("p")
+            per_call_us = (time.time() - t0) / 5000 * 1e6
+        self.assertLess(per_call_us, 200.0,
+                        "%.1f us per availability check" % per_call_us)
+
+
 if __name__ == "__main__":
     unittest.main()
