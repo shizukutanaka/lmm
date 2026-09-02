@@ -6123,42 +6123,16 @@ class TestEveryPromptPathAsksThePinSurvivesElenchus(unittest.TestCase):
         self.assertIn("local", [k for k, _p in sent])
 
     def test_every_prompt_sending_path_consults_the_pin(self):
-        """Structural, so the NEXT path added cannot quietly skip it. Any
-        function that calls a provider with a caller-supplied prompt must
-        also reach pin_private -- directly, or via one that does."""
-        import ast
-        root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-        senders, pinned, calls = set(), set(), {}
-        for mod in ("backend.py", "frontend.py"):
-            with open(os.path.join(root, mod), encoding="utf-8") as fh:
-                tree = ast.parse(fh.read())
-            for fn in [n for n in ast.walk(tree)
-                       if isinstance(n, ast.FunctionDef)]:
-                names = {n.func.id for n in ast.walk(fn)
-                         if isinstance(n, ast.Call)
-                         and isinstance(n.func, ast.Name)}
-                names |= {n.func.attr for n in ast.walk(fn)
-                          if isinstance(n, ast.Call)
-                          and isinstance(n.func, ast.Attribute)}
-                calls[fn.name] = names
-                if names & {"call_provider", "call_provider_stream",
-                            "call_with_retry"}:
-                    senders.add(fn.name)
-                if "pin_private" in names:
-                    pinned.add(fn.name)
-        # Reachability: a sender is covered if it pins, or if some pinning
-        # function calls it.
-        covered = set(pinned)
-        for _ in range(4):
-            for fn, names in calls.items():
-                if fn in covered:
-                    covered |= (names & senders)
-        # These send a FIXED prompt of their own, never the user's.
-        exempt = {"bench_once", "judge_answer", "cmd_selftest", "cmd_doctor"}
-        uncovered = senders - covered - exempt
-        self.assertEqual(uncovered, set(),
-                         "prompt-sending path(s) that never reach "
-                         "pin_private: %s" % sorted(uncovered))
+        """Now expressed through the shared sweep (see
+        TestInvariantsHoldAtEveryCallSiteSurvivesElenchus): any function that
+        calls a provider with a caller-supplied prompt must reach
+        pin_private, directly or through a caller that does. The four
+        exemptions send a fixed prompt of their own, never the user's."""
+        self.assertEqual(
+            _unreached(("call_provider", "call_provider_stream",
+                        "call_with_retry"), ("pin_private",),
+                       ("bench_once", "judge_answer", "cmd_selftest",
+                        "cmd_doctor")), [])
 
 
 class TestBreakerStateSurvivesConcurrencySurvivesElenchus(unittest.TestCase):
@@ -6241,39 +6215,27 @@ for i in range(n):
         self.assertEqual(state["fails"].get("other"), 1)
 
     def test_every_persisted_state_file_is_written_under_the_lock(self):
-        """Structural, because this is exactly what I missed: `_xlock` went
-        onto two of the three state files. Any function that finishes a
-        write with os.replace must hold the cross-process lock."""
+        """Any function finishing a write with os.replace must take
+        _xlock, or be called by one that does. The three exemptions are
+        `_locked` helpers whose docstrings state that contract -- asserted
+        here so an exemption cannot outlive the promise that earned it."""
         import ast
         root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-        offenders = []
+        EXEMPT = ("_record_observation_locked", "_cache_prune_locked",
+                  "_usage_compact_locked")
+        self.assertEqual(_unreached(("os.replace",), ("_xlock",), EXEMPT), [])
+        docs = {}
         for mod in ("backend.py", "frontend.py"):
             with open(os.path.join(root, mod), encoding="utf-8") as fh:
                 tree = ast.parse(fh.read())
             for fn in [n for n in ast.walk(tree)
-                       if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))]:
-                replaces = any(
-                    isinstance(n, ast.Call)
-                    and isinstance(n.func, ast.Attribute)
-                    and n.func.attr == "replace"
-                    and isinstance(n.func.value, ast.Name)
-                    and n.func.value.id == "os"
-                    for n in ast.walk(fn))
-                if not replaces:
-                    continue
-                locked = any(
-                    isinstance(n, ast.Call) and (
-                        (isinstance(n.func, ast.Name) and n.func.id == "_xlock")
-                        or (isinstance(n.func, ast.Attribute)
-                            and n.func.attr == "_xlock"))
-                    for n in ast.walk(fn))
-                # A helper may be called with the lock already held; the
-                # docstring must then say so, in the project's own words.
-                doc = ast.get_docstring(fn) or ""
-                if not locked and "_xlock" not in doc:
-                    offenders.append("%s:%s" % (mod, fn.name))
-        self.assertEqual(offenders, [], "state-file writer(s) with no "
-                         "cross-process lock: %s" % offenders)
+                       if isinstance(n, ast.FunctionDef)]:
+                docs[fn.name] = ast.get_docstring(fn) or ""
+        for name in EXEMPT:
+            with self.subTest(exempt=name):
+                self.assertIn("_xlock", docs.get(name, ""),
+                              "%s is exempt but never says its caller holds "
+                              "the lock" % name)
 
 
 class TestBreakerIsSharedInBothDirectionsSurvivesElenchus(unittest.TestCase):
@@ -6378,6 +6340,122 @@ class TestBreakerIsSharedInBothDirectionsSurvivesElenchus(unittest.TestCase):
             per_call_us = (time.time() - t0) / 5000 * 1e6
         self.assertLess(per_call_us, 200.0,
                         "%.1f us per availability check" % per_call_us)
+
+
+def _call_graph():
+    """{function name -> set of names it calls} across both modules.
+
+    One walker instead of a new hand-written one per invariant. Five of the
+    last defects shipped here were the same shape -- an invariant honoured at
+    some call sites and not all of them -- and each was caught only after the
+    fact, by an AST sweep written specially for it. Two of those sweeps were
+    near-identical. This is that machinery, once.
+    """
+    import ast
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    graph = {}
+    for mod in ("backend.py", "frontend.py"):
+        with open(os.path.join(root, mod), encoding="utf-8") as fh:
+            tree = ast.parse(fh.read())
+        for fn in [n for n in ast.walk(tree)
+                   if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))]:
+            names = set()
+            for n in ast.walk(fn):
+                if not isinstance(n, ast.Call):
+                    continue
+                if isinstance(n.func, ast.Name):
+                    names.add(n.func.id)
+                elif isinstance(n.func, ast.Attribute):
+                    # Both forms. The bare attribute catches `self.foo()`;
+                    # the dotted one lets an invariant say `os.replace`
+                    # rather than every `.replace()` in the codebase --
+                    # measured, the unqualified version indicted
+                    # `str.replace` in gpu_info, parse_params and three
+                    # others, which is a sweep that cries wolf.
+                    names.add(n.func.attr)
+                    if isinstance(n.func.value, ast.Name):
+                        names.add("%s.%s" % (n.func.value.id, n.func.attr))
+            graph.setdefault(fn.name, set()).update(names)
+    return graph
+
+
+def _unreached(trigger, requirement, exempt=()):
+    """Functions that call anything in `trigger` but cannot reach
+    `requirement` -- directly, or through a caller that does."""
+    graph = _call_graph()
+    triggered = {fn for fn, names in graph.items() if names & set(trigger)}
+    covered = {fn for fn, names in graph.items() if names & set(requirement)}
+    for _ in range(6):                       # transitive closure, bounded
+        for fn, names in graph.items():
+            if fn in covered:
+                covered |= (names & triggered)
+    return sorted(triggered - covered - set(exempt))
+
+
+class TestInvariantsHoldAtEveryCallSiteSurvivesElenchus(unittest.TestCase):
+    """The recurring shape, checked as data rather than as one more
+    hand-written walker.
+
+    Adding the next invariant is now a row in this table, not forty lines of
+    ast.walk -- which matters, because the fix for each of the last five
+    defects was "apply the rule at the site that skipped it", and the rule
+    was always already written down somewhere.
+    """
+
+    # (label, trigger calls, required call, functions exempt and why)
+    INVARIANTS = [
+        ("a prompt-sending path must consult the privacy pin",
+         ("call_provider", "call_provider_stream", "call_with_retry"),
+         ("pin_private",),
+         # These send a FIXED prompt of their own, never the user's.
+         ("bench_once", "judge_answer", "cmd_selftest", "cmd_doctor")),
+        ("a state-file writer must take the cross-process lock",
+         ("os.replace",),
+         ("_xlock",),
+         # Callers hold the lock; their docstrings say so (asserted
+         # separately by test_every_persisted_state_file_is_written_under_the_lock).
+         ("_record_observation_locked", "_cache_prune_locked",
+          "_usage_compact_locked")),
+        ("a path that bills a provider answer must meter it",
+         ("call_with_retry",),
+         ("meter_call",),
+         ()),
+    ]
+
+    def test_no_call_site_skips_an_invariant(self):
+        for label, trigger, requirement, exempt in self.INVARIANTS:
+            with self.subTest(invariant=label):
+                self.assertEqual(
+                    _unreached(trigger, requirement, exempt), [],
+                    "%s -- offender(s): %s"
+                    % (label, _unreached(trigger, requirement, exempt)))
+
+    def test_the_sweep_catches_a_planted_violation(self):
+        """A sweep that cannot fail is not a sweep. Two of these were added
+        after a real leak; this proves the machinery itself bites, without
+        editing the modules."""
+        graph_real = _call_graph()
+        self.assertIn("hub_complete", graph_real)
+        # Simulate a new sender that reaches nothing: it must be reported.
+        import unittest.mock as _mock
+        planted = {k: set(v) for k, v in graph_real.items()}
+        planted["summarise_for_user"] = {"call_provider"}
+        with _mock.patch(__name__ + "._call_graph", lambda: planted):
+            offenders = _unreached(
+                ("call_provider", "call_provider_stream", "call_with_retry"),
+                ("pin_private",),
+                ("bench_once", "judge_answer", "cmd_selftest", "cmd_doctor"))
+        self.assertIn("summarise_for_user", offenders)
+
+    def test_the_exemptions_are_all_real_functions(self):
+        """An exemption for a function that no longer exists is a hole that
+        looks like a rule."""
+        graph = _call_graph()
+        for label, _trigger, _req, exempt in self.INVARIANTS:
+            for name in exempt:
+                with self.subTest(invariant=label, exempt=name):
+                    self.assertIn(name, graph,
+                                  "exempting a function that does not exist")
 
 
 if __name__ == "__main__":
