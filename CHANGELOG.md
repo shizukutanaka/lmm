@@ -18,6 +18,21 @@ the round of fixes that took the hub from "works" to "holds up under load", and
 the merge of the managed-routing line of work into the same tool.
 
 ### Fixed
+- **`lmm config validate` now catches the mistakes that disable a feature
+  silently.** Fed a config with six real errors it reported three, and the
+  three it missed were the ones no runtime error would ever reveal: a
+  `cache.similarity` above 1.0 (a cosine can never reach it, so the semantic
+  tier the user enabled can never hit), a negative `cache.max_temp` (the
+  store side then refuses every call, so nothing is ever cached), a negative
+  `cache.ttl_hours` (which disables expiry rather than shortening it), and an
+  unresolved `cascade.order` — the identical typo check already existed for
+  `ask_order`, so both lists now go through one `check_order`. It also
+  reported `[OK] route -- absent (defaults apply)` for a config carrying
+  `route_threshold: 1.7`, naming the key that was missing rather than the one
+  that was there; `route_threshold` is now range-checked against the 0.0–1.0
+  window `prompt_strength()` can actually produce.
+
+### Fixed
 - **The grader's own rules now bite.** On `--verify` the grader is the
   gatekeeper, where a bad answer getting *through* is what costs, and two
   rules were measured not doing their job. Markers were counted with
