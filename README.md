@@ -628,6 +628,11 @@ So **`models_cmd` runs only from your own config** (`~/.lmm/config.json` or
 `~/.config/lmm/config.json`); from a working-directory file it is ignored with a
 warning. Everything else in a local config still applies.
 
+Short answers are not treated as failures. A cascade that escalates "Paris."
+because it is one word pays the expensive model for the questions the cheap
+one gets right; whether an answer is too short is judged against what the
+prompt asked for, not against a word count.
+
 ## What the hub forwards
 
 Everything your client sent, except the handful of fields the hub genuinely

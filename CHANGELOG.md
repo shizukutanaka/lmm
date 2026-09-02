@@ -18,6 +18,21 @@ the round of fixes that took the hub from "works" to "holds up under load", and
 the merge of the managed-routing line of work into the same tool.
 
 ### Fixed
+- **The answer grader no longer escalates correct answers.** The cascade
+  exists to spend less: try the cheap model, stop when the answer is good
+  enough. But `verify_answer` opened with `len(text.split()) < 3 -> 0.0,
+  "empty or near-empty answer"`, and measured against the 0.75 gate that
+  scored **"Paris." for "What is the capital of France?" at 0.00** — as it
+  did "4", "Yes.", "1989." and "404". The cascade paid the expensive model a
+  second time for exactly the questions a small model answers correctly.
+  Brevity is not emptiness: whether an answer is too short is a question
+  about the *prompt*, and the reasoning, code and multi-part rules already
+  ask it (measured: "It works." to "Explain how TCP congestion control
+  works." still fails, as do "Blue.", "Sure." to a code request, and a terse
+  reply to a multi-part prompt). Only an answer with no alphanumeric content
+  at all — `""`, `"..."`, `"???"` — is still an unconditional zero.
+
+### Fixed
 - **The hub forwards what the client actually sent.** `PASSTHROUGH_KEYS` was
   an allow-list of the OpenAI fields this code happened to know about, and
   the failure direction was wrong. Measured against a provider that echoes
