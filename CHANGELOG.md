@@ -18,6 +18,15 @@ the round of fixes that took the hub from "works" to "holds up under load", and
 the merge of the managed-routing line of work into the same tool.
 
 ### Fixed
+- **`--host ""` no longer publishes the hub.** `hub_bind_check` treats
+  reachability as the entire security boundary — the hub holds your API keys
+  — and refuses to bind beyond loopback without a token. But `""` was listed
+  as a loopback host, and to the socket layer `""` is INADDR_ANY: measured,
+  a server bound to `""` listened on `0.0.0.0` and accepted a connection on
+  the machine's LAN address. Removed from the loopback list, so `""` is now
+  refused without a token like any other non-loopback bind.
+
+### Fixed
 - **`lmm ask` can be scripted.** Measured with no provider configured:
   `lmm ask hi` exited **0** and printed its failure to **stdout**, so
   `answer=$(lmm ask ...)` captured "[ask] no provider available" as the
