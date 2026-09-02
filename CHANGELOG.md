@@ -251,6 +251,17 @@ the merge of the managed-routing line of work into the same tool.
   cost_report`). It did; now it must keep doing so.
 
 ### Added
+- **The documentation is now gated like code.** Three claims about the docs
+  were put on trial and all three came back clean — every one of the 26
+  settings the code honours is named in the README and every config key the
+  README documents is read by the code; `config.example.json` passes
+  `lmm config validate`; both JSON snippets are valid config for the keys
+  they contain. Nothing was holding any of them, and the command surface had
+  already drifted exactly this way, so each is now a test: an undocumented
+  setting, a sample the tool would reject, or a snippet that no longer parses
+  fails the suite.
+
+### Added
 - **The README now documents every command that ships.** `doctor`,
   `selftest`, `config validate`, `secrets`, `stats` and `log` all worked and
   none appeared in the command table — 26 commands registered, 21 listed.
