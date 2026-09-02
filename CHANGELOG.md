@@ -183,6 +183,24 @@ the merge of the managed-routing line of work into the same tool.
   (verified), and existing cache entries simply age out as misses.
 
 ### Fixed
+- **…and the breaker now *reads* the shared state, not just writes it.** The
+  previous entry fixed the write half. `_load_locked` was a one-shot latch,
+  so a long-lived process read `breaker.json` once at startup and never
+  again: measured, a concurrent CLI run tripped a provider open and the hub
+  still reported `closed` and `available == True`, and would have kept
+  sending traffic to a provider it had been told was down. It now re-reads
+  when the file's mtime changes — one stat per call, measured at 3.3 µs, not
+  a poll. Fixing that exposed a second defect introduced by the merge in the
+  previous entry: it read our own just-cleared failure back out of the file,
+  so `record_success` became a no-op and a recovered provider stayed open
+  until its cooldown expired. A deletion is an observation too, so a
+  recovery now names the provider it clears. The remaining asymmetry is
+  deliberate and documented: bad news crosses processes immediately, good
+  news is bounded by `cooldown_s`, because accepting deletions on the read
+  side would let one process's success erase another's freshly observed
+  failures.
+
+### Fixed
 - **The circuit breaker's state survives concurrent processes too.** The
   cross-process lock went onto two of the three state files;
   `~/.lmm/breaker.json` was the third, and sharing a circuit between the
