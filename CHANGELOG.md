@@ -18,6 +18,18 @@ the round of fixes that took the hub from "works" to "holds up under load", and
 the merge of the managed-routing line of work into the same tool.
 
 ### Fixed
+- **…and `lmm bench --prompt`.** Having closed the judge's door, the same
+  question was put to every other path that sends a user's prompt. `bench`
+  is the widest fan-out in the tool — the prompt goes to *every* configured
+  provider — and measured, a prompt matching `route.private` reached the
+  remote ones in full. It now asks `pin_private` like every other sending
+  path: a private prompt is benchmarked on local providers only, and refused
+  outright when none remain. A structural test now sweeps both modules and
+  fails if any function that calls a provider with a caller-supplied prompt
+  cannot reach `pin_private`, so the next path added cannot quietly skip it
+  (verified by planting one).
+
+### Fixed
 - **The privacy pin now covers the judge.** `pin_private` is the single
   privacy authority: a prompt matching `route.private` has non-local targets
   removed and is refused outright when nothing local remains. But the judge

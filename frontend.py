@@ -1140,6 +1140,14 @@ def cmd_bench(cfg, provider=None, runs=3, prompt=None, max_tokens=128):
     if not targets:
         return fail("[bench] no provider available. Start Ollama or add "
                     "'providers' to lmm config (see `lmm examples`).")
+    # `--prompt` is the user's text, and bench sends it to EVERY provider --
+    # the widest fan-out in the tool. Measured before this: a prompt matching
+    # route.private went to the remote providers in full. The pin is the one
+    # privacy authority, so bench asks it like every other sending path
+    # rather than being quietly exempt from what the README promises.
+    targets, refused = backend.pin_private(cfg, prompt, targets)
+    if refused:
+        return fail("[bench] " + refused)
     measured = 0
 
     print(f'prompt: "{prompt}"   runs: {runs} (+1 discarded warm-up)   '
