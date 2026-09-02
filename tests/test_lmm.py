@@ -6161,5 +6161,120 @@ class TestEveryPromptPathAsksThePinSurvivesElenchus(unittest.TestCase):
                          "pin_private: %s" % sorted(uncovered))
 
 
+class TestBreakerStateSurvivesConcurrencySurvivesElenchus(unittest.TestCase):
+    """`_xlock` was added for usage.jsonl and cache.jsonl. There is a THIRD
+    state file, and I did not cover it: breaker.json, whose entire purpose is
+    to be shared across processes -- a resident hub and the CLI on one
+    circuit. It persisted by read-modify-replace of one process's in-memory
+    view, with no cross-process lock.
+
+    Measured with two processes recording 240 distinct provider failures:
+    125 survived. **47.9% lost**, worse than the 20.1% the usage log lost to
+    the same race, and worse in kind -- a lost failure is a circuit that
+    stays closed on a provider that is already down.
+    """
+
+    RACER = r'''
+import sys, os, time
+sys.path.insert(0, %r)
+import backend as lmm
+d, role, n = sys.argv[1], sys.argv[2], int(sys.argv[3])
+lmm.LMM_DIR = d
+open(os.path.join(d, "ready." + role), "w").close()
+while not all(os.path.exists(os.path.join(d, "ready." + r))
+              for r in ("A", "B")):
+    time.sleep(0.005)
+b = lmm.CircuitBreaker(threshold=10**9, cooldown_s=1, persist=True)
+for i in range(n):
+    b.record_failure("%%s%%d" %% (role, i))
+''' % os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+    def test_two_processes_recording_failures_lose_none(self):
+        n = 90
+        d = tempfile.mkdtemp(prefix="lmm-breaker-")
+        try:
+            script = os.path.join(d, "racer.py")
+            with open(script, "w", encoding="utf-8") as fh:
+                fh.write(self.RACER)
+            procs = [subprocess.Popen(
+                [sys.executable, script, d, role, str(n)],
+                stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+                for role in ("A", "B")]
+            for p in procs:
+                self.assertEqual(p.wait(timeout=300), 0, p.stdout.read())
+                p.stdout.close()
+            with open(os.path.join(d, "breaker.json"), encoding="utf-8") as fh:
+                state = json.load(fh)
+        finally:
+            shutil.rmtree(d, ignore_errors=True)
+        self.assertEqual(len(state.get("fails", {})), 2 * n)
+
+    def test_a_reset_is_not_undone_by_the_merge(self):
+        """Merging must not resurrect what reset() deliberately cleared --
+        it deletes the file, so there is nothing to merge back."""
+        with temp_state():
+            b = lmm.CircuitBreaker(threshold=1, cooldown_s=30, persist=True)
+            b.record_failure("dead")
+            self.assertEqual(b.state("dead"), "open")
+            b.reset()
+            self.assertFalse(os.path.exists(
+                os.path.join(lmm.LMM_DIR, "breaker.json")))
+            fresh = lmm.CircuitBreaker(threshold=1, cooldown_s=30, persist=True)
+            self.assertEqual(fresh.state("dead"), "closed")
+
+    def test_a_concurrent_higher_count_wins_the_merge(self):
+        """The other direction: overwriting with our own view is the bug;
+        taking the maximum is the fix. A process that saw more failures than
+        we did must not have them lowered."""
+        with temp_state():
+            path = os.path.join(lmm.LMM_DIR, "breaker.json")
+            os.makedirs(lmm.LMM_DIR, exist_ok=True)
+            with open(path, "w", encoding="utf-8") as fh:
+                json.dump({"fails": {"p": 7}, "open_until": {}}, fh)
+            b = lmm.CircuitBreaker(threshold=10**9, cooldown_s=1, persist=True)
+            b._loaded = True                  # simulate a stale in-memory view
+            b.record_failure("other")
+            with open(path, encoding="utf-8") as fh:
+                state = json.load(fh)
+        self.assertEqual(state["fails"].get("p"), 7, "another process's "
+                         "observations were overwritten")
+        self.assertEqual(state["fails"].get("other"), 1)
+
+    def test_every_persisted_state_file_is_written_under_the_lock(self):
+        """Structural, because this is exactly what I missed: `_xlock` went
+        onto two of the three state files. Any function that finishes a
+        write with os.replace must hold the cross-process lock."""
+        import ast
+        root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        offenders = []
+        for mod in ("backend.py", "frontend.py"):
+            with open(os.path.join(root, mod), encoding="utf-8") as fh:
+                tree = ast.parse(fh.read())
+            for fn in [n for n in ast.walk(tree)
+                       if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))]:
+                replaces = any(
+                    isinstance(n, ast.Call)
+                    and isinstance(n.func, ast.Attribute)
+                    and n.func.attr == "replace"
+                    and isinstance(n.func.value, ast.Name)
+                    and n.func.value.id == "os"
+                    for n in ast.walk(fn))
+                if not replaces:
+                    continue
+                locked = any(
+                    isinstance(n, ast.Call) and (
+                        (isinstance(n.func, ast.Name) and n.func.id == "_xlock")
+                        or (isinstance(n.func, ast.Attribute)
+                            and n.func.attr == "_xlock"))
+                    for n in ast.walk(fn))
+                # A helper may be called with the lock already held; the
+                # docstring must then say so, in the project's own words.
+                doc = ast.get_docstring(fn) or ""
+                if not locked and "_xlock" not in doc:
+                    offenders.append("%s:%s" % (mod, fn.name))
+        self.assertEqual(offenders, [], "state-file writer(s) with no "
+                         "cross-process lock: %s" % offenders)
+
+
 if __name__ == "__main__":
     unittest.main()
