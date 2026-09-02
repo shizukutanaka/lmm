@@ -18,6 +18,20 @@ the round of fixes that took the hub from "works" to "holds up under load", and
 the merge of the managed-routing line of work into the same tool.
 
 ### Fixed
+- **The privacy pin now covers the judge.** `pin_private` is the single
+  privacy authority: a prompt matching `route.private` has non-local targets
+  removed and is refused outright when nothing local remains. But the judge
+  is not a target — `cascade.judge` names a provider that receives the prompt
+  **and** the answer verbatim, and it was looked up straight from
+  `merged_providers()`. Measured: the pin correctly kept only the local
+  provider, and the same private prompt then went to a remote judge in full.
+  A guard that stops one path out of two is not a guard. The judge is now
+  asked through the same `pin_private`, so a non-local judge is dropped for a
+  private prompt (the answer is graded without a second opinion, and the
+  trace says so) while a **local** judge still grades it and an ordinary
+  prompt is unaffected.
+
+### Fixed
 - **No paid call is booked as free.** Providers are allowed to omit `usage`,
   and plenty of local runtimes and proxies do. Measured against one that
   does, the two hub paths disagreed: the streamed path logged
