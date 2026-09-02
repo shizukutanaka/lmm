@@ -5625,5 +5625,94 @@ class TestHubForwardsWhatItWasAskedSurvivesElenchus(unittest.TestCase):
         self.assertNotEqual(a, b)
 
 
+class TestGraderDoesNotEscalateCorrectAnswersSurvivesElenchus(unittest.TestCase):
+    """The cascade's claim is that it SPENDS LESS: try the cheap model, stop
+    when the answer is good enough. Derive the consequence — a correct cheap
+    answer must pass the gate, or the cascade pays the expensive model for
+    nothing.
+
+    Measured against VERIFY_GATE (0.75), the grader opened with
+    `len(text.split()) < 3 -> 0.0, "empty or near-empty answer"`. So "Paris."
+    for "What is the capital of France?" scored **0.00** and escalated, as
+    did "4", "Yes.", "1989." and "404" — precisely the questions a small
+    model gets right. Brevity is not emptiness; whether an answer is too
+    short is a question about the PROMPT, and the reasoning / code /
+    multi-part rules already ask it.
+    """
+
+    CORRECT_AND_SHORT = [
+        ("What is 2+2?", "4"),
+        ("What is the capital of France?", "Paris."),
+        ("Is 17 prime?", "Yes."),
+        ("What year did the Berlin Wall fall?", "1989."),
+        ("Reply with just the HTTP status code for 'not found'.", "404"),
+    ]
+
+    # The other direction: brevity where the prompt demanded more, and
+    # answers with no content at all. A grader that passed everything would
+    # satisfy the cases above and be worthless.
+    SHORT_AND_WRONG = [
+        ("Explain how TCP congestion control works.", "It works."),
+        ("Why is the sky blue?", "Blue."),
+        ("Summarize this. It has many sentences. Here is another. And more.",
+         "ok"),
+        ("Write a python function to reverse a list.", "Sure."),
+    ]
+
+    NO_CONTENT = ["", "   ", "...", "???", "\n\n"]
+
+    def test_a_correct_short_answer_is_not_escalated(self):
+        for prompt, answer in self.CORRECT_AND_SHORT:
+            with self.subTest(answer=answer):
+                score, why = lmm.verify_answer(prompt, answer)
+                self.assertGreaterEqual(
+                    score, lmm.VERIFY_GATE,
+                    "%r would escalate to the expensive model: %s"
+                    % (answer, why))
+
+    def test_brevity_the_prompt_did_not_invite_still_fails(self):
+        for prompt, answer in self.SHORT_AND_WRONG:
+            with self.subTest(answer=answer):
+                score, why = lmm.verify_answer(prompt, answer)
+                self.assertLess(score, lmm.VERIFY_GATE,
+                                "%r passed the gate: %s" % (answer, why))
+                self.assertTrue(why, "no reason given for the deduction")
+
+    def test_an_answer_with_no_content_is_still_zero(self):
+        for answer in self.NO_CONTENT:
+            with self.subTest(answer=answer):
+                score, why = lmm.verify_answer("What is 2+2?", answer)
+                self.assertEqual(score, 0.0)
+                self.assertEqual(why, ["empty or near-empty answer"])
+
+    def test_the_cascade_stops_on_a_correct_short_answer(self):
+        """End to end, through the real cascade: the cheap rung answers
+        "Paris." and the expensive rung must never be called."""
+        called = []
+
+        def fake(prov, prompt, temperature=0.7, extra=None, messages=None,
+                 stream=False):
+            called.append(prov.get("model"))
+            return {"choices": [{"message": {"content": "Paris."}}],
+                    "usage": {"prompt_tokens": 5, "completion_tokens": 1}}
+
+        saved = lmm.call_provider
+        lmm.call_provider = fake
+        try:
+            targets = [("cheap", {"kind": "local", "base": "http://x",
+                                  "model": "small", "key": "k"}),
+                       ("dear", {"kind": "remote", "base": "http://y",
+                                 "model": "big", "key": "k"})]
+            with temp_state():
+                lmm.hub_complete({"cache": {"enabled": False}},
+                                 [{"role": "user",
+                                   "content": "What is the capital of France?"}],
+                                 targets, {"cascade": True, "cache": False})
+        finally:
+            lmm.call_provider = saved
+        self.assertEqual(called, ["small"],
+                         "the cascade paid for the expensive rung anyway")
+
+
 if __name__ == "__main__":
     unittest.main()

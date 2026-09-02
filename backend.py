@@ -2838,7 +2838,16 @@ def verify_answer(prompt, answer, cfg=None, judge=None, tool_calls=None):
     if tool_calls:
         return verify_tool_calls(tool_calls)
     text = (answer or "").strip()
-    if not text or len(text.split()) < 3:
+    # No content at all -- "", "...", "???" -- is the only unconditional
+    # zero. Brevity is NOT: this rule used to be `len(text.split()) < 3`,
+    # and measured against the gate of 0.75 it scored "Paris." for "What is
+    # the capital of France?" at 0.00 and escalated it. A cascade exists to
+    # spend less, and that made it pay the expensive model twice for exactly
+    # the questions a cheap model answers correctly. Whether an answer is too
+    # short is a question about the PROMPT, and the rules below already ask
+    # it: a reasoning request, a code request, or a multi-part prompt each
+    # deduct for a one-breath reply.
+    if not any(c.isalnum() for c in text):
         return 0.0, ["empty or near-empty answer"]
     low = text.lower()
     ptext = (prompt if isinstance(prompt, str) else messages_text(prompt)) or ""
