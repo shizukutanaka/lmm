@@ -18,6 +18,22 @@ the round of fixes that took the hub from "works" to "holds up under load", and
 the merge of the managed-routing line of work into the same tool.
 
 ### Fixed
+- **`lmm ask` can be scripted.** Measured with no provider configured:
+  `lmm ask hi` exited **0** and printed its failure to **stdout**, so
+  `answer=$(lmm ask ...)` captured "[ask] no provider available" as the
+  answer and `lmm ask ... || fallback` never fell back; `lmm bench` also
+  exited 0 with nothing measured. `frontend.py` contained zero writes to
+  stderr. Now: the answer is the only thing on stdout, diagnostics
+  (`[warn]`, `--explain`, failures) go to stderr, and `ask` / `bench` / `fit`
+  exit 1 on failure (2 for a usage error) through one `fail()` authority
+  that `main()` passes to the shell.
+- **The hub emits one error shape.** A 400 for an unknown model used the
+  OpenAI object form (`error.message` / `error.type`) while 502, 404 and
+  bad-JSON 400s answered with a bare string — two shapes for one server, and
+  the OpenAI SDK reads `.message` off the string and finds nothing. Every
+  hub error now goes through `_error()`.
+
+### Fixed
 - **The cache no longer answers a question the caller did not ask.** The key
   was the prompt and the model, but the hub is an OpenAI-compatible endpoint
   that forwards the caller's parameters — and those decide what a correct

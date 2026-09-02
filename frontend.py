@@ -15,6 +15,21 @@
 import backend
 from backend import *
 
+
+def fail(msg, code=1):
+    """Report a command failure the way a CLI must: on stderr, with a non-zero
+    exit status for the caller to return.
+
+    Measured before this existed: `lmm ask` with no provider printed its
+    failure to STDOUT and exited 0, so `answer=$(lmm ask ...)` captured the
+    error text as the answer and `lmm ask ... || fallback` never fell back.
+    A tool that cannot tell a script it failed is not scriptable, whatever
+    its README says. One authority so every command fails the same way.
+    """
+    print(msg, file=sys.stderr)
+    return code
+
+
 # ------------------------------ routing ------------------------------------
 def cmd_route(cfg, task, explain=False):
     """Recommend local vs remote, and with --explain show the RouteLLM-style
@@ -246,16 +261,14 @@ def cmd_fit(model=None, ctx=None, vram=None, kv="f16", as_json=False):
         budget = (gpu["total"] - gpu["used"]) / 1024.0
         src = f"{gpu['name']} ({gpu['total'] - gpu['used']} of {gpu['total']} MiB free)"
     else:
-        print("[fit] no GPU detected and no --vram given. "
-              "Pass --vram <GiB> to size a machine you do not have in front of you.")
-        return
+        return fail("[fit] no GPU detected and no --vram given. Pass --vram "
+                    "<GiB> to size a machine you do not have in front of you.")
 
     models = [model] if model else (detect_ollama().get("models") or [])
     if not models:
-        print("[fit] no model given and no Ollama models installed. Try: "
-              "lmm fit llama3.1:8b --vram 24, or point it at a file: "
-              "lmm fit ./model.gguf")
-        return
+        return fail("[fit] no model given and no Ollama models installed. Try: "
+                    "lmm fit llama3.1:8b --vram 24, or point it at a file: "
+                    "lmm fit ./model.gguf")
 
     rows = []
     for name in models:
@@ -284,10 +297,13 @@ def cmd_fit(model=None, ctx=None, vram=None, kv="f16", as_json=False):
                      "est": est, "fits": est["total_gib"] <= budget,
                      "max_ctx": max_context_for(spec, budget, None, kv)})
 
+    # A model that could not be sized is a failure of the question asked;
+    # the exit status says so even when the table (or JSON) is still printed.
+    sized = any(not r.get("error") for r in rows)
     if as_json:
         print(json.dumps({"budget_gib": round(budget, 2), "source": src,
                           "rows": rows}, indent=2, default=str))
-        return
+        return 0 if sized else 1
 
     print(f"VRAM budget: {budget:.1f} GiB  [{src}]")
     print(f"KV cache dtype: {kv}  "
@@ -333,6 +349,7 @@ def cmd_fit(model=None, ctx=None, vram=None, kv="f16", as_json=False):
         print("Estimates. bits-per-weight are llama.cpp measurements on "
               "LLaMA-family models;\noverhead is a 0.5 GiB middle estimate for "
               "context and scratch buffers.")
+    return 0 if sized else 1
 
 
 def cmd_serve(model):
@@ -385,6 +402,18 @@ def cmd_serve_hub(cfg, host, port, quiet=False):
             self.end_headers()
             self.wfile.write(body)
 
+        def _error(self, code, message, type_="invalid_request_error",
+                   code_str=None):
+            """Every error the hub emits, in the one shape OpenAI clients
+            parse (`error.message` / `error.type`). This handler used to
+            answer some failures with `{"error": "<string>"}` and others
+            with the object form -- two shapes for one server, and the SDK
+            reads `.message` off the first one and finds nothing."""
+            err = {"message": message, "type": type_}
+            if code_str:
+                err["code"] = code_str
+            self._send(code, {"error": err})
+
         def _stream(self, frames):
             """Relay SSE frames. No Content-Length: the body length is unknown
             when the headers go out, which is the whole point of streaming.
@@ -423,9 +452,7 @@ def cmd_serve_hub(cfg, host, port, quiet=False):
 
         def _deny(self):
             # 401 with no hint about the expected value.
-            self._send(401, {"error": {"message": "missing or invalid bearer "
-                                                  "token for the lmm hub",
-                                       "type": "invalid_request_error"}})
+            self._error(401, "missing or invalid bearer token for the lmm hub")
 
         def do_GET(self):
             if not self._authed():
@@ -450,20 +477,21 @@ def cmd_serve_hub(cfg, host, port, quiet=False):
                                      "owned_by": p["kind"]})
                 self._send(200, {"object": "list", "data": data})
             else:
-                self._send(404, {"error": "not found"})
+                self._error(404, "not found", code_str="not_found")
 
         def do_POST(self):
             if not self._authed():
                 self._deny()
                 return
             if not self.path.rstrip("/").endswith("/v1/chat/completions"):
-                self._send(404, {"error": "only /v1/chat/completions supported"})
+                self._error(404, "only /v1/chat/completions is supported",
+                            code_str="not_found")
                 return
             length = int(self.headers.get("Content-Length", 0))
             try:
                 req = json.loads(self.rfile.read(length).decode("utf-8", "ignore"))
             except Exception as e:
-                self._send(400, {"error": f"bad json: {e}"})
+                self._error(400, f"bad json: {e}")
                 return
             # Routing, cascade, cache and metering are the SAME code path as
             # `lmm ask` (hub_complete) — one hub, one routing brain. The whole
@@ -490,18 +518,17 @@ def cmd_serve_hub(cfg, host, port, quiet=False):
                     # some other model anyway — which this handler used to do
                     # by falling back to default routing — is the one thing a
                     # proxy must never be: a silent substitution.
-                    self._send(400, {"error": {
-                        "message": "unknown model '%s' — GET /v1/models for "
-                                   "what this hub serves" % explicit,
-                        "type": "invalid_request_error",
-                        "code": "model_not_found"}})
+                    self._error(400, "unknown model '%s' — GET /v1/models for "
+                                     "what this hub serves" % explicit,
+                                code_str="model_not_found")
                     return
             else:
                 targets = resolve_ask_targets(
                     cfg, messages_text(msgs),
                     explicit if explicit in provs else None)
             if not targets:
-                self._send(400, {"error": "no provider available for model '%s'" % explicit})
+                self._error(400, "no provider available for model '%s'" % explicit,
+                            code_str="model_not_found")
                 return
             no_cache = (bool(req.get("lmm_no_cache"))
                         or self.headers.get("X-LMM-No-Cache") is not None)
@@ -516,7 +543,8 @@ def cmd_serve_hub(cfg, host, port, quiet=False):
                 return
             res, _trace = hub_complete(cfg, msgs, targets, hub_opts)
             if isinstance(res, dict) and res.get("error"):
-                self._send(502, {"error": "all providers failed: %s" % res["error"]})
+                self._error(502, "all providers failed: %s" % res["error"],
+                            type_="server_error", code_str="upstream_failed")
                 return
             self._send(200, res)
 
@@ -1030,18 +1058,16 @@ def cmd_ask(prompt, provider, cfg, cascade=False, no_cache=False,
     guess before the call. Both orderings come from the same router.
     """
     if not (prompt or "").strip():
-        print("usage: lmm ask \"your question\" [--provider NAME] [--cascade]")
-        return
+        return fail("usage: lmm ask \"your question\" [--provider NAME] [--cascade]", 2)
     effective = provider
     if verify and not provider:
         name, vreason, reply = route_and_verify(prompt, cfg, cfg.get("ask_order"))
         if name and reply is not None:
-            print(f"[ask] verified-route: {name} -> {vreason}")
+            print(f"[ask] verified-route: {name} -> {vreason}", file=sys.stderr)
             print(reply)
-        else:
-            print("[ask] verified-route: no backend passed the quality gate "
-                  f"({vreason})")
-        return
+            return 0
+        return fail("[ask] verified-route: no backend passed the quality gate "
+                    f"({vreason})")
     targets = resolve_ask_targets(cfg, prompt, effective)
     if not targets:
         if provider:
@@ -1051,18 +1077,17 @@ def cmd_ask(prompt, provider, cfg, cascade=False, no_cache=False,
                 list((cfg.get("providers") or {}).keys())
                 + [it["name"] for it in backend.discover(cfg) if it["running"]]
                 + ["local-ollama(implicit)", "local-lmstudio(implicit)"]))
-            print(f"[ask] unknown provider '{provider}'.")
-            print(f"[ask] known providers: {', '.join(known)}")
-            print("[ask] or omit --provider to use ask_order / auto routing.")
-        else:
-            print("[ask] no provider available. Start Ollama (`lmm serve <model>`) "
-                  "or add 'providers' to lmm config (see `lmm examples`).")
-        return
+            return fail(f"[ask] unknown provider '{provider}'.\n"
+                        f"[ask] known providers: {', '.join(known)}\n"
+                        "[ask] or omit --provider to use ask_order / auto routing.")
+        return fail("[ask] no provider available. Start Ollama (`lmm serve <model>`) "
+                    "or add 'providers' to lmm config (see `lmm examples`).")
     if explain:
         score, feats = prompt_strength(cfg, prompt)
         thr = cfg.get("route_threshold", DEFAULT_ROUTE_THRESHOLD)
         print(f"[route] strength={score:.2f} threshold={thr} -> "
-              + ", ".join(n for n, _ in backend.order_targets(cfg, prompt, targets)))
+              + ", ".join(n for n, _ in backend.order_targets(cfg, prompt, targets)),
+              file=sys.stderr)
     brk = merged_breaker(cfg)
     HUB_BREAKER.threshold = int(brk.get("threshold", 3))
     HUB_BREAKER.cooldown_s = float(brk.get("cooldown_s", 30))
@@ -1071,22 +1096,23 @@ def cmd_ask(prompt, provider, cfg, cascade=False, no_cache=False,
                                "source": "ask",
                                "breaker": HUB_BREAKER
                                if brk.get("enabled", True) else None})
+    # Diagnostics go to stderr, always: stdout is the answer and nothing else,
+    # so `$(lmm ask ...)` captures exactly what the model said.
     for line in trace:               # warnings are never hidden behind --explain
         if explain or line.startswith("[warn]"):
-            print(line)
+            print(line, file=sys.stderr)
     if isinstance(res, dict) and res.get("error"):
         log_hub({"event": "ask", "provider": effective or "(routed)",
                  "ok": False, "error": res["error"], "prompt": prompt})
-        print(f"[ask] all providers failed. last error: {res['error']}")
-        return
+        return fail(f"[ask] all providers failed. last error: {res['error']}")
     try:
         answer = res["choices"][0]["message"]["content"]
     except (KeyError, IndexError, TypeError):
-        print("[ask] unexpected response shape from provider")
-        return
+        return fail("[ask] unexpected response shape from provider")
     log_hub({"event": "ask", "provider": effective or "(routed)", "ok": True,
              "prompt": prompt, "reply": (answer or "")[:200], "trace": trace})
     print(answer)
+    return 0
 
 
 def cmd_bench(cfg, provider=None, runs=3, prompt=None, max_tokens=128):
@@ -1106,9 +1132,9 @@ def cmd_bench(cfg, provider=None, runs=3, prompt=None, max_tokens=128):
         if lo:
             targets.append(("local-ollama(implicit)", lo))
     if not targets:
-        print("[bench] no provider available. Start Ollama or add 'providers' "
-              "to lmm config (see `lmm examples`).")
-        return
+        return fail("[bench] no provider available. Start Ollama or add "
+                    "'providers' to lmm config (see `lmm examples`).")
+    measured = 0
 
     print(f'prompt: "{prompt}"   runs: {runs} (+1 discarded warm-up)   '
           f"max_tokens: {max_tokens}")
@@ -1151,6 +1177,7 @@ def cmd_bench(cfg, provider=None, runs=3, prompt=None, max_tokens=128):
         if not samples:
             print(f"  {name:<26} warm-up ok but every measured run failed")
             continue
+        measured += 1
         ttft = median([s["ttft_ms"] for s in samples])
         tpot = median([s["tpot_ms"] for s in samples])
         tps = median([s["tok_per_s"] for s in samples])
@@ -1170,6 +1197,9 @@ def cmd_bench(cfg, provider=None, runs=3, prompt=None, max_tokens=128):
     print("TTFT = time to first token (prefill). TPOT = time per output token "
           "after the first\n(decode). e2e = TTFT + TPOT x (tokens-1). Medians "
           "over the measured runs.")
+    if not measured:
+        return fail("[bench] every provider failed; nothing was measured")
+    return 0
 
 
 def cmd_cache(cfg=None, clear=False):
@@ -2334,7 +2364,8 @@ def main():
     elif cmd == "pull":
         cmd_pull(args.model)
     elif cmd == "fit":
-        cmd_fit(args.model, args.ctx, args.vram, args.kv, getattr(args, "json", False))
+        sys.exit(cmd_fit(args.model, args.ctx, args.vram, args.kv,
+                         getattr(args, "json", False)))
     elif cmd == "cost":
         print(cost_report(cfg, args.days or None))
     elif cmd == "route":
@@ -2342,14 +2373,15 @@ def main():
     elif cmd == "priority":
         cmd_priority(cfg, getattr(args, "show", False), getattr(args, "optimize", False))
     elif cmd == "bench":
-        cmd_bench(cfg, args.provider, args.runs, args.prompt, args.max_tokens)
+        sys.exit(cmd_bench(cfg, args.provider, args.runs, args.prompt,
+                           args.max_tokens))
     elif cmd == "ask":
-        cmd_ask(" ".join(getattr(args, "prompt", [])),
-                getattr(args, "provider", None), cfg,
-                cascade=getattr(args, "cascade", False),
-                no_cache=getattr(args, "no_cache", False),
-                explain=getattr(args, "explain", False),
-                verify=getattr(args, "verify", False))
+        sys.exit(cmd_ask(" ".join(getattr(args, "prompt", [])),
+                         getattr(args, "provider", None), cfg,
+                         cascade=getattr(args, "cascade", False),
+                         no_cache=getattr(args, "no_cache", False),
+                         explain=getattr(args, "explain", False),
+                         verify=getattr(args, "verify", False)))
     elif cmd == "chat":
         cmd_chat(args.provider, cfg)
     elif cmd == "serve":
