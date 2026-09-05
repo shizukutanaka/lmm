@@ -6505,6 +6505,89 @@ class TestTheReadmeDocumentsWhatShipsSurvivesElenchus(unittest.TestCase):
         self.assertEqual(missing, [], "command(s) users cannot discover: %s"
                          % missing)
 
+    def test_every_setting_the_code_honours_is_documented(self):
+        """The same promise, one level down: a setting the code reads but the
+        README never names is a knob nobody can turn -- the `secrets` defect
+        again, in the config surface.
+
+        Measured at the time of writing: both directions clean. All 26
+        settings in the DEFAULT_* tables appear in the README, and all 26
+        config keys the README documents are read by the code. Acquitted --
+        and pinned, because nothing was holding it and the command surface
+        had already drifted the same way.
+        """
+        md = self._readme()
+        groups = {"cache": lmm.DEFAULT_CACHE, "cascade": lmm.DEFAULT_CASCADE,
+                  "hub": lmm.DEFAULT_HUB, "route": lmm.DEFAULT_ROUTE}
+        for extra in ("DEFAULT_RETRY", "DEFAULT_BREAKER"):
+            table = getattr(lmm, extra, None)
+            if isinstance(table, dict):
+                groups[extra.replace("DEFAULT_", "").lower()] = table
+        self.assertGreaterEqual(sum(len(d) for d in groups.values()), 20,
+                                "the settings tables moved")
+        undocumented = sorted("%s.%s" % (grp, k)
+                              for grp, d in groups.items() for k in d
+                              if k not in md)
+        self.assertEqual(undocumented, [],
+                         "setting(s) nobody can discover: %s" % undocumented)
+
+    def test_the_shipped_config_example_passes_lmms_own_validator(self):
+        """`config.example.json` is what the README points users at, and
+        `lmm examples` prints it. Nothing ran it through `lmm config
+        validate` -- the tool's own idea of a correct config. A sample that
+        the tool would reject teaches the wrong shape."""
+        import io
+        import contextlib
+        root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        with open(os.path.join(root, "config.example.json"),
+                  encoding="utf-8") as fh:
+            cfg = json.load(fh)
+        saved = lmm.discover
+        lmm.discover = lambda c, **kw: []
+        buf, code = io.StringIO(), 0
+        try:
+            with contextlib.redirect_stdout(buf):
+                try:
+                    frontend.cmd_validate_config(cfg)
+                except SystemExit as e:
+                    code = e.code or 0
+        finally:
+            lmm.discover = saved
+        self.assertEqual(code, 0, buf.getvalue())
+
+    def test_every_config_fragment_in_the_readme_is_real_config(self):
+        """The snippets are FRAGMENTS -- `"cache": {...}` to paste into a
+        config, not whole documents -- so they are wrapped in braces before
+        parsing. (My first pass reported the one at line 146 as invalid JSON;
+        that was the extractor treating a fragment as a document, not the
+        README being wrong.) Wrapped, each must parse and survive the
+        validator for the keys it does contain."""
+        import re
+        import io
+        import contextlib
+        frags = re.findall(r"```jsonc?\n(.*?)```", self._readme(), re.S)
+        self.assertGreaterEqual(len(frags), 2, "the config snippets moved")
+        for i, frag in enumerate(frags):
+            with self.subTest(fragment=i):
+                text = "\n".join(re.sub(r"//.*$", "", l).rstrip()
+                                 for l in frag.splitlines())
+                text = text.rstrip().rstrip(",")
+                if not text.lstrip().startswith("{"):
+                    text = "{" + text + "}"
+                cfg = json.loads(text)          # raises = the snippet is wrong
+                saved = lmm.discover
+                lmm.discover = lambda c, **kw: []
+                buf, code = io.StringIO(), 0
+                try:
+                    with contextlib.redirect_stdout(buf):
+                        try:
+                            frontend.cmd_validate_config(cfg)
+                        except SystemExit as e:
+                            code = e.code or 0
+                finally:
+                    lmm.discover = saved
+                self.assertEqual(code, 0, buf.getvalue())
+
     def test_every_command_the_readme_shows_is_a_real_command(self):
         """The other direction of the same promise, checked deterministically.
 
