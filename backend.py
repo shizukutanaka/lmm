@@ -4255,6 +4255,16 @@ def optimize_ask_order(cfg):
         total = ok + fail
         if total == 0:
             score = -1.0          # unmeasured: tail, but keep
+        elif ok == 0:
+            # Confirmed bad: every observed attempt failed. The latency and
+            # cost-efficiency terms below don't require a single success to
+            # apply, so a backend that fails FAST (a dead API key returning
+            # 401 in 50ms) scored up to 5.0 from the latency term alone --
+            # measured, a provider with 20/20 recorded failures outranked
+            # one nobody had ever tried. A fast failure is not evidence of
+            # anything good. Active evidence of always failing is worse than
+            # no evidence at all, so this sinks below "unmeasured" on purpose.
+            score = -2.0
         else:
             succ = ok / total
             avg = s.get("avg_ms", 0) or 1

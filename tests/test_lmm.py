@@ -4043,6 +4043,54 @@ class TestOneOfEach(unittest.TestCase):
             # the cache hit is an answer, not an attempt — neither ok nor fail
             self.assertEqual(st["p"]["ok"] + st["p"]["fail"], 2)
 
+    def test_optimize_never_promotes_a_confirmed_dead_backend(self):
+        """`optimize_ask_order`'s claim: "a backend that keeps failing or
+        timing out drops in priority." Measured, it did the opposite for the
+        common real case — a dead API key or an unreachable local runtime,
+        which fails FAST and every time. The latency and cost-efficiency
+        terms in the score didn't require a single success to apply, so a
+        provider with 20/20 recorded failures (fast, at 50ms) outranked one
+        nobody had ever tried at all: `optimize_ask_order` put the confirmed-
+        broken backend FIRST.
+
+        Fixed by making a 0%-success record score below "unmeasured" rather
+        than compete on latency alone. The other direction matters just as
+        much: the fix must key on "never once succeeded", not "ever failed
+        at all" — a mostly-working backend that has hit a handful of errors
+        is completely normal and must still outrank both an untested one and
+        a confirmed-dead one. An earlier version of this test used a
+        zero-failure "flaky" backend and did not notice when a broader
+        mutation (sink below unmeasured on ANY failure) passed it; the
+        partial-success case below is what actually exercises that edge.
+        """
+        with temp_state():
+            for _ in range(20):
+                lmm.log_hub({"event": "ask_attempt", "provider": "dead",
+                             "ok": False, "latency_ms": 50, "rung": 0,
+                             "source": "ask", "error": "401"})
+            for _ in range(3):
+                lmm.log_usage({"provider": "flaky", "kind": "local", "in": 10,
+                               "out": 10, "usd": 0.0, "cache": "miss",
+                               "ms": 500})
+            for _ in range(8):
+                lmm.log_usage({"provider": "partial", "kind": "local",
+                               "in": 1, "out": 1, "usd": 0.0, "cache": "miss",
+                               "ms": 100})
+            for _ in range(2):
+                lmm.log_hub({"event": "ask_attempt", "provider": "partial",
+                             "ok": False, "latency_ms": 100})
+            cfg = {"ask_order": ["untested", "dead", "flaky", "partial"]}
+            order, stat = lmm.optimize_ask_order(cfg)
+        self.assertEqual(stat["dead"]["ok"], 0)
+        self.assertGreater(order.index("dead"), order.index("untested"),
+                           "a 20/20-failing backend outranked an untested one")
+        self.assertGreater(order.index("dead"), order.index("flaky"),
+                           "a 20/20-failing backend outranked a working one")
+        self.assertGreater(order.index("untested"), order.index("partial"),
+                           "an 80%-successful backend, having failed twice, "
+                           "sank below one nobody has ever tried")
+        self.assertEqual(order[-1], "dead")
+
     def test_the_trail_is_bounded(self):
         """The reason the second log had to die: unbounded growth."""
         with temp_state():
