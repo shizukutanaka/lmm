@@ -18,6 +18,20 @@ the round of fixes that took the hub from "works" to "holds up under load", and
 the merge of the managed-routing line of work into the same tool.
 
 ### Fixed
+- **`priority --optimize` no longer promotes a confirmed-dead backend.** Its
+  own docstring's claim is "a backend that keeps failing or timing out drops
+  in priority" — measured, the opposite happened for the most common real
+  case: a dead API key or an unreachable local runtime, which fails *fast*
+  and *every time*. The latency and cost-efficiency terms in the score
+  didn't require a single success to apply, so a provider with 20/20
+  recorded failures (each one 50ms) scored up to 5.0 from speed alone and
+  **outranked a backend nobody had ever tried**. A 0%-success record now
+  scores below "unmeasured" — active evidence of always failing is worse
+  than no evidence — while a backend that has *ever* succeeded, even with
+  some failures mixed in, is untouched: a mostly-working provider must still
+  beat both an untested one and a confirmed-dead one.
+
+### Fixed
 - **…and `lmm bench --prompt`.** Having closed the judge's door, the same
   question was put to every other path that sends a user's prompt. `bench`
   is the widest fan-out in the tool — the prompt goes to *every* configured
