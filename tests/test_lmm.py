@@ -3029,9 +3029,10 @@ class TestPerModelRouting(unittest.TestCase):
                          ["stub-model-a", "stub-model-b"])
         self.assertEqual(
             len([p for p in self.stub.seen_get if "models" in p]), 1)
+        key = (prov["base_url"], prov.get("api_key", ""))
         with lmm._MODELS_CACHE_LOCK:      # rewind the clock: entry now stale
-            ts, ids = lmm._MODELS_CACHE[prov["base_url"]]
-            lmm._MODELS_CACHE[prov["base_url"]] = (ts - 2 * lmm.MODELS_CACHE_TTL, ids)
+            ts, ids = lmm._MODELS_CACHE[key]
+            lmm._MODELS_CACHE[key] = (ts - 2 * lmm.MODELS_CACHE_TTL, ids)
         lmm.fetch_models(prov)
         self.assertEqual(
             len([p for p in self.stub.seen_get if "models" in p]), 2,
@@ -6668,6 +6669,96 @@ class TestTheReadmeDocumentsWhatShipsSurvivesElenchus(unittest.TestCase):
         self.assertEqual(unreal, [],
                          "the README shows command(s) that do not exist: %s"
                          % unreal)
+
+
+class TestModelsCacheKeysOnTheCredentialSurvivesElenchus(unittest.TestCase):
+    """`fetch_models` caches by `base_url` alone. Two providers can share a
+    base_url and differ only in `api_key` -- a self-hosted gateway with
+    per-key model visibility, or a primary/backup key pair on the same
+    host -- and each provider's model list depends on which key was sent.
+
+    Measured against a stub that answers differently per Authorization
+    header: fetching provider A (key-a) populated the cache under the bare
+    base_url, and fetching provider B (key-b, same base_url) then returned
+    A's cached list without B's key ever reaching the server. `lmm models`
+    would show the wrong models for B, and a client asking the hub for one
+    of B's real models would fail to resolve, or resolve to the wrong
+    provider.
+    """
+
+    def _stub(self):
+        import http.server
+        import socket
+
+        class H(http.server.BaseHTTPRequestHandler):
+            def do_GET(handler_self):
+                auth = handler_self.headers.get("Authorization", "")
+                if not handler_self.path.rstrip("/").endswith("/v1/models"):
+                    handler_self.send_response(404)
+                    handler_self.end_headers()
+                    return
+                if "key-a" in auth:
+                    ids = ["model-a"]
+                elif "key-b" in auth:
+                    ids = ["model-b"]
+                else:
+                    ids = []
+                body = json.dumps({"object": "list",
+                                   "data": [{"id": i} for i in ids]}).encode()
+                handler_self.send_response(200)
+                handler_self.send_header("Content-Type", "application/json")
+                handler_self.send_header("Content-Length", str(len(body)))
+                handler_self.end_headers()
+                handler_self.wfile.write(body)
+
+            def log_message(handler_self, *a):
+                pass
+
+        s = socket.socket()
+        s.bind(("127.0.0.1", 0))
+        port = s.getsockname()[1]
+        s.close()
+        srv = http.server.HTTPServer(("127.0.0.1", port), H)
+        t = threading.Thread(target=lambda: srv.serve_forever(poll_interval=0.01),
+                             daemon=True)
+        t.start()
+        self.addCleanup(srv.server_close)   # LIFO: closes after shutdown
+        self.addCleanup(srv.shutdown)
+        return "http://127.0.0.1:%d/v1" % port
+
+    def test_two_keys_on_one_base_url_see_their_own_models(self):
+        base = self._stub()
+        prov_a = {"kind": "remote", "base_url": base, "api_key": "key-a"}
+        prov_b = {"kind": "remote", "base_url": base, "api_key": "key-b"}
+        saved = dict(lmm._MODELS_CACHE)
+        lmm._MODELS_CACHE.clear()
+        try:
+            models_a = lmm.fetch_models(prov_a)
+            models_b = lmm.fetch_models(prov_b)
+        finally:
+            lmm._MODELS_CACHE.clear()
+            lmm._MODELS_CACHE.update(saved)
+        self.assertEqual(models_a, ["model-a"])
+        self.assertEqual(models_b, ["model-b"],
+                         "provider B inherited provider A's cached models")
+
+    def test_the_same_key_still_hits_the_cache(self):
+        """The other direction: keying on the credential too must not turn
+        every call into a live fetch for the COMMON case of one provider,
+        one key."""
+        base = self._stub()
+        prov = {"kind": "remote", "base_url": base, "api_key": "key-a"}
+        saved = dict(lmm._MODELS_CACHE)
+        lmm._MODELS_CACHE.clear()
+        try:
+            lmm.fetch_models(prov)
+            import unittest.mock as _mock
+            with _mock.patch.object(lmm, "_fetch_models_live") as live:
+                lmm.fetch_models(prov)
+                live.assert_not_called()
+        finally:
+            lmm._MODELS_CACHE.clear()
+            lmm._MODELS_CACHE.update(saved)
 
 
 if __name__ == "__main__":
