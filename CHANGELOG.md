@@ -18,6 +18,21 @@ the round of fixes that took the hub from "works" to "holds up under load", and
 the merge of the managed-routing line of work into the same tool.
 
 ### Fixed
+- **The model-list cache no longer answers one provider's question with
+  another's credentials.** `fetch_models` cached per `base_url` alone, but
+  the answer depends on the key that was sent: two providers can share a
+  gateway and differ only in `api_key` (per-key model visibility on a
+  self-hosted endpoint, or a primary/backup key pair). Measured against a
+  stub that answers differently per `Authorization` header, fetching
+  provider A populated the cache under the bare URL and provider B then
+  received A's list — **B's own key never reached the server**. `lmm models`
+  would show B the wrong models, and a client asking the hub for one of B's
+  real models would fail to resolve or resolve to the wrong provider. The
+  key is now `(base_url, api_key)`; the common one-provider-one-key case
+  still hits the cache on the second call, which the regression test pins in
+  both directions.
+
+### Fixed
 - **`priority --optimize` no longer promotes a confirmed-dead backend.** Its
   own docstring's claim is "a backend that keeps failing or timing out drops
   in priority" — measured, the opposite happened for the most common real

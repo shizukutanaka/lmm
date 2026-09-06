@@ -4044,7 +4044,7 @@ def _local_lmstudio_provider_live():
             "model": model, "kind": "local", "_implicit": True}
 
 
-_MODELS_CACHE = {}                      # base_url -> (monotonic_ts, [ids])
+_MODELS_CACHE = {}                      # (base_url, api_key) -> (monotonic_ts, [ids])
 _MODELS_CACHE_LOCK = threading.Lock()
 MODELS_CACHE_TTL = 30.0
 
@@ -4053,25 +4053,33 @@ def fetch_models(prov):
     """Return a list of model-id strings for a provider, or [] on failure.
     Ollama uses /api/tags; OpenAI-compatible clouds use /v1/models.
 
-    Results are cached for MODELS_CACHE_TTL seconds per base_url. The hub is
-    a long-lived process that needs this list on every model-id request and
-    every /v1/models call; without the cache each one paid a full round-trip
-    to the backend — measured at +80% P50 against a localhost stub, and a
-    whole network RTT against anything real. Unreachable backends cache their
-    [] too, for the breaker's reason: a dead backend must not cost every
-    request its timeout. The price is that a just-started backend can stay
-    invisible for up to the TTL. CLI commands run in a fresh process, so they
-    always see fresh data.
+    Results are cached for MODELS_CACHE_TTL seconds per (base_url, api_key).
+    The hub is a long-lived process that needs this list on every model-id
+    request and every /v1/models call; without the cache each one paid a
+    full round-trip to the backend — measured at +80% P50 against a
+    localhost stub, and a whole network RTT against anything real.
+    Unreachable backends cache their [] too, for the breaker's reason: a
+    dead backend must not cost every request its timeout. The price is that
+    a just-started backend can stay invisible for up to the TTL. CLI
+    commands run in a fresh process, so they always see fresh data.
+
+    The key includes api_key, not just base_url: two providers on the same
+    gateway with different keys can see different models (per-key access on
+    a self-hosted endpoint, or a primary/backup key pair). Measured, keying
+    on base_url alone had one provider's fetch answer for both -- the
+    second provider's OWN key was never even sent, it just inherited
+    whatever the first happened to see.
     """
     base = prov.get("base_url", "")
+    key = (base, prov.get("api_key", ""))
     now = time.monotonic()
     with _MODELS_CACHE_LOCK:
-        hit = _MODELS_CACHE.get(base)
+        hit = _MODELS_CACHE.get(key)
         if hit and now - hit[0] < MODELS_CACHE_TTL:
             return list(hit[1])
     models = _fetch_models_live(prov, base)
     with _MODELS_CACHE_LOCK:
-        _MODELS_CACHE[base] = (now, list(models))
+        _MODELS_CACHE[key] = (now, list(models))
     return models
 
 
