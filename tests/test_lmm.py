@@ -6809,8 +6809,8 @@ class TestTruncatedStreamIsNotAnAnswerSurvivesElenchus(unittest.TestCase):
         port = s.getsockname()[1]
         s.close()
         srv = http.server.HTTPServer(("127.0.0.1", port), H)
-        threading.Thread(target=srv.serve_forever,
-                         kwargs={"poll_interval": 0.01}, daemon=True).start()
+        threading.Thread(target=lambda: srv.serve_forever(poll_interval=0.01),
+                         daemon=True).start()
         self.addCleanup(srv.server_close)
         self.addCleanup(srv.shutdown)
         return [("p", {"api_key": "k", "model": "m", "kind": "remote",
