@@ -6761,5 +6761,94 @@ class TestModelsCacheKeysOnTheCredentialSurvivesElenchus(unittest.TestCase):
             lmm._MODELS_CACHE.update(saved)
 
 
+class TestTruncatedStreamIsNotAnAnswerSurvivesElenchus(unittest.TestCase):
+    """The streaming path promises "never cache a truncated answer" and
+    meters `partial=not completed`. Both hang on `completed`, which the SSE
+    reader set whenever the response simply ran out of lines -- it never
+    checked that the provider had said it was done.
+
+    Measured with a provider that closes the connection after "The answer
+    is" (no [DONE], no finish_reason): no error reached the client, the
+    fragment was CACHED, the call was metered as complete, and every repeat
+    of the question was served the fragment from cache. A connection cut by
+    a proxy timeout or an OOM-killed local runtime looks exactly like that.
+
+    The other direction is tested too: servers that send finish_reason but
+    omit [DONE] are finished, and must not be punished as truncated.
+    """
+
+    def _serve(self, ending):
+        import http.server
+        import socketserver
+        import threading
+        import socket
+
+        class H(http.server.BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.0"
+
+            def do_POST(self):
+                self.rfile.read(int(self.headers.get("Content-Length", 0)))
+                self.send_response(200)
+                self.send_header("Content-Type", "text/event-stream")
+                self.end_headers()
+                for i, t in enumerate(["The answer", " is"]):
+                    ch = {"delta": {"content": t}}
+                    if ending == "finish_reason" and i == 1:
+                        ch["finish_reason"] = "stop"
+                    self.wfile.write(b"data: " + json.dumps(
+                        {"choices": [ch]}).encode() + b"\n\n")
+                    self.wfile.flush()
+                if ending == "done":
+                    self.wfile.write(b"data: [DONE]\n\n")
+
+            def log_message(self, *a):
+                pass
+
+        s = socket.socket()
+        s.bind(("127.0.0.1", 0))
+        port = s.getsockname()[1]
+        s.close()
+        srv = http.server.HTTPServer(("127.0.0.1", port), H)
+        threading.Thread(target=srv.serve_forever,
+                         kwargs={"poll_interval": 0.01}, daemon=True).start()
+        self.addCleanup(srv.server_close)
+        self.addCleanup(srv.shutdown)
+        return [("p", {"api_key": "k", "model": "m", "kind": "remote",
+                       "base_url": "http://127.0.0.1:%d/v1" % port})]
+
+    def _run(self, ending):
+        targets = self._serve(ending)
+        cfg = {"cache": {"enabled": True}}
+        msgs = [{"role": "user", "content": "q"}]
+        with temp_state():
+            out = b"".join(lmm.hub_stream(cfg, msgs, list(targets),
+                                          {"cache": True}))
+            billed = [e for e in lmm.read_usage()
+                      if not e.get("event") and e.get("cache") != "exact"]
+            cached = len(lmm.cache_entries({}))
+        return out, billed, cached
+
+    def test_a_cut_off_stream_is_neither_cached_nor_billed_as_complete(self):
+        out, billed, cached = self._run("cut")
+        self.assertIn(b"error", out, "the client was never told")
+        self.assertEqual(cached, 0, "a fragment was cached as the answer")
+        self.assertTrue(billed and billed[0].get("partial"),
+                        "a truncated call was metered as complete")
+
+    def test_a_done_terminated_stream_is_still_an_answer(self):
+        out, billed, cached = self._run("done")
+        self.assertNotIn(b'"error"', out)
+        self.assertEqual(cached, 1)
+        self.assertFalse(billed[0].get("partial"))
+
+    def test_finish_reason_without_done_is_still_an_answer(self):
+        """Over-correction guard: requiring [DONE] alone would break every
+        server that ends with finish_reason and omits it."""
+        out, billed, cached = self._run("finish_reason")
+        self.assertNotIn(b'"error"', out)
+        self.assertEqual(cached, 1)
+        self.assertFalse(billed[0].get("partial"))
+
+
 if __name__ == "__main__":
     unittest.main()

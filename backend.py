@@ -1466,6 +1466,14 @@ def http_stream_sse(url, payload, api_key, timeout=300):
         yield None, classify_http_error(e)
         return
     saw_frame = False
+    # A stream is finished only when the provider SAYS so: `[DONE]`, or a
+    # chunk carrying finish_reason (some OpenAI-compatible servers send that
+    # and omit [DONE]). Running out of lines is not the same thing. Measured
+    # before this: a connection that closed after "The answer is" -- proxy
+    # timeout, OOM-killed local runtime -- was reported as a clean end, so
+    # the fragment was cached, metered as complete, and served verbatim on
+    # every repeat of the question.
+    finished = False
     try:
         for raw in resp:                      # urllib responses iterate by line
             line = raw.decode("utf-8", "ignore").strip()
@@ -1476,11 +1484,18 @@ def http_stream_sse(url, payload, api_key, timeout=300):
             saw_frame = True
             body = line[5:].strip()
             if body == "[DONE]":
+                finished = True
                 break
             try:
-                yield raw, json.loads(body)
+                obj = json.loads(body)
             except ValueError:
                 continue
+            try:
+                if any(c.get("finish_reason") for c in obj.get("choices") or []):
+                    finished = True
+            except AttributeError:
+                pass
+            yield raw, obj
     except Exception as e:
         yield None, {"error": str(e)}
         return
@@ -1496,6 +1511,10 @@ def http_stream_sse(url, payload, api_key, timeout=300):
         # and never fails over — the user just gets silence. Report it instead.
         yield None, {"error": "upstream returned no SSE frames "
                               "(did it ignore stream:true?)"}
+        return
+    if not finished:
+        yield None, {"error": "stream ended before completion "
+                              "(no [DONE] and no finish_reason)"}
         return
     yield None, None                          # clean end of stream
 

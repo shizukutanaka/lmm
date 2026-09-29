@@ -18,6 +18,20 @@ the round of fixes that took the hub from "works" to "holds up under load", and
 the merge of the managed-routing line of work into the same tool.
 
 ### Fixed
+- **A truncated stream is no longer cached as the answer.** The streaming
+  path promised "never cache a truncated answer", but the SSE reader called
+  any stream that simply ran out of lines a clean end — it never checked
+  that the provider had said it was done. Measured with a provider that
+  closed the connection after "The answer is" (no `[DONE]`, no
+  `finish_reason`), as a proxy timeout or an OOM-killed local runtime does:
+  no error reached the client, the fragment was **cached**, the call was
+  metered as complete, and every repeat of the question was served the
+  fragment. A stream now counts as finished only on `[DONE]` or a chunk
+  carrying `finish_reason` (servers that send the latter and omit `[DONE]`
+  are still accepted); anything else surfaces as an error, is metered
+  `partial`, and is never cached.
+
+### Fixed
 - **The model-list cache no longer answers one provider's question with
   another's credentials.** `fetch_models` cached per `base_url` alone, but
   the answer depends on the key that was sent: two providers can share a
