@@ -44,7 +44,7 @@ git clone https://github.com/shizukutanaka/lmm && cd lmm
 
 # no clone? fetch the three files into one directory and run it in place
 for f in lmm.py backend.py frontend.py; do
-  curl -fsSLO https://raw.githubusercontent.com/shizukutanaka/lmm/main/$f
+  curl -fsSLO https://raw.githubusercontent.com/shizukutanaka/lmm/master/$f
 done
 python lmm.py <command>
 ```
