@@ -40,7 +40,7 @@ while read -r local_ref local_sha remote_ref remote_sha; do
     echo "[pre-push] could not check out ${local_sha:0:8}; skipping guard." >&2
     continue
   fi
-  if ! (cd "${tmpdir}" && LMM_SELFTEST_SKIP_LIVE=1 python lmm.py selftest --guard); then
+  if ! (cd "${tmpdir}" && LMM_SELFTEST_SKIP_LIVE=1 "${LMM_PYTHON:-python3}" lmm.py selftest --guard); then
     echo "[pre-push] BLOCKED: revision ${local_sha:0:8} failed its own selftest." >&2
     echo "[pre-push] Fix the code (or run: LMM_SKIP_HOOK=1 git push to override) then re-push." >&2
     status=1
