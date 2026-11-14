@@ -69,7 +69,7 @@ except ImportError as _e:
         "must sit in the same directory. Re-run the installer, or fetch them\n"
         "together:\n"
         "  for f in lmm.py backend.py frontend.py; do curl -fsSLO "
-        "https://raw.githubusercontent.com/shizukutanaka/lmm/main/$f; done\n"
+        "https://raw.githubusercontent.com/shizukutanaka/lmm/master/$f; done\n"
         % (" and ".join(_missing), _here))
     sys.exit(1)
 

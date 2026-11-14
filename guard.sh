@@ -11,8 +11,16 @@ REPO="$(cd "$(dirname "$0")" && pwd)"
 cd "$REPO" || { echo "[guard] cannot cd to repo"; exit 1; }
 
 export LMM_SELFTEST_SKIP_LIVE="1"   # no live Ollama on this box needed
+# Stock Debian/Ubuntu has only `python3` (no `python`); calling bare `python`
+# made this gate fail with "command not found" and then misleadingly report
+# that lmm "did not self-prove". Pick whichever interpreter actually exists.
+PYTHON="$(command -v python3 || command -v python || true)"
+if [ -z "$PYTHON" ]; then
+  echo "[guard] FAILED — no python3/python interpreter found on PATH"
+  exit 1
+fi
 echo "[guard] lmm self-proves (measure, don't trust) — selftest --guard"
-if python lmm.py selftest --guard; then
+if "$PYTHON" lmm.py selftest --guard; then
   echo "[guard] ALL OK"
   exit 0
 else
