@@ -1,5 +1,7 @@
 # lmm — Local/remote Model Manager & Unified Inference Hub
 
+> **Consolidated into [Pasture](https://github.com/shizukutanaka/Pasture)** — this repository is no longer developed. lmm's local-runtime detection breadth (Ollama, LM Studio, Jan, llama.cpp, KoboldCPP, GPT4All, vLLM, Open WebUI) was ported into Pasture as `pasture discover` (IMP-75); its cascade, caching and cost-tracking roles were already covered by Pasture, the surviving local/cloud LLM router. This repository will be archived; the code remains available for reference. (The Windows taskbar hider was a separate desktop utility and was not ported.)
+
 > Three files, no dependencies. One endpoint in front of every LLM you use —
 > and a bill you can actually see.
 
