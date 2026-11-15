@@ -768,15 +768,10 @@ runs the unit suite whenever a `tests/` directory sits beside it, all three
 gates carry all of it — a checkout cannot be committed, pushed or merged
 with a failing test. (Users get three files and no `tests/`, so for them the
 check simply does not apply.) The matrix that runs
-the suite on Python 3.8 through 3.13 lives at **`ci/github-actions-ci.yml`**
-and is not yet in `.github/workflows/`, because pushes from this repo's GitHub
-App are rejected without `workflows` permission. Enabling it is a one-line copy
-you run yourself:
-
-```bash
-mkdir -p .github/workflows && cp ci/github-actions-ci.yml .github/workflows/ci.yml
-git add .github && git commit -m "ci: enable GitHub Actions" && git push
-```
+the suite on Python 3.8 through 3.13 is **`.github/workflows/ci.yml`**. Its
+source copy lives at `ci/github-actions-ci.yml`; the workflows copy was
+installed by a direct git push, because pushes from this repo's GitHub
+App are rejected without `workflows` permission.
 
 For contributors there is also a local proof-before-ship gate: enable it once
 with `git config core.hooksPath .githooks` (same command on every platform).
