@@ -22,13 +22,29 @@ permissions:
 
 jobs:
   test:
-    runs-on: ubuntu-latest
+    runs-on: ${{ matrix.runs-on }}
     strategy:
       fail-fast: false
       matrix:
         # 3.8 is the floor the README promises; the newest entry catches
         # deprecations before they become breakage.
         python-version: ["3.8", "3.9", "3.10", "3.11", "3.12", "3.13"]
+        # The newest ubuntu-latest images no longer offer 3.8/3.9 to
+        # setup-python ("Version 3.9 was not found"), so the two oldest
+        # legs run on ubuntu-22.04, where those interpreters still exist.
+        include:
+          - python-version: "3.8"
+            runs-on: ubuntu-22.04
+          - python-version: "3.9"
+            runs-on: ubuntu-22.04
+          - python-version: "3.10"
+            runs-on: ubuntu-latest
+          - python-version: "3.11"
+            runs-on: ubuntu-latest
+          - python-version: "3.12"
+            runs-on: ubuntu-latest
+          - python-version: "3.13"
+            runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
 
